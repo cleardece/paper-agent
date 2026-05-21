@@ -1,0 +1,10 @@
+venv/
+__pycache__/
+*.pyc
+.env
+*.egg-info/
+dist/
+build/
+.venv/
+milvus_data/
+mongodb_data/
