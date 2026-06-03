@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Paper Agent</title>
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body>
+    <aside class="sidebar">
+      <div class="brand">Paper Agent</div>
+      <button id="newChat" class="new-chat">+ 新建对话</button>
+      <div id="sessions" class="sessions"></div>
+    </aside>
+
+    <main class="chat-shell">
+      <header class="topbar">
+        <div>
+          <strong id="chatTitle">新对话</strong>
+          <span id="connectionState">准备就绪</span>
+        </div>
+      </header>
+
+      <section id="messages" class="messages"></section>
+
+      <form id="composer" class="composer">
+        <textarea id="messageInput" rows="1" placeholder="询问论文、检索主题或要求入库..."></textarea>
+        <button id="sendButton" type="submit">发送</button>
+      </form>
+    </main>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>

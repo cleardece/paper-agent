@@ -127,7 +127,8 @@ class PDFParser:
                         },
                     })
                     chunk_index += 1
-                    return chunks
+
+        return chunks
 
     def _is_heading(self, line: str) -> bool:
         """

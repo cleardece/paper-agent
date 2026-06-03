@@ -33,6 +33,7 @@ class AgentState(TypedDict):
     """全局共享状态"""
     # 用户输入
     user_query: str
+    search_query: Optional[str]  # 从用户输入中提取的搜索关键词
 
     # 消息历史（用于对话）
     messages: Annotated[list[BaseMessage], add_messages]

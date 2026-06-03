@@ -2,16 +2,22 @@
 Paper Agent - Milvus向量存储层
 """
 
+import logging
 from typing import Optional
-from pymilvus import MilvusClient, DataType
+from pymilvus import DataType
+from pymilvus import MilvusClient as PyMilvusClient
+
+logger = logging.getLogger("paper-agent")
 
 COLLECTION_NAME = "paper_chunks"
 VECTOR_DIM = 1024  # BGE-M3
 
 
-class MilvusClientWrapper:
+class MilvusClient:
     def __init__(self, uri: str = "http://localhost:19530"):
-        self.client = MilvusClient(uri=uri)
+        logger.info(f"[Milvus] 正在连接 {uri}...")
+        self.client = PyMilvusClient(uri=uri, timeout=10)
+        logger.info("[Milvus] 连接成功")
         self._ensure_collection()
 
     def _ensure_collection(self):
@@ -61,57 +67,57 @@ class MilvusClientWrapper:
         if output_fields is None:
             output_fields = ["paper_arxiv_id", "chunk_index", "content", "metadata_json"]
 
-            search_params = {"metric_type": "COSINE", "params": {"nprobe": 16}}
+        search_params = {"metric_type": "COSINE", "params": {"nprobe": 16}}
 
-            expr = None
-            if paper_ids:
-                id_list = ", ".join(f'"{pid}"' for pid in paper_ids)
-                expr = f"paper_arxiv_id in [{id_list}]"
+        expr = None
+        if paper_ids:
+            id_list = ", ".join(f'"{pid}"' for pid in paper_ids)
+            expr = f"paper_arxiv_id in [{id_list}]"
 
-            results = self.client.search(
-                collection_name=COLLECTION_NAME,
-                data=[query_embedding],
-                limit=top_k,
-                search_params=search_params,
-                expr=expr,
-                output_fields=output_fields,
-            )
+        results = self.client.search(
+            collection_name=COLLECTION_NAME,
+            data=[query_embedding],
+            limit=top_k,
+            search_params=search_params,
+            expr=expr,
+            output_fields=output_fields,
+        )
 
-            hits = []
-            if results and len(results) > 0:
-                for hit in results[0]:
-                    record = hit["entity"]
-                    record["id"] = hit["id"]
-                    record["score"] = hit["distance"]
-                    hits.append(record)
-            return hits
+        hits = []
+        if results and len(results) > 0:
+            for hit in results[0]:
+                record = hit["entity"]
+                record["id"] = hit["id"]
+                record["score"] = hit["distance"]
+                hits.append(record)
+        return hits
 
-        def delete_by_paper(self, arxiv_id: str):
-            self.client.delete(
+    def delete_by_paper(self, arxiv_id: str):
+        self.client.delete(
+            collection_name=COLLECTION_NAME,
+            filter=f'paper_arxiv_id == "{arxiv_id}"',
+        )
+
+    def delete_all(self):
+        self.client.drop_collection(COLLECTION_NAME)
+        self._ensure_collection()
+
+    def count(self, arxiv_id: Optional[str] = None) -> int:
+        if arxiv_id:
+            results = self.client.query(
                 collection_name=COLLECTION_NAME,
                 filter=f'paper_arxiv_id == "{arxiv_id}"',
+                output_fields=["id"],
             )
+            return len(results)
+        stats = self.client.get_collection_stats(COLLECTION_NAME)
+        return int(stats["row_count"])
 
-        def delete_all(self):
-            self.client.drop_collection(COLLECTION_NAME)
-            self._ensure_collection()
+    def close(self):
+        self.client.close()
 
-        def count(self, arxiv_id: Optional[str] = None) -> int:
-            if arxiv_id:
-                results = self.client.query(
-                    collection_name=COLLECTION_NAME,
-                    filter=f'paper_arxiv_id == "{arxiv_id}"',
-                    output_fields=["id"],
-                )
-                return len(results)
-            stats = self.client.get_collection_stats(COLLECTION_NAME)
-            return int(stats["row_count"])
+    def __enter__(self):
+        return self
 
-        def close(self):
-            self.client.close()
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            self.close()
+    def __exit__(self, *args):
+        self.close()

@@ -3,10 +3,13 @@ Paper Agent - Fetcher Agent
 从arXiv抓取论文，解析PDF，分块入库
 """
 
+import logging
 from typing import Optional
 from langchain_core.messages import SystemMessage, HumanMessage
 
 from state.graph_state import AgentState
+
+logger = logging.getLogger("paper-agent")
 
 
 class FetcherAgent:
@@ -28,10 +31,14 @@ class FetcherAgent:
         4. Embedding → 存Milvus
         5. 更新state
         """
-        query = state["user_query"]
+        # 优先使用 Supervisor 提取的 search_query，否则用 user_query
+        query = state.get("search_query") or state["user_query"]
+        logger.info(f"[Fetcher] 开始搜索论文: {query[:50]}...")
 
         # 1. 搜索
+        logger.info("[Fetcher] 正在调用 arXiv API...")
         papers = self.arxiv.search(query, max_results=5)
+        logger.info(f"[Fetcher] 找到 {len(papers)} 篇论文")
 
         # 2-4. 逐篇处理
         fetched = []
@@ -46,7 +53,7 @@ class FetcherAgent:
                 self._process_paper(paper_meta)
                 fetched.append(paper_meta)
             except Exception as e:
-                print(f"[Fetcher] 处理失败 {arxiv_id}: {e}")
+                logger.error(f"[Fetcher] 处理失败 {arxiv_id}: {e}")
 
         # 5. 返回结果给Supervisor
         if fetched:
@@ -65,58 +72,68 @@ class FetcherAgent:
     def _process_paper(self, paper_meta: dict):
         """单篇论文完整处理链路"""
         arxiv_id = paper_meta["arxiv_id"]
+        title = paper_meta.get('title', '未知')[:40]
+        logger.info(f"[Fetcher] 正在处理论文: {title}...")
 
         # 1. 入MongoDB（状态: pending）
         paper_meta["status"] = "pending"
         self.mongo.upsert_paper(paper_meta)
+        logger.info(f"[Fetcher] 论文元数据已存入 MongoDB")
 
         # 2. 下载并解析PDF
         if not paper_meta.get("pdf_url"):
+            logger.info(f"[Fetcher] 论文无 PDF 链接，跳过")
             return
 
-            pdf_path = self._download_pdf(paper_meta["pdf_url"], arxiv_id)
-            parsed = self.parser.parse(pdf_path)
+        logger.info(f"[Fetcher] 正在下载 PDF...")
+        pdf_path = self._download_pdf(paper_meta["pdf_url"], arxiv_id)
+        logger.info(f"[Fetcher] 正在解析 PDF...")
+        parsed = self.parser.parse(pdf_path)
 
-            # 3. 分块
-            chunks = self.parser.chunk(parsed["sections"])
+        # 3. 分块
+        logger.info(f"[Fetcher] 正在分块...")
+        chunks = self.parser.chunk(parsed["sections"])
 
-            # 4. 更新MongoDB状态 + 存分块
-            self.mongo.update_paper_status(arxiv_id, "parsed")
-            mongo_chunks = [
-                {
-                    "paper_arxiv_id": arxiv_id,
-                    "chunk_index": c["chunk_index"],
-                    "content": c["content"],
-                    "metadata": c["metadata"],
-                }
-                for c in chunks
-            ]
-            self.mongo.insert_chunks(mongo_chunks)
-            self.mongo.update_paper_status(arxiv_id, "chunked")
+        # 4. 更新MongoDB状态 + 存分块
+        self.mongo.update_paper_status(arxiv_id, "parsed")
+        mongo_chunks = [
+            {
+                "paper_arxiv_id": arxiv_id,
+                "chunk_index": c["chunk_index"],
+                "content": c["content"],
+                "metadata": c["metadata"],
+            }
+            for c in chunks
+        ]
+        self.mongo.insert_chunks(mongo_chunks)
+        self.mongo.update_paper_status(arxiv_id, "chunked")
+        logger.info(f"[Fetcher] 已生成 {len(chunks)} 个分块并存入 MongoDB")
 
-            # 5. Embedding
-            texts = [c["content"] for c in chunks]
-            vectors = self.embedder.encode_batch(texts)
+        # 5. Embedding
+        logger.info(f"[Fetcher] 正在生成 Embedding...")
+        texts = [c["content"] for c in chunks]
+        vectors = self.embedder.embed_texts(texts)
+        logger.info(f"[Fetcher] Embedding 完成")
 
-            # 6. 存Milvus
-            import json
-            milvus_records = [
-                {
-                    "paper_arxiv_id": arxiv_id,
-                    "chunk_index": c["chunk_index"],
-                    "content": c["content"],
-                    "embedding": vectors[i],
-                    "metadata_json": json.dumps(c["metadata"]),
-                }
-                for i, c in enumerate(chunks)
-            ]
-            self.milvus.insert(milvus_records)
-            self.mongo.update_paper_status(arxiv_id, "indexed")
+        # 6. 存Milvus
+        import json
+        milvus_records = [
+            {
+                "paper_arxiv_id": arxiv_id,
+                "chunk_index": c["chunk_index"],
+                "content": c["content"],
+                "embedding": vectors[i],
+                "metadata_json": json.dumps(c["metadata"]),
+            }
+            for i, c in enumerate(chunks)
+        ]
+        self.milvus.insert(milvus_records)
+        self.mongo.update_paper_status(arxiv_id, "indexed")
+        logger.info(f"[Fetcher] 论文处理完成: {title}")
 
     def _download_pdf(self, url: str, arxiv_id: str) -> str:
             """下载PDF到本地临时目录"""
             import os
-            import urllib.request
 
             tmp_dir = os.path.join(os.getcwd(), "tmp_pdfs")
             os.makedirs(tmp_dir, exist_ok=True)
@@ -124,6 +141,8 @@ class FetcherAgent:
             pdf_path = os.path.join(tmp_dir, f"{arxiv_id.replace('/', '_')}.pdf")
 
             if not os.path.exists(pdf_path):
+                # 使用同步下载（httpx 可选，这里保持简单）
+                import urllib.request
                 urllib.request.urlretrieve(url, pdf_path)
 
             return pdf_path

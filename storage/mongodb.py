@@ -3,18 +3,25 @@ Paper Agent - MongoDB存储层
 存储论文元数据、解析状态、对话记录
 """
 
+import logging
 from datetime import datetime, timezone
 from typing import Optional
 from pymongo import MongoClient, ASCENDING, DESCENDING
 from pymongo.collection import Collection
 from pymongo.database import Database
 
+logger = logging.getLogger("paper-agent")
+
 
 class MongoDBClient:
     """MongoDB客户端 - 管理论文元数据"""
 
     def __init__(self, uri: str = "mongodb://localhost:27017", db_name: str = "paper_agent"):
-        self.client = MongoClient(uri)
+        logger.info(f"[MongoDB] 正在连接 {uri}...")
+        self.client = MongoClient(uri, serverSelectionTimeoutMS=5000)
+        # 测试连接
+        self.client.admin.command('ping')
+        logger.info("[MongoDB] 连接成功")
         self.db: Database = self.client[db_name]
         self._ensure_indexes()
 
@@ -62,7 +69,8 @@ class MongoDBClient:
 
         if extra_fields:
             update["$set"].update(extra_fields)
-            self.papers.update_one({"arxiv_id": arxiv_id}, update)
+
+        self.papers.update_one({"arxiv_id": arxiv_id}, update)
 
     def get_paper(self, arxiv_id: str) -> Optional[dict]:
         return self.papers.find_one({"arxiv_id": arxiv_id})

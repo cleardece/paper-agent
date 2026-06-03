@@ -3,10 +3,13 @@ Paper Agent - Retriever Agent
 从Milvus语义检索相关论文分块
 """
 
+import logging
 from typing import Optional
 from langchain_core.messages import SystemMessage, HumanMessage
 
 from state.graph_state import AgentState, RetrievedChunk
+
+logger = logging.getLogger("paper-agent")
 
 
 class RetrieverAgent:
@@ -26,16 +29,21 @@ class RetrieverAgent:
         4. 更新state
         """
         query = state["user_query"]
+        logger.info(f"[Retriever] 开始检索: {query[:50]}...")
 
         # 1. Embedding
-        query_vector = self.embedder.encode(query)
+        logger.info("[Retriever] 正在生成查询向量...")
+        query_vector = self.embedder.embed_query(query)
+        logger.info("[Retriever] 向量生成完成")
 
         # 2. Milvus检索
+        logger.info("[Retriever] 正在 Milvus 中检索...")
         hits = self.milvus.search(
             query_embedding=query_vector,
             top_k=10,
             output_fields=["paper_arxiv_id", "chunk_index", "content", "metadata_json"],
         )
+        logger.info(f"[Retriever] 找到 {len(hits)} 个相关分块")
 
         # 3. 补全元数据 + 构造RetrievedChunk
         retrieved = []
@@ -51,13 +59,22 @@ class RetrieverAgent:
             else:
                 paper = None  # 已查过，跳过重复查询
 
+            # 解析 metadata_json
+            import json
+            metadata = {}
+            if hit.get("metadata_json"):
+                try:
+                    metadata = json.loads(hit["metadata_json"])
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
             retrieved.append(RetrievedChunk(
                 paper_arxiv_id=arxiv_id,
                 paper_title=paper["title"] if paper else arxiv_id,
                 chunk_index=hit["chunk_index"],
                 content=hit["content"],
                 score=hit["score"],
-                metadata={},
+                metadata=metadata,
             ))
 
         # 4. 如果知识库为空，提示用户

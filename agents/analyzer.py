@@ -3,10 +3,13 @@ Paper Agent - Analyzer Agent
 ReAct模式，综合多篇论文分析问题
 """
 
+import logging
 from langchain_core.messages import SystemMessage, HumanMessage
 from langgraph.prebuilt import create_react_agent
 
 from state.graph_state import AgentState
+
+logger = logging.getLogger("paper-agent")
 
 
 ANALYZER_PROMPT = """你是一个学术论文分析专家。根据检索到的论文片段，综合分析用户的问题。
@@ -69,8 +72,10 @@ class AnalyzerAgent:
         """
         chunks = state.get("retrieved_chunks", [])
         if not chunks:
+            logger.info("[Analyzer] 无可用的论文内容进行分析")
             return {"analysis": "无可用的论文内容进行分析。"}
 
+        logger.info(f"[Analyzer] 收到 {len(chunks)} 个分块，开始分析...")
         # 组装上下文
         context = "\n\n---\n\n".join(
             f"【{c['paper_title']}】(chunk {c['chunk_index']}, score: {c['score']:.3f})\n{c['content']}"
@@ -83,6 +88,7 @@ class AnalyzerAgent:
         ]
 
         # ReAct Agent执行
+        logger.info("[Analyzer] 正在调用 LLM 进行分析...")
         agent = create_react_agent(
             model=self.llm,
             tools=self.tools,
@@ -93,5 +99,6 @@ class AnalyzerAgent:
 
         # 提取最终回答
         answer = result["messages"][-1].content
+        logger.info(f"[Analyzer] 分析完成，回答长度: {len(answer)}")
 
         return {"analysis": answer, "error": None}
