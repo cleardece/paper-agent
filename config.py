@@ -1,6 +1,6 @@
 import os
 from dotenv import load_dotenv
-
+from langchain_openai import ChatOpenAI
 load_dotenv()
 
 # LLM配置 - MiMo
@@ -26,3 +26,10 @@ TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 # LangSmith
 LANGSMITH_API_KEY = os.getenv("LANGSMITH_API_KEY")
 LANGSMITH_TRACING = os.getenv("LANGSMITH_TRACING", "true")
+def get_llm():
+    return ChatOpenAI(
+        model=LLM_MODEL,
+        base_url=LLM_BASE_URL,
+        api_key=LLM_API_KEY,
+        temperature=0.3,
+    )

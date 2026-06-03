@@ -1,21 +1,55 @@
-#定义图状态
-from typing import TypedDict,Annotated,List
-from langgraph.graph.message import add_messages
-class GraphState(TypedDict):
-    # 输入
-    paper_url: str                    # 论文链接或arXiv ID
-    paper_text: str                   # 解析后的论文全文
-    sections: dict                    # 按章节拆分 {title: content}
+"""
+Paper Agent - LangGraph状态定义
+定义多Agent协作的共享状态
+"""
 
-    # 中间结果
-    summary: str                      # 摘要分析
-    methodology: str                  # 方法论分析
-    key_findings: List[str]           # 关键发现列表
+from typing import TypedDict, Annotated, Optional
+from langgraph.graph import add_messages
+from langchain_core.messages import BaseMessage
+import operator
 
-    # 最终输出
-    structured_output: dict           # 结构化分析结果
-    presentation: str                 # 汇报文案
+
+class PaperInfo(TypedDict):
+    """论文信息"""
+    arxiv_id: str
+    title: str
+    authors: list[str]
+    abstract: str
+    pdf_url: str
+    status: str  # pending / parsed / chunked / embedded / indexed
+
+
+class RetrievedChunk(TypedDict):
+    """检索结果分块"""
+    paper_arxiv_id: str
+    paper_title: str
+    chunk_index: int
+    content: str
+    score: float
+    metadata: dict
+
+
+class AgentState(TypedDict):
+    """全局共享状态"""
+    # 用户输入
+    user_query: str
+
+    # 消息历史（用于对话）
+    messages: Annotated[list[BaseMessage], add_messages]
+
+    # 论文相关
+    target_papers: list[PaperInfo]          # 当前涉及的论文列表
+    retrieved_chunks: list[RetrievedChunk]  # 检索到的相关分块
+
+    # Agent输出
+    search_results: Optional[dict]          # web搜索结果
+    analysis: Optional[str]                 # 分析结论
+    answer: Optional[str]                   # 最终回答
 
     # 流程控制
-    current_step: str                 # 当前步骤
-    error: str                        # 错误信息
+    next_agent: Optional[str]               # Supervisor决定的下一个Agent
+    iteration: int                          # 当前迭代轮次
+    max_iterations: int                     # 最大轮次限制
+
+    # 错误处理
+    error: Optional[str]

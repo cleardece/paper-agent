@@ -1,8 +1,8 @@
 from langgraph.graph import StateGraph, END
-from state.graph_state import GraphState
+from state.graph_state import AgentState
 from tools.arxiv_api import search_papers, fetch_paper_content
 import re
-from config import llm
+from config import get_llm
 def fetch_paper(state):
     """从arXiv获取论文内容"""
     paper_url = state["paper_url"]
