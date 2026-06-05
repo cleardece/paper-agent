@@ -32,9 +32,9 @@ from config import get_llm
 from state.graph_state import AgentState
 
 
-AGENTS = ("supervisor", "translator", "fetcher", "retriever", "analyzer", "critic", "presenter")
+AGENTS = ("supervisor", "fetcher", "retriever", "analyzer", "critic", "presenter")
 QUESTION_FLOW = ("supervisor", "retriever", "analyzer", "critic", "presenter")
-FETCH_FLOW = ("supervisor", "translator", "fetcher")
+FETCH_FLOW = ("supervisor", "fetcher")
 
 
 class ChatRequest(BaseModel):
@@ -86,37 +86,62 @@ class ConnectionManager:
                 self.disconnect(session_id, socket)
 
 
+# Session 内存缓存（热数据）
 sessions: dict[str, Session] = {}
 manager = ConnectionManager()
 
-# Session 过期时间（秒）
-SESSION_TTL = 3600  # 1小时
+
+def load_session_from_db(session_id: str) -> Session | None:
+    """从 MongoDB 加载 Session"""
+    from core.deps import get_container
+    container = get_container()
+    doc = container.mongodb.get_session(session_id)
+    if not doc:
+        return None
+
+    session = Session(
+        id=doc["session_id"],
+        title=doc.get("title", ""),
+        created_at=doc.get("created_at", time.time()),
+        updated_at=doc.get("updated_at", time.time()),
+    )
+
+    # 加载消息
+    messages_data = doc.get("messages", [])
+    for msg in messages_data:
+        session.messages.append(ChatMessage(
+            role=msg.get("role", ""),
+            content=msg.get("content", ""),
+            created_at=msg.get("created_at", time.time()),
+            timeline=msg.get("timeline", []),
+        ))
+
+    return session
 
 
-def cleanup_expired_sessions():
-    """清理过期的 Session"""
-    now = time.time()
-    expired_ids = [
-        sid for sid, session in sessions.items()
-        if now - session.updated_at > SESSION_TTL
-    ]
-    for sid in expired_ids:
-        del sessions[sid]
-        logger.info(f"[Session] 已清理过期 Session: {sid}")
-
-    if expired_ids:
-        logger.info(f"[Session] 共清理 {len(expired_ids)} 个过期 Session")
-
-
-# 定期清理（在每次请求时触发）
-def maybe_cleanup_sessions():
-    """每 100 次请求清理一次"""
-    if not hasattr(maybe_cleanup_sessions, "counter"):
-        maybe_cleanup_sessions.counter = 0
-    maybe_cleanup_sessions.counter += 1
-    if maybe_cleanup_sessions.counter >= 100:
-        maybe_cleanup_sessions.counter = 0
-        cleanup_expired_sessions()
+def save_session_to_db(session: Session):
+    """保存 Session 到 MongoDB"""
+    try:
+        from core.deps import get_container
+        container = get_container()
+        messages_data = [
+            {
+                "role": msg.role,
+                "content": msg.content,
+                "created_at": msg.created_at,
+                "timeline": msg.timeline,
+            }
+            for msg in session.messages
+        ]
+        container.mongodb.save_session(
+            session_id=session.id,
+            title=session.title,
+            messages=messages_data,
+            updated_at=session.updated_at,
+        )
+        logger.info(f"[Session] 已保存 Session: {session.id[:20]}...")
+    except Exception as e:
+        logger.error(f"[Session] 保存 Session 失败: {e}")
 
 
 def summarize(value: Any, limit: int = 220) -> str:
@@ -227,7 +252,6 @@ def wrap_agent(name: str, invoke: Callable[[AgentState], Any], session: Session)
 def agent_running_detail(name: str, retry_count: int = 0) -> str:
     details = {
         "supervisor": "正在分析用户意图...",
-        "translator": "正在翻译查询...",
         "fetcher": "正在检索并入库论文...",
         "retriever": "正在检索相关论文片段...",
         "analyzer": "正在综合分析证据...",
@@ -240,9 +264,6 @@ def agent_running_detail(name: str, retry_count: int = 0) -> str:
 def agent_done_detail(name: str, result: dict[str, Any]) -> str:
     if name == "supervisor":
         return f"路由到 {result.get('next_agent', 'END')}"
-    if name == "translator":
-        search_query = result.get("search_query", "")
-        return f"翻译为: {search_query[:30]}..."
     if name == "critic":
         score = result.get("critic_score", {}).get("score", "N/A")
         return f"质量评分 {score}，下一步 {result.get('next_agent', 'END')}"
@@ -270,11 +291,7 @@ def create_web_initial_state(query: str) -> AgentState:
 
 
 def supervisor_route(state: AgentState) -> str:
-    next_agent = state.get("next_agent", "END")
-    # 如果是 fetcher，先经过翻译
-    if next_agent == "fetcher":
-        return "translator"
-    return next_agent
+    return state.get("next_agent", "END")
 
 
 def fetcher_route(state: AgentState) -> str:
@@ -291,15 +308,10 @@ def critic_route(state: AgentState) -> str:
 
 def build_traced_workflow(session: Session):
     from core.deps import get_container
-    from agents.translator import TranslatorAgent
 
     # 获取单例服务容器
     container = get_container()
     agents = container.create_agents()
-
-    # 添加翻译 Agent
-    translator = TranslatorAgent(container.llm)
-    agents["translator"] = translator
 
     graph = StateGraph(AgentState)
     for name, agent in agents.items():
@@ -308,11 +320,10 @@ def build_traced_workflow(session: Session):
     # 构建图结构
     graph.add_edge(START, "supervisor")
     graph.add_conditional_edges("supervisor", supervisor_route, {
-        "fetcher": "translator",  # fetcher 先经过翻译
+        "fetcher": "fetcher",
         "retriever": "retriever",
-        "END": "presenter"
+        "END": "presenter",
     })
-    graph.add_edge("translator", "fetcher")  # 翻译后传给 fetcher
     graph.add_conditional_edges("fetcher", fetcher_route, {END: END})
     graph.add_edge("retriever", "analyzer")
     graph.add_edge("analyzer", "critic")
@@ -326,8 +337,17 @@ def build_traced_workflow(session: Session):
 
 
 def get_or_create_session(session_id: str | None, message: str = "") -> Session:
-    if session_id and session_id in sessions:
-        return sessions[session_id]
+    if session_id:
+        # 先查内存缓存
+        if session_id in sessions:
+            return sessions[session_id]
+        # 再查 MongoDB
+        session = load_session_from_db(session_id)
+        if session:
+            sessions[session_id] = session
+            return session
+
+    # 创建新 Session
     new_id = session_id or uuid4().hex
     title = message.strip().replace("\n", " ")[:36] or "新对话"
     session = Session(id=new_id, title=title)
@@ -408,15 +428,66 @@ async def test_connection():
 
 @app.get("/api/sessions")
 async def list_sessions() -> list[dict[str, Any]]:
-    return sorted((serialize_session(s) for s in sessions.values()), key=lambda item: item["updated_at"], reverse=True)
+    from core.deps import get_container
+    container = get_container()
+    # 从 MongoDB 加载所有 Session
+    db_sessions = container.mongodb.list_sessions(limit=100)
+    result = []
+    for doc in db_sessions:
+        result.append({
+            "id": doc.get("session_id", ""),
+            "title": doc.get("title", ""),
+            "created_at": doc.get("created_at", 0),
+            "updated_at": doc.get("updated_at", 0),
+        })
+    return sorted(result, key=lambda item: item["updated_at"], reverse=True)
+
+
+# 定期清理过期 Session
+def maybe_cleanup_sessions():
+    """每 100 次请求清理一次"""
+    if not hasattr(maybe_cleanup_sessions, "counter"):
+        maybe_cleanup_sessions.counter = 0
+    maybe_cleanup_sessions.counter += 1
+    if maybe_cleanup_sessions.counter >= 100:
+        maybe_cleanup_sessions.counter = 0
+        # 清理 MongoDB 中超过 24 小时的 Session
+        from core.deps import get_container
+        container = get_container()
+        # 简单实现：不做清理，只清内存缓存
+        sessions.clear()
 
 
 @app.get("/api/sessions/{session_id}")
 async def get_session(session_id: str) -> dict[str, Any]:
     session = sessions.get(session_id)
     if not session:
-        raise HTTPException(status_code=404, detail="session not found")
+        # 尝试从 MongoDB 加载
+        session = load_session_from_db(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="session not found")
+        sessions[session_id] = session
     return serialize_session(session, include_messages=True)
+
+
+@app.delete("/api/sessions/{session_id}")
+async def delete_session(session_id: str) -> dict[str, str]:
+    """删除单个 Session"""
+    from core.deps import get_container
+    container = get_container()
+    container.mongodb.delete_session(session_id)
+    sessions.pop(session_id, None)
+    return {"message": "deleted"}
+
+
+@app.delete("/api/sessions")
+async def delete_all_sessions() -> dict[str, Any]:
+    """删除所有 Session"""
+    from core.deps import get_container
+    container = get_container()
+    count = container.mongodb.delete_all_sessions()
+    sessions.clear()
+    return {"message": f"deleted {count} sessions"}
 
 
 @app.post("/api/chat")
@@ -428,6 +499,8 @@ async def chat(request: ChatRequest) -> StreamingResponse:
     session.updated_at = time.time()
     session.events = []
     session.messages.append(ChatMessage(role="user", content=request.message))
+    # 持久化用户消息
+    save_session_to_db(session)
 
     async def event_stream():
         yield f"event: session\ndata: {json.dumps({'session_id': session.id}, ensure_ascii=False)}\n\n"
@@ -437,7 +510,7 @@ async def chat(request: ChatRequest) -> StreamingResponse:
             workflow = build_traced_workflow(session)
             state = create_web_initial_state(request.message)
             logger.info(f"[Chat] 开始执行 workflow，查询: {request.message[:50]}...")
-            result = await asyncio.wait_for(workflow.ainvoke(state), timeout=120)
+            result = await asyncio.wait_for(workflow.ainvoke(state), timeout=300)
             answer = result.get("answer") or result.get("error") or "未生成回复。"
             logger.info(f"[Chat] Workflow 执行完成")
         except asyncio.TimeoutError:
@@ -453,6 +526,8 @@ async def chat(request: ChatRequest) -> StreamingResponse:
         timeline = timeline_snapshot(session.events)
         session.messages.append(ChatMessage(role="assistant", content=answer, timeline=timeline))
         session.updated_at = time.time()
+        # 持久化 assistant 消息
+        save_session_to_db(session)
         for i in range(0, len(answer), 48):
             chunk = answer[i : i + 48]
             yield f"event: token\ndata: {json.dumps({'content': chunk}, ensure_ascii=False)}\n\n"

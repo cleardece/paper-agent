@@ -131,6 +131,48 @@ class MongoDBClient:
             .limit(limit)
         )
 
+    # ==================== Session 持久化 ====================
+
+    def save_session(self, session_id: str, title: str, messages: list[dict] = None, updated_at: float = None):
+        """保存 Session 到 MongoDB"""
+        doc = {
+            "session_id": session_id,
+            "title": title,
+            "updated_at": updated_at or datetime.now(timezone.utc).timestamp(),
+            "created_at": datetime.now(timezone.utc),
+        }
+        if messages:
+            doc["messages"] = messages
+        self.db["sessions"].update_one(
+            {"session_id": session_id},
+            {"$set": doc},
+            upsert=True,
+        )
+
+    def get_session(self, session_id: str) -> Optional[dict]:
+        """从 MongoDB 获取 Session"""
+        return self.db["sessions"].find_one({"session_id": session_id})
+
+    def list_sessions(self, limit: int = 50) -> list[dict]:
+        """列出所有 Session"""
+        return list(
+            self.db["sessions"].find()
+            .sort("updated_at", DESCENDING)
+            .limit(limit)
+        )
+
+    def delete_session(self, session_id: str) -> bool:
+        """删除 Session 及其消息"""
+        result = self.db["sessions"].delete_one({"session_id": session_id})
+        self.conversations.delete_many({"session_id": session_id})
+        return result.deleted_count > 0
+
+    def delete_all_sessions(self) -> int:
+        """删除所有 Session"""
+        result = self.db["sessions"].delete_many({})
+        self.conversations.delete_many({})
+        return result.deleted_count
+
         # ==================== 统计 ====================
 
     def get_stats(self) -> dict:

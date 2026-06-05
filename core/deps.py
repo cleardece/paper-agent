@@ -4,9 +4,11 @@ Paper Agent - 依赖注入模块
 """
 
 import logging
+import os
 from config import get_llm
 from storage.mongodb import MongoDBClient
 from storage.milvus import MilvusClient
+from tools.semantic_scholar import SemanticScholarAPI
 from tools.arxiv_api import ArxivAPI
 from tools.embeddings import EmbeddingService
 from tools.pdf_parser import PDFParser
@@ -26,7 +28,16 @@ class ServiceContainer:
         self.mongodb = MongoDBClient()
         self.milvus = MilvusClient()
         self.embedder = EmbeddingService()
-        self.arxiv = ArxivAPI()
+
+        # 优先使用 Semantic Scholar，fallback 到 arXiv
+        ss_api_key = os.getenv("SEMANTIC_SCHOLAR_API_KEY")
+        if ss_api_key:
+            self.paper_search = SemanticScholarAPI(api_key=ss_api_key)
+            logger.info("[Container] 使用 Semantic Scholar API")
+        else:
+            self.paper_search = ArxivAPI()
+            logger.info("[Container] 使用 arXiv API（无 Semantic Scholar API Key）")
+
         self.pdf_parser = PDFParser()
         self.code_generator = CodeGenerator(self.llm)
 
@@ -44,7 +55,7 @@ class ServiceContainer:
         return {
             "supervisor": SupervisorAgent(self.llm),
             "fetcher": FetcherAgent(
-                self.arxiv, self.pdf_parser, self.mongodb,
+                self.paper_search, self.pdf_parser, self.mongodb,
                 self.embedder, self.milvus
             ),
             "retriever": RetrieverAgent(

@@ -3,11 +3,13 @@ Paper Agent - Retriever Agent
 从Milvus语义检索相关论文分块
 """
 
+import json
 import logging
 from typing import Optional
 from langchain_core.messages import SystemMessage, HumanMessage
 
 from state.graph_state import AgentState, RetrievedChunk
+from core.cache import cache
 
 logger = logging.getLogger("paper-agent")
 
@@ -31,10 +33,17 @@ class RetrieverAgent:
         query = state["user_query"]
         logger.info(f"[Retriever] 开始检索: {query[:50]}...")
 
-        # 1. Embedding
-        logger.info("[Retriever] 正在生成查询向量...")
-        query_vector = self.embedder.embed_query(query)
-        logger.info("[Retriever] 向量生成完成")
+        # 1. Embedding（带缓存）
+        cache_key = f"embedding:{query}"
+        cached_vector = cache.get(cache_key)
+        if cached_vector:
+            logger.info("[Retriever] 使用缓存向量")
+            query_vector = cached_vector
+        else:
+            logger.info("[Retriever] 正在生成查询向量...")
+            query_vector = self.embedder.embed_query(query)
+            cache.set(cache_key, query_vector)
+            logger.info("[Retriever] 向量生成完成")
 
         # 2. Milvus检索
         logger.info("[Retriever] 正在 Milvus 中检索...")

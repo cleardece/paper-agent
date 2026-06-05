@@ -17,11 +17,17 @@ class EmbeddingService:
         if self._model is None:
             with self._lock:
                 if self._model is None:
+                    import os
                     logger.info(f"[Embedding] 正在加载模型 {self._model_name} 到 {self._device}...")
-                    self._model = SentenceTransformer(
-                        self._model_name,
-                        device=self._device
-                    )
+                    # 直接使用本地快照路径，不连 huggingface
+                    cache_dir = os.path.expanduser("~/.cache/huggingface/hub")
+                    model_path = os.path.join(cache_dir, "models--BAAI--bge-m3/snapshots/5617a9f61b028005a4858fdac845db406aefb181")
+                    if os.path.exists(model_path):
+                        logger.info(f"[Embedding] 使用本地模型: {model_path}")
+                        self._model = SentenceTransformer(model_path, device=self._device)
+                    else:
+                        logger.info(f"[Embedding] 本地模型不存在，尝试下载...")
+                        self._model = SentenceTransformer(self._model_name, device=self._device)
                     logger.info(f"[Embedding] 模型加载完成")
 
     def embed_texts(self, texts: list[str], batch_size: int = 32,

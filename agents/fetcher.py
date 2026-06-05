@@ -8,6 +8,7 @@ from typing import Optional
 from langchain_core.messages import SystemMessage, HumanMessage
 
 from state.graph_state import AgentState
+from core.cache import cache
 
 logger = logging.getLogger("paper-agent")
 
@@ -25,7 +26,7 @@ class FetcherAgent:
     def invoke(self, state: AgentState) -> dict:
         """
         抓取流程：
-        1. arXiv搜索论文
+        1. arXiv搜索论文（带缓存）
         2. 逐篇：下载PDF → 解析 → 分块
         3. 存MongoDB（元数据+分块）
         4. Embedding → 存Milvus
@@ -35,10 +36,19 @@ class FetcherAgent:
         query = state.get("search_query") or state["user_query"]
         logger.info(f"[Fetcher] 开始搜索论文: {query[:50]}...")
 
-        # 1. 搜索
-        logger.info("[Fetcher] 正在调用 arXiv API...")
-        papers = self.arxiv.search(query, max_results=5)
-        logger.info(f"[Fetcher] 找到 {len(papers)} 篇论文")
+        # 1. 搜索（带缓存）
+        cache_key = f"arxiv_search:{query}"
+        cached_papers = cache.get(cache_key)
+        if cached_papers:
+            logger.info(f"[Fetcher] 使用缓存，找到 {len(cached_papers)} 篇论文")
+            papers = cached_papers
+        else:
+            logger.info("[Fetcher] 正在调用 arXiv API...")
+            papers = self.arxiv.search(query, max_results=5)
+            logger.info(f"[Fetcher] 找到 {len(papers)} 篇论文")
+            # 缓存搜索结果
+            if papers:
+                cache.set(cache_key, papers)
 
         # 2-4. 逐篇处理
         fetched = []
@@ -132,17 +142,22 @@ class FetcherAgent:
         logger.info(f"[Fetcher] 论文处理完成: {title}")
 
     def _download_pdf(self, url: str, arxiv_id: str) -> str:
-            """下载PDF到本地临时目录"""
-            import os
+        """下载PDF到本地临时目录"""
+        import os
+        import httpx
 
-            tmp_dir = os.path.join(os.getcwd(), "tmp_pdfs")
-            os.makedirs(tmp_dir, exist_ok=True)
+        tmp_dir = os.path.join(os.getcwd(), "tmp_pdfs")
+        os.makedirs(tmp_dir, exist_ok=True)
 
-            pdf_path = os.path.join(tmp_dir, f"{arxiv_id.replace('/', '_')}.pdf")
+        pdf_path = os.path.join(tmp_dir, f"{arxiv_id.replace('/', '_')}.pdf")
 
-            if not os.path.exists(pdf_path):
-                # 使用同步下载（httpx 可选，这里保持简单）
-                import urllib.request
-                urllib.request.urlretrieve(url, pdf_path)
+        if not os.path.exists(pdf_path):
+            logger.info(f"[Fetcher] 正在下载 PDF: {url[:60]}...")
+            with httpx.Client(timeout=60, follow_redirects=True) as client:
+                response = client.get(url)
+                response.raise_for_status()
+                with open(pdf_path, "wb") as f:
+                    f.write(response.content)
+            logger.info(f"[Fetcher] PDF 下载完成: {pdf_path}")
 
-            return pdf_path
+        return pdf_path

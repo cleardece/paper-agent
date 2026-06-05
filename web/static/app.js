@@ -144,11 +144,33 @@ async function loadSessions() {
   const sessions = await res.json();
   sessionsEl.innerHTML = "";
   sessions.forEach((session) => {
+    const item = document.createElement("div");
+    item.className = `session-item-wrapper ${session.id === currentSessionId ? "active" : ""}`;
+
     const button = document.createElement("button");
-    button.className = `session-item ${session.id === currentSessionId ? "active" : ""}`;
+    button.className = "session-item";
     button.textContent = session.title;
     button.onclick = () => loadSession(session.id);
-    sessionsEl.appendChild(button);
+
+    const deleteBtn = document.createElement("button");
+    deleteBtn.className = "session-delete";
+    deleteBtn.textContent = "×";
+    deleteBtn.title = "删除对话";
+    deleteBtn.onclick = async (e) => {
+      e.stopPropagation();
+      if (!confirm("确定删除这个对话？")) return;
+      await fetch(`/api/sessions/${session.id}`, { method: "DELETE" });
+      if (session.id === currentSessionId) {
+        currentSessionId = null;
+        chatTitleEl.textContent = "新对话";
+        messagesEl.innerHTML = "";
+      }
+      await loadSessions();
+    };
+
+    item.appendChild(button);
+    item.appendChild(deleteBtn);
+    sessionsEl.appendChild(item);
   });
 }
 

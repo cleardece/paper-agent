@@ -22,6 +22,8 @@ class MilvusClient:
 
     def _ensure_collection(self):
         if self.client.has_collection(COLLECTION_NAME):
+            # 确保 collection 已加载到内存
+            self.client.load_collection(COLLECTION_NAME)
             return
 
         schema = self.client.create_schema(auto_id=True, enable_dynamic_field=True)
@@ -49,6 +51,9 @@ class MilvusClient:
             index_params=index_params,
         )
 
+        # 加载 collection 到内存
+        self.client.load_collection(COLLECTION_NAME)
+
     def insert(self, records: list[dict]) -> int:
         """批量插入向量"""
         if not records:
@@ -69,19 +74,19 @@ class MilvusClient:
 
         search_params = {"metric_type": "COSINE", "params": {"nprobe": 16}}
 
-        expr = None
+        kwargs = {
+            "collection_name": COLLECTION_NAME,
+            "data": [query_embedding],
+            "limit": top_k,
+            "search_params": search_params,
+            "output_fields": output_fields,
+        }
+
         if paper_ids:
             id_list = ", ".join(f'"{pid}"' for pid in paper_ids)
-            expr = f"paper_arxiv_id in [{id_list}]"
+            kwargs["expr"] = f"paper_arxiv_id in [{id_list}]"
 
-        results = self.client.search(
-            collection_name=COLLECTION_NAME,
-            data=[query_embedding],
-            limit=top_k,
-            search_params=search_params,
-            expr=expr,
-            output_fields=output_fields,
-        )
+        results = self.client.search(**kwargs)
 
         hits = []
         if results and len(results) > 0:
