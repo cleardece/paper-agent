@@ -30,6 +30,9 @@ TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 # LangSmith
 LANGSMITH_API_KEY = os.getenv("LANGSMITH_API_KEY")
 LANGSMITH_TRACING = os.getenv("LANGSMITH_TRACING", "true")
+
+# MinerU PDF 解析
+MINERU_URL = os.getenv("MINERU_URL")
 def get_llm():
     logger.info(f"[LLM] 正在初始化 {LLM_MODEL} @ {LLM_BASE_URL}")
     llm = ChatOpenAI(

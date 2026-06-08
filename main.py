@@ -54,7 +54,7 @@ def create_initial_state(query: str) -> AgentState:
         "critic_score": None,
         "next_agent": None,
         "iteration": 0,
-        "max_iterations": 3,
+        "max_iterations": 2,
         "error": None,
     }
 

@@ -1,23 +1,27 @@
 """
-Paper Agent - PDF解析工具 v2
-增强分块策略：更好的标题识别、保护区块、后处理合并
+Paper Agent - PDF解析工具 v3
+支持 MinerU（Markdown 输出）和 pdfplumber（fallback）
 """
 
+import os
 import re
+import logging
 from typing import Optional
+
+logger = logging.getLogger("paper-agent")
 
 
 class PDFParser:
-    """PDF论文解析器"""
+    """PDF论文解析器 - 支持 MinerU 和 pdfplumber"""
 
-    def __init__(self):
+    def __init__(self, mineru_url: str = None):
+        """
+        Args:
+            mineru_url: MinerU API 地址，如 http://localhost:8888
+                       如果为 None，使用 pdfplumber fallback
+        """
+        self.mineru_url = mineru_url or os.getenv("MINERU_URL")
         self._pdfplumber = None
-
-    def _get_pdfplumber(self):
-        if self._pdfplumber is None:
-            import pdfplumber
-            self._pdfplumber = pdfplumber
-        return self._pdfplumber
 
     def parse(self, pdf_path: str) -> dict:
         """
@@ -25,10 +29,63 @@ class PDFParser:
         返回: {
             "title": str,
             "text": str,
+            "markdown": str,        # MinerU 输出的 Markdown
             "sections": [{"heading": str, "content": str, "page": int, "level": int}],
             "page_count": int,
+            "source": "mineru" | "pdfplumber",
         }
         """
+        if self.mineru_url:
+            try:
+                return self._parse_with_mineru(pdf_path)
+            except Exception as e:
+                logger.warning(f"[PDFParser] MinerU 解析失败，回退到 pdfplumber: {e}")
+
+        return self._parse_with_pdfplumber(pdf_path)
+
+    def _parse_with_mineru(self, pdf_path: str) -> dict:
+        """使用 MinerU API 解析 PDF"""
+        import httpx
+
+        logger.info(f"[PDFParser] 使用 MinerU 解析: {pdf_path}")
+
+        with open(pdf_path, "rb") as f:
+            files = {"files": (os.path.basename(pdf_path), f, "application/pdf")}
+            response = httpx.post(
+                f"{self.mineru_url}/file_parse",
+                files=files,
+                timeout=300,
+            )
+            response.raise_for_status()
+
+        data = response.json()
+        # MinerU 返回格式：{"results": {"filename": {"md_content": "..."}}}
+        markdown = ""
+        results = data.get("results", {})
+        for fname, result in results.items():
+            markdown = result.get("md_content", "")
+            if markdown:
+                break
+
+        # 从 Markdown 解析章节
+        sections = self._markdown_to_sections(markdown)
+
+        # 提取标题
+        title = self._extract_title_from_markdown(markdown) or os.path.basename(pdf_path).replace(".pdf", "")
+
+        return {
+            "title": title,
+            "text": markdown,
+            "markdown": markdown,
+            "sections": sections,
+            "page_count": len(sections),
+            "source": "mineru",
+        }
+
+    def _parse_with_pdfplumber(self, pdf_path: str) -> dict:
+        """使用 pdfplumber 解析 PDF（fallback）"""
+        logger.info(f"[PDFParser] 使用 pdfplumber 解析: {pdf_path}")
+
         pdf = self._get_pdfplumber().open(pdf_path)
         all_text = []
         sections = []
@@ -37,7 +94,6 @@ class PDFParser:
             text = page.extract_text() or ""
             all_text.append(text)
 
-            # 按行识别章节标题
             current_section = {"heading": "", "content": "", "page": page_num + 1, "level": 0}
             for line in text.split("\n"):
                 stripped = line.strip()
@@ -69,9 +125,55 @@ class PDFParser:
         return {
             "title": title,
             "text": full_text,
+            "markdown": None,
             "sections": sections,
             "page_count": len(all_text),
+            "source": "pdfplumber",
         }
+
+    def _markdown_to_sections(self, markdown: str) -> list[dict]:
+        """将 Markdown 转换为 sections 列表"""
+        sections = []
+        current_section = {"heading": "", "content": "", "page": 0, "level": 0}
+
+        for line in markdown.split("\n"):
+            # 识别 Markdown 标题
+            heading_match = re.match(r'^(#{1,6})\s+(.+)$', line)
+            if heading_match:
+                # 保存之前的 section
+                if current_section["content"].strip():
+                    sections.append(current_section)
+
+                level = len(heading_match.group(1))
+                title = heading_match.group(2).strip()
+                current_section = {
+                    "heading": title,
+                    "content": "",
+                    "page": 0,
+                    "level": level,
+                    "is_appendix": "appendix" in title.lower(),
+                }
+            else:
+                current_section["content"] += line + "\n"
+
+        # 最后一个 section
+        if current_section["content"].strip():
+            sections.append(current_section)
+
+        return sections
+
+    def _extract_title_from_markdown(self, markdown: str) -> str:
+        """从 Markdown 提取标题"""
+        lines = markdown.strip().split("\n")
+        for line in lines[:20]:
+            # 匹配 # 标题
+            match = re.match(r'^#\s+(.+)$', line)
+            if match:
+                return match.group(1).strip()
+            # 跳过空行和元数据
+            if line.strip() and not line.startswith("---"):
+                return line.strip()[:100]
+        return ""
 
     def chunk(
             self,
@@ -81,11 +183,9 @@ class PDFParser:
             min_chunk_size: int = 200,
     ) -> list[dict]:
         """
-        分块策略 v2：
-        1. 增强标题识别
-        2. 保护区块（公式、表格、列表）
-        3. 动态 chunk size
-        4. 后处理合并过短 chunk
+        分块策略 v3：
+        - MinerU 输出：直接按 Markdown 标题分块
+        - pdfplumber 输出：使用 v2 策略
         """
         chunks = []
         chunk_index = 0
@@ -95,24 +195,15 @@ class PDFParser:
             if not content:
                 continue
 
-            # 附录使用更大的 chunk size
             is_appendix = section.get("is_appendix", False)
             cur_max = 2000 if is_appendix else max_chunk_size
 
-            # 保护区块：将公式、表格、列表替换为占位符
-            protected_content, placeholders = self._protect_blocks(content)
-
-            if len(protected_content) <= cur_max:
-                # 短内容直接作为一个 chunk
-                chunks.append(self._create_chunk(
-                    chunk_index, content, section, placeholders
-                ))
+            if len(content) <= cur_max:
+                chunks.append(self._create_chunk(chunk_index, content, section))
                 chunk_index += 1
             else:
-                # 按句子边界切分
                 new_chunks, chunk_index = self._split_long_section(
-                    protected_content, content, section, placeholders,
-                    cur_max, overlap, chunk_index
+                    content, section, cur_max, overlap, chunk_index
                 )
                 chunks.extend(new_chunks)
 
@@ -125,42 +216,35 @@ class PDFParser:
 
         return chunks
 
-    def _split_long_section(self, protected_content, original_content, section,
-                            placeholders, max_size, overlap, start_index):
+    def _split_long_section(self, content, section, max_size, overlap, start_index):
         """切分长章节"""
         chunks = []
         chunk_index = start_index
 
-        # 按句子边界切分（保护区块视为一个整体）
-        sentences = self._split_into_sentences(protected_content)
+        sentences = re.split(r'(?<=[.!?;:])\s+', content)
         current_chunk = ""
 
         for sentence in sentences:
             if len(current_chunk) + len(sentence) > max_size and current_chunk.strip():
-                # 保存当前 chunk
-                restored = self._restore_blocks(current_chunk.strip(), placeholders)
                 chunks.append(self._create_chunk(
-                    chunk_index, restored, section, placeholders
+                    chunk_index, current_chunk.strip(), section
                 ))
                 chunk_index += 1
 
-                # 重叠处理：从尾部取完整句子
                 overlap_text = self._take_last_sentences(current_chunk, overlap)
                 current_chunk = overlap_text + sentence
             else:
                 current_chunk += sentence
 
-        # 最后一个 chunk
         if current_chunk.strip():
-            restored = self._restore_blocks(current_chunk.strip(), placeholders)
             chunks.append(self._create_chunk(
-                chunk_index, restored, section, placeholders
+                chunk_index, current_chunk.strip(), section
             ))
             chunk_index += 1
 
         return chunks, chunk_index
 
-    def _create_chunk(self, index, content, section, placeholders=None):
+    def _create_chunk(self, index, content, section):
         """创建 chunk 字典"""
         return {
             "chunk_index": index,
@@ -170,16 +254,44 @@ class PDFParser:
                 "page": section.get("page", 0),
                 "level": section.get("level", 0),
                 "is_appendix": section.get("is_appendix", False),
-                "has_formula": bool(placeholders) if placeholders else False,
             },
         }
 
+    def _take_last_sentences(self, text: str, max_chars: int) -> str:
+        """从文本尾部取若干完整句子"""
+        sentences = re.split(r'(?<=[.!?])\s+', text)
+        result = ""
+        for sent in reversed(sentences):
+            if len(result) + len(sent) > max_chars:
+                break
+            result = sent + " " + result
+        return result.strip()
+
+    def _merge_short_chunks(self, chunks: list[dict], min_size: int) -> list[dict]:
+        """合并过短的 chunk"""
+        if not chunks:
+            return chunks
+
+        merged = [chunks[0]]
+        for chunk in chunks[1:]:
+            prev = merged[-1]
+            if (len(prev["content"]) < min_size and
+                    len(prev["content"]) + len(chunk["content"]) <= 2000):
+                prev["content"] = prev["content"] + "\n" + chunk["content"]
+                prev["metadata"]["merged"] = True
+            else:
+                merged.append(chunk)
+
+        return merged
+
+    def _get_pdfplumber(self):
+        if self._pdfplumber is None:
+            import pdfplumber
+            self._pdfplumber = pdfplumber
+        return self._pdfplumber
+
     def _is_heading(self, line: str) -> dict | None:
-        """
-        增强标题识别
-        返回: {"title": str, "level": int, "is_appendix": bool} 或 None
-        """
-        # 无编号标题
+        """增强标题识别"""
         no_number_patterns = [
             (r'^(Abstract)\s*$', 1, False),
             (r'^(Introduction)\s*$', 1, False),
@@ -191,145 +303,23 @@ class PDFParser:
             if re.match(pattern, line, re.IGNORECASE):
                 return {"title": line.strip(), "level": level, "is_appendix": is_appendix}
 
-        # 附录标题: Appendix A, Appendix B.1
         appendix_match = re.match(r'^(Appendix)\s+([A-Z])(?:\.(\d+))?\s*(.*)', line, re.IGNORECASE)
         if appendix_match:
             sub = appendix_match.group(3)
             level = 2 if sub else 1
-            title = line.strip()
-            return {"title": title, "level": level, "is_appendix": True}
+            return {"title": line.strip(), "level": level, "is_appendix": True}
 
-        # 编号标题: 1, 1.1, 1.1.1, 2.3 Method
         number_match = re.match(r'^(\d+(?:\.\d+)*)\s+(.+)$', line)
         if number_match:
             num = number_match.group(1)
             level = num.count('.') + 1
             return {"title": line.strip(), "level": level, "is_appendix": False}
 
-        # 附录内小节: A.1, B.2, C.3.1
         appendix_sub_match = re.match(r'^([A-Z]\.\d+(?:\.\d+)*)\s+(.+)', line)
         if appendix_sub_match:
             return {"title": line.strip(), "level": 2, "is_appendix": True}
 
         return None
-
-    def _protect_blocks(self, text: str) -> tuple[str, list[str]]:
-        """
-        保护区块：将公式、表格、列表替换为占位符
-        返回: (处理后的文本, 占位符列表)
-        """
-        placeholders = []
-        protected = text
-
-        # 保护行间公式: $$ ... $$ 或 \[ ... \]
-        for pattern in [r'\$\$.*?\$\$', r'\\\[.*?\\\]']:
-            protected = re.sub(pattern, lambda m: self._store(m.group(0), placeholders),
-                               protected, flags=re.DOTALL)
-
-        # 保护表格：连续行以 | 开头
-        lines = protected.split('\n')
-        new_lines = []
-        i = 0
-        while i < len(lines):
-            stripped = lines[i].strip()
-            if stripped.startswith('|') and stripped.endswith('|'):
-                table_lines = [lines[i]]
-                i += 1
-                while i < len(lines) and lines[i].strip().startswith('|'):
-                    table_lines.append(lines[i])
-                    i += 1
-                block = '\n'.join(table_lines)
-                new_lines.append(self._store(block, placeholders))
-            else:
-                new_lines.append(lines[i])
-                i += 1
-        protected = '\n'.join(new_lines)
-
-        # 保护列表：连续行以 - * • 或数字. 开头
-        lines = protected.split('\n')
-        new_lines = []
-        i = 0
-        while i < len(lines):
-            stripped = lines[i].strip()
-            if re.match(r'^[-*•]\s', stripped) or re.match(r'^\d+\.\s', stripped):
-                list_lines = [lines[i]]
-                i += 1
-                while i < len(lines):
-                    s = lines[i].strip()
-                    if re.match(r'^[-*•]\s', s) or re.match(r'^\d+\.\s', s):
-                        list_lines.append(lines[i])
-                        i += 1
-                    else:
-                        break
-                block = '\n'.join(list_lines)
-                new_lines.append(self._store(block, placeholders))
-            else:
-                new_lines.append(lines[i])
-                i += 1
-        protected = '\n'.join(new_lines)
-
-        return protected, placeholders
-
-    def _store(self, text: str, placeholders: list) -> str:
-        """存储受保护文本，返回占位符"""
-        placeholders.append(text)
-        return f"[PROTECTED_{len(placeholders) - 1}]"
-
-    def _restore_blocks(self, text: str, placeholders: list) -> str:
-        """还原占位符为原始文本"""
-        result = text
-        for i, block in enumerate(placeholders):
-            result = result.replace(f"[PROTECTED_{i}]", block)
-        return result
-
-    def _split_into_sentences(self, text: str) -> list[str]:
-        """按句子边界切分，保护区块视为一个整体"""
-        # 先保护区块
-        protected = text
-        placeholders = []
-        protected = re.sub(
-            r'\[PROTECTED_\d+\]',
-            lambda m: self._store(m.group(0), placeholders),
-            protected
-        )
-
-        # 按句子边界切分
-        sentences = re.split(r'(?<=[.!?;:])\s+', protected)
-
-        # 还原保护区块
-        result = []
-        for sent in sentences:
-            result.append(self._restore_blocks(sent, placeholders))
-
-        return result
-
-    def _take_last_sentences(self, text: str, max_chars: int) -> str:
-        """从文本尾部取若干完整句子，总长度不超过 max_chars"""
-        sentences = re.split(r'(?<=[.!?])\s+', text)
-        result = ""
-        for sent in reversed(sentences):
-            if len(result) + len(sent) > max_chars:
-                break
-            result = sent + " " + result
-        return result.strip()
-
-    def _merge_short_chunks(self, chunks: list[dict], min_size: int) -> list[dict]:
-        """合并过短的 chunk 到相邻块"""
-        if not chunks:
-            return chunks
-
-        merged = [chunks[0]]
-        for chunk in chunks[1:]:
-            prev = merged[-1]
-            if (len(prev["content"]) < min_size and
-                    len(prev["content"]) + len(chunk["content"]) <= 2000):
-                # 合并到前一个
-                prev["content"] = prev["content"] + "\n" + chunk["content"]
-                prev["metadata"]["merged"] = True
-            else:
-                merged.append(chunk)
-
-        return merged
 
     def _extract_title(self, text: str, pdf_path: str) -> str:
         """从文本开头提取标题"""
@@ -338,8 +328,7 @@ class PDFParser:
         for line in lines[:15]:
             stripped = line.strip()
             if stripped and len(stripped) > 5:
-                # 跳过期刊信息、页码等
                 if re.match(r'^(Vol\.|ISSN|DOI|http|www\.)', stripped, re.IGNORECASE):
                     continue
                 candidates.append(stripped)
-        return candidates[0] if candidates else pdf_path.split("/")[-1].replace(".pdf", "")
+        return candidates[0] if candidates else os.path.basename(pdf_path).replace(".pdf", "")

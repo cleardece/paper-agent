@@ -5,7 +5,7 @@ Paper Agent - 依赖注入模块
 
 import logging
 import os
-from config import get_llm
+from config import get_llm, MINERU_URL
 from storage.mongodb import MongoDBClient
 from storage.milvus import MilvusClient
 from tools.semantic_scholar import SemanticScholarAPI
@@ -38,7 +38,13 @@ class ServiceContainer:
             self.paper_search = ArxivAPI()
             logger.info("[Container] 使用 arXiv API（无 Semantic Scholar API Key）")
 
-        self.pdf_parser = PDFParser()
+        # PDF 解析：优先 MinerU，fallback 到 pdfplumber
+        self.pdf_parser = PDFParser(mineru_url=MINERU_URL)
+        if MINERU_URL:
+            logger.info(f"[Container] 使用 MinerU: {MINERU_URL}")
+        else:
+            logger.info("[Container] 使用 pdfplumber（未配置 MinerU）")
+
         self.code_generator = CodeGenerator(self.llm)
 
         logger.info("[Container] 服务容器初始化完成")

@@ -285,13 +285,20 @@ def create_web_initial_state(query: str) -> AgentState:
         "critic_score": None,
         "next_agent": None,
         "iteration": 0,
-        "max_iterations": 3,
+        "max_iterations": 2,
         "error": None,
     }
 
 
 def supervisor_route(state: AgentState) -> str:
-    return state.get("next_agent", "END")
+    next_agent = state.get("next_agent", "END")
+    if state.get("error"):
+        logger.warning("[SupervisorRoute] 检测到错误，路由到 presenter")
+        return "presenter"
+    if next_agent not in ("fetcher", "retriever", "END"):
+        logger.warning(f"[SupervisorRoute] 非法路由 '{next_agent}'，使用 END")
+        return "END"
+    return next_agent
 
 
 def fetcher_route(state: AgentState) -> str:
@@ -303,7 +310,12 @@ def critic_route(state: AgentState) -> str:
     if state.get("error"):
         logger.warning("[CriticRoute] 检测到错误，强制终止循环")
         return "presenter"
-    return state.get("next_agent", "END")
+    next_agent = state.get("next_agent", "END")
+    # 如果 next_agent 不在合法范围内，强制终止
+    if next_agent not in ("presenter", "retriever", "END"):
+        logger.warning(f"[CriticRoute] 非法路由 '{next_agent}'，强制终止")
+        return "presenter"
+    return next_agent
 
 
 def build_traced_workflow(session: Session):
@@ -514,14 +526,14 @@ async def chat(request: ChatRequest) -> StreamingResponse:
             answer = result.get("answer") or result.get("error") or "未生成回复。"
             logger.info(f"[Chat] Workflow 执行完成")
         except asyncio.TimeoutError:
-            answer = "执行超时（120秒），请检查服务连接或稍后重试。"
+            answer = "抱歉，处理时间较长，请稍后重试。"
             logger.warning("[Chat] Workflow 执行超时")
         except Exception as exc:
-            answer = f"执行失败：{html.escape(str(exc))}"
+            answer = f"抱歉，处理过程中出现问题，请稍后重试。"
             logger.error(f"[Chat] Workflow 执行失败: {exc}", exc_info=True)
 
         if answer is None:
-            answer = "未知错误，未生成回复。"
+            answer = "抱歉，未能生成回复，请稍后重试。"
 
         timeline = timeline_snapshot(session.events)
         session.messages.append(ChatMessage(role="assistant", content=answer, timeline=timeline))
