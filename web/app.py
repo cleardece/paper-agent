@@ -536,58 +536,6 @@ async def _process_upload(container, pdf_path, filename, arxiv_id):
         logger.error(f"[Upload] 后台处理失败: {e}", exc_info=True)
 
 
-# ==================== 收藏 API ====================
-
-@app.get("/api/favorites")
-async def list_favorites(tag: str = None):
-    """列出收藏的论文"""
-    from core.deps import get_container
-    container = get_container()
-    favorites = container.mongodb.list_favorites(tag=tag)
-    result = []
-    for fav in favorites:
-        paper = container.mongodb.get_paper(fav["paper_arxiv_id"])
-        result.append({
-            "arxiv_id": fav["paper_arxiv_id"],
-            "title": paper.get("title", "") if paper else "",
-            "tags": fav.get("tags", []),
-            "notes": fav.get("notes", ""),
-            "created_at": fav.get("created_at", 0),
-        })
-    return result
-
-
-@app.post("/api/favorites/{arxiv_id}")
-async def add_favorite(arxiv_id: str, body: dict = None):
-    """收藏论文"""
-    from core.deps import get_container
-    container = get_container()
-    body = body or {}
-    container.mongodb.add_favorite(
-        arxiv_id,
-        tags=body.get("tags", []),
-        notes=body.get("notes", ""),
-    )
-    return {"message": "已收藏"}
-
-
-@app.delete("/api/favorites/{arxiv_id}")
-async def remove_favorite(arxiv_id: str):
-    """取消收藏"""
-    from core.deps import get_container
-    container = get_container()
-    container.mongodb.remove_favorite(arxiv_id)
-    return {"message": "已取消收藏"}
-
-
-@app.get("/api/favorites/{arxiv_id}/check")
-async def check_favorite(arxiv_id: str):
-    """检查是否已收藏"""
-    from core.deps import get_container
-    container = get_container()
-    return {"is_favorite": container.mongodb.is_favorite(arxiv_id)}
-
-
 # ==================== 论文列表 API ====================
 
 @app.get("/api/papers")
@@ -596,15 +544,14 @@ async def list_papers():
     from core.deps import get_container
     container = get_container()
     papers = container.mongodb.list_papers(limit=50)
-    result = []
-    for p in papers:
-        result.append({
+    return [
+        {
             "arxiv_id": p.get("arxiv_id", ""),
             "title": p.get("title", ""),
             "status": p.get("status", ""),
-            "is_favorite": container.mongodb.is_favorite(p.get("arxiv_id", "")),
-        })
-    return result
+        }
+        for p in papers
+    ]
 
 
 @app.post("/api/compare")

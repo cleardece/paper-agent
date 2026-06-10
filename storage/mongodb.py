@@ -173,55 +173,11 @@ class MongoDBClient:
         self.conversations.delete_many({})
         return result.deleted_count
 
-    # ==================== 收藏操作 ====================
-
-    def add_favorite(self, paper_arxiv_id: str, tags: list[str] = None, notes: str = ""):
-        """收藏论文"""
-        doc = {
-            "paper_arxiv_id": paper_arxiv_id,
-            "tags": tags or [],
-            "notes": notes,
-            "created_at": datetime.now(timezone.utc),
-        }
-        self.db["favorites"].update_one(
-            {"paper_arxiv_id": paper_arxiv_id},
-            {"$set": doc},
-            upsert=True,
-        )
-
-    def remove_favorite(self, paper_arxiv_id: str) -> bool:
-        """取消收藏"""
-        result = self.db["favorites"].delete_one({"paper_arxiv_id": paper_arxiv_id})
-        return result.deleted_count > 0
-
-    def is_favorite(self, paper_arxiv_id: str) -> bool:
-        """是否已收藏"""
-        return self.db["favorites"].count_documents({"paper_arxiv_id": paper_arxiv_id}, limit=1) > 0
-
-    def list_favorites(self, tag: str = None) -> list[dict]:
-        """列出收藏"""
-        query = {"tags": tag} if tag else {}
-        return list(self.db["favorites"].find(query).sort("created_at", DESCENDING))
-
-    def update_favorite(self, paper_arxiv_id: str, tags: list[str] = None, notes: str = None):
-        """更新收藏"""
-        update = {}
-        if tags is not None:
-            update["tags"] = tags
-        if notes is not None:
-            update["notes"] = notes
-        if update:
-            self.db["favorites"].update_one(
-                {"paper_arxiv_id": paper_arxiv_id},
-                {"$set": update},
-            )
-
     # ==================== 统计 ====================
 
     def get_stats(self) -> dict:
         return {
             "total_papers": self.count_papers(),
-            "total_favorites": self.db["favorites"].count_documents({}),
             "papers_by_status": {
                 status: self.count_papers(status)
                 for status in ["pending", "parsed", "chunked", "embedded", "indexed"]

@@ -313,29 +313,3 @@ fileInput.addEventListener("change", async () => {
   fileInput.value = "";
   setTimeout(() => { uploadStatus.style.display = "none"; }, 5000);
 });
-
-// ========== 收藏功能 ==========
-async function toggleFavorite(arxivId) {
-  const res = await fetch(`/api/favorites/${arxivId}/check`);
-  const { is_favorite } = await res.json();
-  if (is_favorite) {
-    await fetch(`/api/favorites/${arxivId}`, { method: "DELETE" });
-  } else {
-    await fetch(`/api/favorites/${arxivId}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ tags: [] }),
-    });
-  }
-  return !is_favorite;
-}
-
-async function loadFavorites() {
-  const res = await fetch("/api/favorites");
-  return await res.json();
-}
-
-async function loadPapers() {
-  const res = await fetch("/api/papers");
-  return await res.json();
-}
