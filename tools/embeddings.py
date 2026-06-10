@@ -19,9 +19,10 @@ class EmbeddingService:
                 if self._model is None:
                     import os
                     logger.info(f"[Embedding] 正在加载模型 {self._model_name} 到 {self._device}...")
-                    # 直接使用本地快照路径，不连 huggingface
-                    cache_dir = os.path.expanduser("~/.cache/huggingface/hub")
-                    model_path = os.path.join(cache_dir, "models--BAAI--bge-m3/snapshots/5617a9f61b028005a4858fdac845db406aefb181")
+                    # 优先 D 盘，fallback 到 C 盘
+                    model_path = os.path.join("D:/huggingface_cache/models--BAAI--bge-m3/snapshots/5617a9f61b028005a4858fdac845db406aefb181")
+                    if not os.path.exists(model_path):
+                        model_path = os.path.expanduser("~/.cache/huggingface/hub/models--BAAI--bge-m3/snapshots/5617a9f61b028005a4858fdac845db406aefb181")
                     if os.path.exists(model_path):
                         logger.info(f"[Embedding] 使用本地模型: {model_path}")
                         self._model = SentenceTransformer(model_path, device=self._device)

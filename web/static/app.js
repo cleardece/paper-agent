@@ -275,3 +275,67 @@ newChatButton.addEventListener("click", () => {
 });
 
 loadSessions();
+
+// ========== 论文上传 ==========
+const uploadBtn = document.querySelector("#uploadBtn");
+const fileInput = document.querySelector("#fileInput");
+const uploadStatus = document.querySelector("#uploadStatus");
+
+uploadBtn.addEventListener("click", () => fileInput.click());
+
+fileInput.addEventListener("change", async () => {
+  const file = fileInput.files[0];
+  if (!file) return;
+
+  uploadStatus.style.display = "block";
+  uploadStatus.className = "upload-status";
+  uploadStatus.textContent = `正在上传并解析: ${file.name}...`;
+  uploadBtn.disabled = true;
+
+  const formData = new FormData();
+  formData.append("file", file);
+
+  try {
+    const res = await fetch("/api/upload", { method: "POST", body: formData });
+    const data = await res.json();
+    if (res.ok) {
+      uploadStatus.textContent = `✅ ${data.title.slice(0, 40)}... (${data.chunks} 个分块, ${data.source})`;
+    } else {
+      uploadStatus.className = "upload-status error";
+      uploadStatus.textContent = `❌ ${data.detail || "上传失败"}`;
+    }
+  } catch (e) {
+    uploadStatus.className = "upload-status error";
+    uploadStatus.textContent = `❌ 网络错误: ${e.message}`;
+  }
+
+  uploadBtn.disabled = false;
+  fileInput.value = "";
+  setTimeout(() => { uploadStatus.style.display = "none"; }, 5000);
+});
+
+// ========== 收藏功能 ==========
+async function toggleFavorite(arxivId) {
+  const res = await fetch(`/api/favorites/${arxivId}/check`);
+  const { is_favorite } = await res.json();
+  if (is_favorite) {
+    await fetch(`/api/favorites/${arxivId}`, { method: "DELETE" });
+  } else {
+    await fetch(`/api/favorites/${arxivId}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ tags: [] }),
+    });
+  }
+  return !is_favorite;
+}
+
+async function loadFavorites() {
+  const res = await fetch("/api/favorites");
+  return await res.json();
+}
+
+async function loadPapers() {
+  const res = await fetch("/api/papers");
+  return await res.json();
+}

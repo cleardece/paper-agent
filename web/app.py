@@ -6,6 +6,7 @@ import asyncio
 import html
 import json
 import logging
+import re
 import sys
 import time
 from dataclasses import dataclass, field
@@ -21,7 +22,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("paper-agent")
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -438,6 +439,260 @@ async def test_connection():
     return results
 
 
+import asyncio
+
+@app.post("/api/upload")
+async def upload_paper(file: UploadFile):
+    """上传本地 PDF 论文，后台异步解析并入库"""
+    import json
+    import os
+    from core.deps import get_container
+
+    if not file.filename.endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="只支持 PDF 文件")
+
+    container = get_container()
+
+    # 保存到临时目录
+    tmp_dir = "tmp_pdfs"
+    os.makedirs(tmp_dir, exist_ok=True)
+    pdf_path = os.path.join(tmp_dir, file.filename)
+
+    content = await file.read()
+    with open(pdf_path, "wb") as f:
+        f.write(content)
+
+    logger.info(f"[Upload] 收到文件: {file.filename} ({len(content)} bytes)")
+
+    # 生成 arxiv_id
+    arxiv_id = os.path.splitext(file.filename)[0].replace(" ", "_").replace("/", "_")
+    if len(arxiv_id) > 60:
+        arxiv_id = arxiv_id[:60]
+
+    # 立即返回，后台处理
+    asyncio.create_task(_process_upload(container, pdf_path, file.filename, arxiv_id))
+
+    return {
+        "message": "上传成功，正在后台解析...",
+        "arxiv_id": arxiv_id,
+        "title": file.filename,
+    }
+
+
+async def _process_upload(container, pdf_path, filename, arxiv_id):
+    """后台处理上传的 PDF"""
+    import json
+    try:
+        # 1. 解析 PDF
+        result = await asyncio.get_event_loop().run_in_executor(
+            None, container.pdf_parser.parse, pdf_path
+        )
+        logger.info(f"[Upload] 解析完成: {result['source']}, {len(result['sections'])} 章节")
+
+        # 2. 分块
+        chunks = container.pdf_parser.chunk(result["sections"])
+        logger.info(f"[Upload] 分块完成: {len(chunks)} 个")
+
+        # 3. 存 MongoDB
+        container.mongodb.upsert_paper({
+            "arxiv_id": arxiv_id,
+            "title": result.get("title", filename),
+            "abstract": "",
+            "authors": [],
+            "pdf_url": f"local://{filename}",
+            "status": "chunked",
+        })
+        mongo_chunks = [
+            {
+                "paper_arxiv_id": arxiv_id,
+                "chunk_index": c["chunk_index"],
+                "content": c["content"],
+                "metadata": c.get("metadata", {}),
+            }
+            for c in chunks
+        ]
+        container.mongodb.insert_chunks(mongo_chunks)
+        logger.info(f"[Upload] MongoDB 入库完成")
+
+        # 4. Embedding + Milvus
+        texts = [c["content"] for c in chunks]
+        vectors = await asyncio.get_event_loop().run_in_executor(
+            None, container.embedder.embed_texts, texts
+        )
+        milvus_records = [
+            {
+                "paper_arxiv_id": arxiv_id,
+                "chunk_index": c["chunk_index"],
+                "content": c["content"],
+                "embedding": vectors[i],
+                "metadata_json": json.dumps(c.get("metadata", {})),
+            }
+            for i, c in enumerate(chunks)
+        ]
+        container.milvus.insert(milvus_records)
+        logger.info(f"[Upload] Milvus 入库完成: {len(chunks)} 分块")
+
+    except Exception as e:
+        logger.error(f"[Upload] 后台处理失败: {e}", exc_info=True)
+
+
+# ==================== 收藏 API ====================
+
+@app.get("/api/favorites")
+async def list_favorites(tag: str = None):
+    """列出收藏的论文"""
+    from core.deps import get_container
+    container = get_container()
+    favorites = container.mongodb.list_favorites(tag=tag)
+    result = []
+    for fav in favorites:
+        paper = container.mongodb.get_paper(fav["paper_arxiv_id"])
+        result.append({
+            "arxiv_id": fav["paper_arxiv_id"],
+            "title": paper.get("title", "") if paper else "",
+            "tags": fav.get("tags", []),
+            "notes": fav.get("notes", ""),
+            "created_at": fav.get("created_at", 0),
+        })
+    return result
+
+
+@app.post("/api/favorites/{arxiv_id}")
+async def add_favorite(arxiv_id: str, body: dict = None):
+    """收藏论文"""
+    from core.deps import get_container
+    container = get_container()
+    body = body or {}
+    container.mongodb.add_favorite(
+        arxiv_id,
+        tags=body.get("tags", []),
+        notes=body.get("notes", ""),
+    )
+    return {"message": "已收藏"}
+
+
+@app.delete("/api/favorites/{arxiv_id}")
+async def remove_favorite(arxiv_id: str):
+    """取消收藏"""
+    from core.deps import get_container
+    container = get_container()
+    container.mongodb.remove_favorite(arxiv_id)
+    return {"message": "已取消收藏"}
+
+
+@app.get("/api/favorites/{arxiv_id}/check")
+async def check_favorite(arxiv_id: str):
+    """检查是否已收藏"""
+    from core.deps import get_container
+    container = get_container()
+    return {"is_favorite": container.mongodb.is_favorite(arxiv_id)}
+
+
+# ==================== 论文列表 API ====================
+
+@app.get("/api/papers")
+async def list_papers():
+    """列出所有论文"""
+    from core.deps import get_container
+    container = get_container()
+    papers = container.mongodb.list_papers(limit=50)
+    result = []
+    for p in papers:
+        result.append({
+            "arxiv_id": p.get("arxiv_id", ""),
+            "title": p.get("title", ""),
+            "status": p.get("status", ""),
+            "is_favorite": container.mongodb.is_favorite(p.get("arxiv_id", "")),
+        })
+    return result
+
+
+@app.post("/api/compare")
+async def compare_papers(body: dict):
+    """对比多篇论文"""
+    from core.deps import get_container
+    container = get_container()
+
+    paper_ids = body.get("paper_ids", [])
+    if len(paper_ids) < 2:
+        raise HTTPException(status_code=400, detail="至少需要2篇论文进行对比")
+
+    # 检索每篇论文的内容
+    all_chunks = []
+    paper_info = []
+    for pid in paper_ids:
+        chunks = container.mongodb.get_chunks_by_paper(pid)
+        paper = container.mongodb.get_paper(pid)
+        title = paper.get("title", pid) if paper else pid
+        paper_info.append({"arxiv_id": pid, "title": title, "chunks": len(chunks)})
+        for c in chunks:
+            all_chunks.append({
+                "paper_title": title,
+                "chunk_index": c.get("chunk_index", 0),
+                "content": c.get("content", ""),
+                "score": 1.0,
+            })
+
+    if not all_chunks:
+        raise HTTPException(status_code=404, detail="未找到论文内容")
+
+    # 用 Analyzer 分析
+    from agents.analyzer import AnalyzerAgent, _build_analyzer_tools
+    tools = _build_analyzer_tools(container.mongodb)
+    analyzer = AnalyzerAgent(container.llm, container.mongodb)
+
+    state = {
+        "user_query": f"对比分析以下论文：{', '.join(p['title'][:30] for p in paper_info)}",
+        "retrieved_chunks": all_chunks[:20],  # 限制 chunk 数量
+    }
+
+    try:
+        import asyncio
+        result = await asyncio.get_event_loop().run_in_executor(
+            None, analyzer.invoke, state
+        )
+        return {
+            "papers": paper_info,
+            "analysis": result.get("analysis", ""),
+        }
+    except Exception as e:
+        logger.error(f"[Compare] 对比失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"对比失败: {str(e)}")
+
+
+@app.get("/api/citations/{arxiv_id}")
+async def get_citations(arxiv_id: str):
+    """获取论文的引用关系"""
+    from core.deps import get_container
+    container = get_container()
+
+    # 从 Semantic Scholar 获取引用数据
+    try:
+        import httpx
+        # 尝试用 arxiv_id 搜索 Semantic Scholar
+        response = httpx.get(
+            f"https://api.semanticscholar.org/graph/v1/paper/ArXiv:{arxiv_id}",
+            params={"fields": "title,references.title,references.paperId,citations.title,citations.paperId"},
+            headers={"x-api-key": os.getenv("SEMANTIC_SCHOLAR_API_KEY", "")},
+            timeout=15,
+        )
+        if response.status_code == 200:
+            data = response.json()
+            references = data.get("references", []) or []
+            citations = data.get("citations", []) or []
+            return {
+                "paper_id": arxiv_id,
+                "title": data.get("title", ""),
+                "references": [{"title": r.get("title", ""), "paper_id": r.get("paperId", "")} for r in references[:20]],
+                "citations": [{"title": c.get("title", ""), "paper_id": c.get("paperId", "")} for c in citations[:20]],
+            }
+        else:
+            return {"paper_id": arxiv_id, "references": [], "citations": [], "error": f"API 返回 {response.status_code}"}
+    except Exception as e:
+        logger.error(f"[Citations] 获取引用失败: {e}")
+        return {"paper_id": arxiv_id, "references": [], "citations": [], "error": str(e)}
+
+
 @app.get("/api/sessions")
 async def list_sessions() -> list[dict[str, Any]]:
     from core.deps import get_container
@@ -517,6 +772,20 @@ async def chat(request: ChatRequest) -> StreamingResponse:
     async def event_stream():
         yield f"event: session\ndata: {json.dumps({'session_id': session.id}, ensure_ascii=False)}\n\n"
         answer = None
+
+        # 启动心跳协程，定期推送 timeline 状态
+        heartbeat_done = asyncio.Event()
+
+        async def heartbeat():
+            while not heartbeat_done.is_set():
+                await asyncio.sleep(2)
+                if not heartbeat_done.is_set():
+                    timeline = timeline_snapshot(session.events)
+                    yield_str = json.dumps({"timeline": timeline}, ensure_ascii=False)
+                    # 通过 session 缓存最新的 timeline，前端轮询获取
+                    session._latest_timeline = timeline
+
+        # 用 task 跑心跳（注意：SSE 不支持多 yield，改用事件推送）
         try:
             logger.info("[Chat] 开始构建 workflow...")
             workflow = build_traced_workflow(session)
@@ -538,12 +807,16 @@ async def chat(request: ChatRequest) -> StreamingResponse:
         timeline = timeline_snapshot(session.events)
         session.messages.append(ChatMessage(role="assistant", content=answer, timeline=timeline))
         session.updated_at = time.time()
-        # 持久化 assistant 消息
         save_session_to_db(session)
-        for i in range(0, len(answer), 48):
-            chunk = answer[i : i + 48]
-            yield f"event: token\ndata: {json.dumps({'content': chunk}, ensure_ascii=False)}\n\n"
-            await asyncio.sleep(0)
+
+        # 流式输出最终回答：逐句发送，模拟打字效果
+        sentences = re.split(r'(?<=[。！？.!?\n])\s*', answer)
+        for sentence in sentences:
+            if not sentence.strip():
+                continue
+            yield f"event: token\ndata: {json.dumps({'content': sentence}, ensure_ascii=False)}\n\n"
+            await asyncio.sleep(0.05)
+
         yield f"event: done\ndata: {json.dumps({'timeline': timeline}, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
