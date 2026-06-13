@@ -35,14 +35,14 @@ class RetrieverAgent:
 
         # 1. Embedding（带缓存）
         cache_key = f"embedding:{query}"
-        cached_vector = cache.get(cache_key)
+        cached_vector = cache.get(state.get("session_id"), cache_key)
         if cached_vector:
             logger.info("[Retriever] 使用缓存向量")
             query_vector = cached_vector
         else:
             logger.info("[Retriever] 正在生成查询向量...")
             query_vector = self.embedder.embed_query(query)
-            cache.set(cache_key, query_vector)
+            cache.set(state.get("session_id"), cache_key, query_vector)
             logger.info("[Retriever] 向量生成完成")
 
         # 2. Milvus检索

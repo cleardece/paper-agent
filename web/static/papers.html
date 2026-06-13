@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>论文库 - Paper Agent</title>
+    <link rel="stylesheet" href="/static/style.css" />
+    <style>
+      body { grid-template-columns: 1fr; }
+      .sidebar { display: none; }
+      .papers-page {
+        max-width: 900px;
+        margin: 0 auto;
+        padding: 30px 20px;
+      }
+      .papers-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 24px;
+      }
+      .papers-header h1 {
+        color: var(--green);
+        margin: 0;
+      }
+      .back-btn {
+        background: var(--bubble);
+        color: var(--muted);
+        border: 1px solid var(--border);
+        padding: 8px 16px;
+        border-radius: 8px;
+        cursor: pointer;
+        text-decoration: none;
+      }
+      .back-btn:hover { color: var(--text); background: #2a2a2a; }
+      .paper-card {
+        background: var(--bubble);
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 16px 20px;
+        margin-bottom: 12px;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        transition: border-color 0.15s;
+      }
+      .paper-card:hover { border-color: var(--green); }
+      .paper-title {
+        font-weight: 600;
+        color: var(--text);
+        margin-bottom: 6px;
+      }
+      .paper-meta {
+        color: var(--muted);
+        font-size: 13px;
+      }
+      .paper-status {
+        display: inline-block;
+        padding: 2px 8px;
+        border-radius: 4px;
+        font-size: 12px;
+        margin-left: 8px;
+      }
+      .paper-status.chunked { background: #1a3a1a; color: #4ade80; }
+      .paper-status.pending { background: #3a3a1a; color: #fbbf24; }
+      .paper-actions { display: flex; gap: 8px; }
+      .btn-ask {
+        background: var(--green);
+        color: white;
+        border: none;
+        padding: 8px 16px;
+        border-radius: 8px;
+        cursor: pointer;
+        font-size: 13px;
+      }
+      .btn-ask:hover { opacity: 0.9; }
+      .btn-delete {
+        background: transparent;
+        color: var(--muted);
+        border: 1px solid var(--border);
+        padding: 8px 12px;
+        border-radius: 8px;
+        cursor: pointer;
+        font-size: 13px;
+      }
+      .btn-delete:hover { color: #f87171; border-color: #f87171; }
+      .empty-state {
+        text-align: center;
+        padding: 60px 20px;
+        color: var(--muted);
+      }
+      .empty-state p { font-size: 16px; margin-bottom: 16px; }
+      .paper-count {
+        color: var(--muted);
+        font-size: 14px;
+      }
+    </style>
+  </head>
+  <body>
+    <main class="papers-page">
+      <div class="papers-header">
+        <div>
+          <h1>论文库</h1>
+          <span id="paperCount" class="paper-count"></span>
+        </div>
+        <div style="display:flex;gap:8px;">
+          <a href="/" class="back-btn">← 返回对话</a>
+        </div>
+      </div>
+      <div id="papersContainer"></div>
+    </main>
+    <script>
+      async function loadPapers() {
+        const res = await fetch("/api/papers");
+        const papers = await res.json();
+        const container = document.getElementById("papersContainer");
+        const countEl = document.getElementById("paperCount");
+        countEl.textContent = `共 ${papers.length} 篇论文`;
+
+        if (papers.length === 0) {
+          container.innerHTML = '<div class="empty-state"><p>暂无论文</p><p>通过对话搜索论文，或上传本地 PDF</p></div>';
+          return;
+        }
+        container.innerHTML = papers.map(p => `
+          <div class="paper-card">
+            <div>
+              <div class="paper-title">${escapeHtml(p.title)}</div>
+              <div class="paper-meta">
+                ${escapeHtml(p.arxiv_id)}
+                <span class="paper-status ${p.status}">${p.status}</span>
+              </div>
+            </div>
+            <div class="paper-actions">
+              <button class="btn-ask" onclick="askAbout('${escapeHtml(p.title.replace(/'/g, "\\'"))}')">提问</button>
+              <button class="btn-delete" onclick="deletePaper('${p.arxiv_id}')">删除</button>
+            </div>
+          </div>
+        `).join("");
+      }
+
+      function escapeHtml(t) {
+        return String(t).replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;").replaceAll('"',"&quot;").replaceAll("'","&#039;");
+      }
+
+      async function deletePaper(arxivId) {
+        if (!confirm("确定删除这篇论文？删除后不可恢复。")) return;
+        await fetch(`/api/papers/${arxivId}`, { method: "DELETE" });
+        loadPapers();
+      }
+
+      function askAbout(title) {
+        // 存入 localStorage，由 app.js 在首页加载时取出并自动发送
+        localStorage.setItem("pendingPaperQuestion", `关于"${title}"这篇论文，帮我分析一下`);
+        window.location.href = "/";
+      }
+
+      loadPapers();
+    </script>
+  </body>
+</html>

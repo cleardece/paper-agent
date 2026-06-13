@@ -276,6 +276,15 @@ newChatButton.addEventListener("click", () => {
 
 loadSessions();
 
+// ========== 论文库（跳转到 /papers 页面） ==========
+// 从论文库页面跳转回来时，自动填充并发送提问
+const pendingQuestion = localStorage.getItem("pendingPaperQuestion");
+if (pendingQuestion) {
+  localStorage.removeItem("pendingPaperQuestion");
+  // 等 DOM 和 session 就绪后自动发送
+  setTimeout(() => sendMessage(pendingQuestion), 300);
+}
+
 // ========== 论文上传 ==========
 const uploadBtn = document.querySelector("#uploadBtn");
 const fileInput = document.querySelector("#fileInput");

@@ -39,6 +39,13 @@ class PresenterAgent:
         self.code_gen = code_generator
 
     def invoke(self, state: AgentState) -> dict:
+        logger.info(f"[Presenter] invoke 开始, answer={bool(state.get('answer'))}")
+
+        # 如果上游 Agent 已经生成了 answer，直接返回
+        if state.get("answer"):
+            logger.info(f"[Presenter] 使用上游已生成的回答: {state['answer'][:50]}...")
+            return {"answer": state["answer"]}
+
         analysis = state.get("analysis")
         retrieved_chunks = state.get("retrieved_chunks", [])
         user_query = state["user_query"]

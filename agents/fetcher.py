@@ -38,7 +38,7 @@ class FetcherAgent:
 
         # 1. 搜索（带缓存）
         cache_key = f"arxiv_search:{query}"
-        cached_papers = cache.get(cache_key)
+        cached_papers = cache.get(state.get("session_id"), cache_key)
         if cached_papers:
             logger.info(f"[Fetcher] 使用缓存，找到 {len(cached_papers)} 篇论文")
             papers = cached_papers
@@ -48,15 +48,25 @@ class FetcherAgent:
             logger.info(f"[Fetcher] 找到 {len(papers)} 篇论文")
             # 缓存搜索结果
             if papers:
-                cache.set(cache_key, papers)
+                cache.set(state.get("session_id"), cache_key, papers)
 
         # 2-4. 逐篇处理
         fetched = []
+        already_exists = []
+        failed = []
+        no_pdf = []
+
         for paper_meta in papers:
             arxiv_id = paper_meta["arxiv_id"]
 
             # 跳过已入库的
             if self.mongo.paper_exists(arxiv_id):
+                already_exists.append(paper_meta)
+                continue
+
+            # 检查是否有 PDF
+            if not paper_meta.get("pdf_url"):
+                no_pdf.append(paper_meta)
                 continue
 
             try:
@@ -64,45 +74,90 @@ class FetcherAgent:
                 fetched.append(paper_meta)
             except Exception as e:
                 logger.error(f"[Fetcher] 处理失败 {arxiv_id}: {e}")
+                failed.append({"title": paper_meta.get("title", ""), "error": str(e)})
 
-        # 5. 返回结果给Supervisor
+        # 5. 构建详细的反馈信息
+        total = len(papers)
+        summary_parts = []
+        summary_parts.append(f"搜索到 {total} 篇论文：")
+
         if fetched:
-            titles = "\n".join(f"- {p['title']}" for p in fetched)
+            summary_parts.append(f"\n[成功入库 {len(fetched)} 篇]")
+            for p in fetched:
+                summary_parts.append(f"  - {p['title'][:60]}")
+
+        if already_exists:
+            summary_parts.append(f"\n[已存在 {len(already_exists)} 篇，跳过]")
+            for p in already_exists:
+                summary_parts.append(f"  - {p['title'][:60]}")
+
+        if no_pdf:
+            summary_parts.append(f"\n[无PDF链接 {len(no_pdf)} 篇，无法入库]")
+            for p in no_pdf:
+                summary_parts.append(f"  - {p['title'][:60]}")
+
+        if failed:
+            summary_parts.append(f"\n[处理失败 {len(failed)} 篇]")
+            for f in failed:
+                summary_parts.append(f"  - {f['title'][:40]}: {f['error'][:40]}")
+
+        summary = "\n".join(summary_parts)
+        logger.info(f"[Fetcher] 结果汇总:\n{summary}")
+
+        # 返回结果
+        if fetched:
             return {
                 "target_papers": fetched,
                 "next_agent": "retriever",
                 "error": None,
+                "answer": summary,
             }
         else:
             return {
                 "target_papers": [],
-                "error": "未找到新论文，可能已全部入库。",
+                "next_agent": "presenter",
+                "error": None,
+                "answer": summary + "\n\n建议：稍后重试，或手动从 arXiv 搜索。",
             }
 
-    def _process_paper(self, paper_meta: dict):
+    def _process_paper(self, paper_meta: dict, session_id: str = None):
         """单篇论文完整处理链路"""
         arxiv_id = paper_meta["arxiv_id"]
         title = paper_meta.get('title', '未知')[:40]
         logger.info(f"[Fetcher] 正在处理论文: {title}...")
 
-        # 1. 入MongoDB（状态: pending）
-        paper_meta["status"] = "pending"
-        self.mongo.upsert_paper(paper_meta)
-        logger.info(f"[Fetcher] 论文元数据已存入 MongoDB")
+        # 检查缓存（会话级）
+        from core.cache import cache
+        cache_key = f"paper:{arxiv_id}"
+        cached = None
+        if session_id:
+            cached = cache.get(session_id, cache_key)
+        if cached:
+            logger.info(f"[Fetcher] 使用缓存: {arxiv_id}")
+            chunks = cached["chunks"]
+        else:
+            # 1. 入MongoDB（状态: pending）
+            paper_meta["status"] = "pending"
+            self.mongo.upsert_paper(paper_meta)
+            logger.info(f"[Fetcher] 论文元数据已存入 MongoDB")
 
-        # 2. 下载并解析PDF
-        if not paper_meta.get("pdf_url"):
-            logger.info(f"[Fetcher] 论文无 PDF 链接，跳过")
-            return
+            # 2. 下载并解析PDF
+            if not paper_meta.get("pdf_url"):
+                logger.info(f"[Fetcher] 论文无 PDF 链接，跳过")
+                return
 
-        logger.info(f"[Fetcher] 正在下载 PDF...")
-        pdf_path = self._download_pdf(paper_meta["pdf_url"], arxiv_id)
-        logger.info(f"[Fetcher] 正在解析 PDF...")
-        parsed = self.parser.parse(pdf_path)
+            logger.info(f"[Fetcher] 正在下载 PDF...")
+            pdf_path = self._download_pdf(paper_meta["pdf_url"], arxiv_id)
+            logger.info(f"[Fetcher] 正在解析 PDF...")
+            parsed = self.parser.parse(pdf_path)
 
-        # 3. 分块
-        logger.info(f"[Fetcher] 正在分块...")
-        chunks = self.parser.chunk(parsed["sections"])
+            # 3. 分块
+            logger.info(f"[Fetcher] 正在分块...")
+            chunks = self.parser.chunk(parsed["sections"])
+
+            # 缓存分块结果（会话级）
+            if session_id:
+                cache.set(session_id, cache_key, {"chunks": chunks})
 
         # 4. 更新MongoDB状态 + 存分块
         self.mongo.update_paper_status(arxiv_id, "parsed")

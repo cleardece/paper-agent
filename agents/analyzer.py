@@ -81,11 +81,20 @@ class AnalyzerAgent:
             return {"analysis": "无可用的论文内容进行分析。"}
 
         logger.info(f"[Analyzer] 收到 {len(chunks)} 个分块，开始分析...")
-        # 组装上下文
-        context = "\n\n---\n\n".join(
-            f"【{c['paper_title']}】(chunk {c['chunk_index']}, score: {c['score']:.3f})\n{c['content']}"
-            for c in chunks
-        )
+
+        # 上下文窗口限制：MiMo 32K token ≈ 128K 字符
+        # Prompt 约占 2K token，留 30K token 给内容 ≈ 120K 字符
+        # 安全起见用 50K 字符（约 12K token）
+        MAX_CONTEXT_CHARS = 50000
+        context = ""
+        total_chars = 0
+        for c in chunks:
+            chunk_text = f"【{c['paper_title']}】(chunk {c['chunk_index']}, score: {c['score']:.3f})\n{c['content']}"
+            if total_chars + len(chunk_text) > MAX_CONTEXT_CHARS:
+                logger.info(f"[Analyzer] 上下文已满，截断到 {len(context)} 字符，保留 {len(context.split(chr(10)))} 行")
+                break
+            context += chunk_text + "\n\n---\n\n"
+            total_chars += len(chunk_text)
 
         messages = [
             SystemMessage(content=ANALYZER_PROMPT),

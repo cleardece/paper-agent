@@ -28,6 +28,8 @@ def supervisor_route(state: AgentState) -> str:
 
 
 def fetcher_route(state: AgentState) -> str:
+    if state.get("answer"):
+        return "presenter"
     return END
 
 
@@ -68,7 +70,7 @@ def build_workflow(
     )
 
     graph.add_edge("translator", "fetcher")
-    graph.add_conditional_edges("fetcher", fetcher_route, {END: END})
+    graph.add_conditional_edges("fetcher", fetcher_route, {"presenter": "presenter", END: END})
 
     graph.add_edge("retriever", "analyzer")
     graph.add_edge("analyzer", "critic")

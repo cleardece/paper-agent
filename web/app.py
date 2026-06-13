@@ -303,6 +303,9 @@ def supervisor_route(state: AgentState) -> str:
 
 
 def fetcher_route(state: AgentState) -> str:
+    # 如果 fetcher 直接返回了 answer（如没有 PDF 时），路由到 presenter 展示
+    if state.get("answer"):
+        return "presenter"
     return END
 
 
@@ -337,7 +340,7 @@ def build_traced_workflow(session: Session):
         "retriever": "retriever",
         "END": "presenter",
     })
-    graph.add_conditional_edges("fetcher", fetcher_route, {END: END})
+    graph.add_conditional_edges("fetcher", fetcher_route, {"presenter": "presenter", END: END})
     graph.add_edge("retriever", "analyzer")
     graph.add_edge("analyzer", "critic")
     graph.add_conditional_edges("critic", critic_route, {
@@ -425,6 +428,11 @@ async def index() -> FileResponse:
     return FileResponse(static_dir / "index.html")
 
 
+@app.get("/papers")
+async def papers_page() -> FileResponse:
+    return FileResponse(static_dir / "papers.html")
+
+
 @app.get("/api/test")
 async def test_connection():
     """测试后端组件连接"""
@@ -470,7 +478,7 @@ async def upload_paper(file: UploadFile):
         arxiv_id = arxiv_id[:60]
 
     # 立即返回，后台处理
-    asyncio.create_task(_process_upload(container, pdf_path, file.filename, arxiv_id))
+    asyncio.create_task(_process_upload(container, pdf_path, file.filename, arxiv_id, session_id=None))
 
     return {
         "message": "上传成功，正在后台解析...",
@@ -479,19 +487,32 @@ async def upload_paper(file: UploadFile):
     }
 
 
-async def _process_upload(container, pdf_path, filename, arxiv_id):
+async def _process_upload(container, pdf_path, filename, arxiv_id, session_id=None):
     """后台处理上传的 PDF"""
     import json
-    try:
-        # 1. 解析 PDF
-        result = await asyncio.get_event_loop().run_in_executor(
-            None, container.pdf_parser.parse, pdf_path
-        )
-        logger.info(f"[Upload] 解析完成: {result['source']}, {len(result['sections'])} 章节")
+    from core.cache import cache
 
-        # 2. 分块
-        chunks = container.pdf_parser.chunk(result["sections"])
-        logger.info(f"[Upload] 分块完成: {len(chunks)} 个")
+    try:
+        # 检查缓存（会话级）
+        cache_key = f"paper:{arxiv_id}"
+        cached = cache.get(session_id, cache_key)
+        if cached:
+            logger.info(f"[Upload] 使用缓存: {arxiv_id}")
+            chunks = cached["chunks"]
+            result = cached.get("result", {})
+        else:
+            # 1. 解析 PDF
+            result = await asyncio.get_event_loop().run_in_executor(
+                None, container.pdf_parser.parse, pdf_path
+            )
+            logger.info(f"[Upload] 解析完成: {result['source']}, {len(result['sections'])} 章节")
+
+            # 2. 分块
+            chunks = container.pdf_parser.chunk(result["sections"])
+            logger.info(f"[Upload] 分块完成: {len(chunks)} 个")
+
+            # 缓存解析和分块结果（会话级）
+            cache.set(session_id, cache_key, {"chunks": chunks, "result": result})
 
         # 3. 存 MongoDB
         container.mongodb.upsert_paper({
@@ -552,6 +573,15 @@ async def list_papers():
         }
         for p in papers
     ]
+
+
+@app.delete("/api/papers/{arxiv_id}")
+async def delete_paper(arxiv_id: str):
+    """删除单篇论文"""
+    from core.deps import get_container
+    container = get_container()
+    container.mongodb.delete_paper(arxiv_id)
+    return {"message": "deleted"}
 
 
 @app.post("/api/compare")
@@ -686,20 +716,24 @@ async def get_session(session_id: str) -> dict[str, Any]:
 
 @app.delete("/api/sessions/{session_id}")
 async def delete_session(session_id: str) -> dict[str, str]:
-    """删除单个 Session"""
+    """删除单个 Session 及其缓存"""
     from core.deps import get_container
+    from core.cache import cache
     container = get_container()
     container.mongodb.delete_session(session_id)
+    cache.delete_session(session_id)
     sessions.pop(session_id, None)
     return {"message": "deleted"}
 
 
 @app.delete("/api/sessions")
 async def delete_all_sessions() -> dict[str, Any]:
-    """删除所有 Session"""
+    """删除所有 Session 及其缓存"""
     from core.deps import get_container
+    from core.cache import cache
     container = get_container()
     count = container.mongodb.delete_all_sessions()
+    cache.delete_all()
     sessions.clear()
     return {"message": f"deleted {count} sessions"}
 
@@ -719,20 +753,6 @@ async def chat(request: ChatRequest) -> StreamingResponse:
     async def event_stream():
         yield f"event: session\ndata: {json.dumps({'session_id': session.id}, ensure_ascii=False)}\n\n"
         answer = None
-
-        # 启动心跳协程，定期推送 timeline 状态
-        heartbeat_done = asyncio.Event()
-
-        async def heartbeat():
-            while not heartbeat_done.is_set():
-                await asyncio.sleep(2)
-                if not heartbeat_done.is_set():
-                    timeline = timeline_snapshot(session.events)
-                    yield_str = json.dumps({"timeline": timeline}, ensure_ascii=False)
-                    # 通过 session 缓存最新的 timeline，前端轮询获取
-                    session._latest_timeline = timeline
-
-        # 用 task 跑心跳（注意：SSE 不支持多 yield，改用事件推送）
         try:
             logger.info("[Chat] 开始构建 workflow...")
             workflow = build_traced_workflow(session)
