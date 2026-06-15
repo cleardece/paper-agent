@@ -43,7 +43,7 @@ class SemanticScholarAPI:
         params = {
             "query": query,
             "limit": max_results,
-            "fields": "paperId,title,abstract,authors,url,openAccessPdf,year,citationCount",
+            "fields": "paperId,title,abstract,authors,url,openAccessPdf,year,citationCount,externalIds",
         }
 
         try:
@@ -54,14 +54,18 @@ class SemanticScholarAPI:
 
             papers = []
             for item in data.get("data", []):
-                # 提取 arxiv_id（如果有的话）
+                # 提取 arxiv_id（优先从 externalIds 获取）
                 paper_id = item.get("paperId", "")
-                arxiv_id = self._extract_arxiv_id(paper_id)
+                arxiv_id = self._extract_arxiv_id_from_item(item)
 
                 # 获取 PDF 链接
                 pdf_url = None
-                if item.get("openAccessPdf"):
-                    pdf_url = item["openAccessPdf"].get("url")
+                if item.get("openAccessPdf") and item["openAccessPdf"].get("url"):
+                    pdf_url = item["openAccessPdf"]["url"]
+
+                # 如果没有 PDF 链接但有 ArXiv ID，构造 arxiv PDF URL
+                if not pdf_url and arxiv_id:
+                    pdf_url = f"https://arxiv.org/pdf/{arxiv_id}"
 
                 papers.append({
                     "arxiv_id": arxiv_id or paper_id,
@@ -96,6 +100,17 @@ class SemanticScholarAPI:
             # 可能是 DOI
             return None
         return None
+
+    def _extract_arxiv_id_from_item(self, item: dict) -> str | None:
+        """从论文数据中提取 arxiv_id（优先从 externalIds）"""
+        # 1. 优先从 externalIds.ArXiv 获取
+        external_ids = item.get("externalIds", {})
+        if external_ids and external_ids.get("ArXiv"):
+            return external_ids["ArXiv"]
+
+        # 2. 从 paper_id 提取
+        paper_id = item.get("paperId", "")
+        return self._extract_arxiv_id(paper_id)
 
     def get_paper_details(self, paper_id: str) -> dict | None:
         """获取论文详情"""

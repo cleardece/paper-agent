@@ -178,8 +178,8 @@ class PDFParser:
     def chunk(
             self,
             sections: list[dict],
-            max_chunk_size: int = 1500,
-            overlap: int = 150,
+            max_chunk_size: int = 2000,
+            overlap: int = 300,
             min_chunk_size: int = 200,
     ) -> list[dict]:
         """

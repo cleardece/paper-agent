@@ -22,37 +22,66 @@ class RetrieverAgent:
         self.milvus = milvus_client
         self.mongo = mongodb_client
 
+    def _expand_query(self, query: str) -> list[str]:
+        """Query expansion: 对模糊查询生成多个变体"""
+        import re
+        expanded = [query]
+
+        # "这篇论文" 类模糊查询 → 追加通用变体
+        if re.search(r"这篇论文|该论文|本文", query):
+            expanded.append(query.replace("这篇论文", "论文"))
+            # 追加更具体的变体
+            core = re.sub(r"(这篇论文|该论文|本文)(的|主要|核心)?", "", query).strip()
+            if core:
+                expanded.append(f"论文 {core}")
+
+        # "主要贡献是什么" → 追加 "创新点 方法 贡献"
+        if "主要贡献" in query:
+            expanded.append(query.replace("主要贡献", "创新点和方法"))
+
+        return expanded
+
     def invoke(self, state: AgentState) -> dict:
         """
         检索流程：
-        1. query → embedding
+        1. query → expansion → embedding
         2. Milvus语义检索 → top-k chunks
-        3. MongoDB补全论文标题等元数据
-        4. 更新state
+        3. 去重 + 按score排序
+        4. MongoDB补全论文标题等元数据
+        5. 更新state
         """
         query = state["user_query"]
         logger.info(f"[Retriever] 开始检索: {query[:50]}...")
 
-        # 1. Embedding（带缓存）
-        cache_key = f"embedding:{query}"
-        cached_vector = cache.get(state.get("session_id"), cache_key)
-        if cached_vector:
-            logger.info("[Retriever] 使用缓存向量")
-            query_vector = cached_vector
-        else:
-            logger.info("[Retriever] 正在生成查询向量...")
-            query_vector = self.embedder.embed_query(query)
-            cache.set(state.get("session_id"), cache_key, query_vector)
-            logger.info("[Retriever] 向量生成完成")
+        # 1. Query expansion
+        expanded_queries = self._expand_query(query)
+        logger.info(f"[Retriever] Query expansion: {len(expanded_queries)} 个变体")
 
-        # 2. Milvus检索
-        logger.info("[Retriever] 正在 Milvus 中检索...")
-        hits = self.milvus.search(
-            query_embedding=query_vector,
-            top_k=10,
-            output_fields=["paper_arxiv_id", "chunk_index", "content", "metadata_json"],
-        )
-        logger.info(f"[Retriever] 找到 {len(hits)} 个相关分块")
+        # 2. 对每个变体做 embedding + 检索，合并去重
+        all_hits = {}  # key: (arxiv_id, chunk_index) -> hit
+        for eq in expanded_queries:
+            cache_key = f"embedding:{eq}"
+            cached_vector = cache.get(state.get("session_id"), cache_key)
+            if cached_vector:
+                query_vector = cached_vector
+            else:
+                query_vector = self.embedder.embed_query(eq)
+                cache.set(state.get("session_id"), cache_key, query_vector)
+
+            hits = self.milvus.search(
+                query_embedding=query_vector,
+                top_k=12,
+                output_fields=["paper_arxiv_id", "chunk_index", "content", "metadata_json"],
+            )
+
+            for h in hits:
+                key = (h["paper_arxiv_id"], h["chunk_index"])
+                if key not in all_hits or h["score"] > all_hits[key]["score"]:
+                    all_hits[key] = h
+
+        # 3. 按 score 降序排列，取 top-15
+        hits = sorted(all_hits.values(), key=lambda x: x["score"], reverse=True)[:15]
+        logger.info(f"[Retriever] 合并去重后: {len(hits)} 个分块")
 
         # 3. 补全元数据 + 构造RetrievedChunk
         retrieved = []
