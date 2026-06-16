@@ -60,11 +60,12 @@ def _build_analyzer_tools(mongo_client):
         return f"论文：{paper['title']}\n\n内容：\n{content[:3000]}"
 
     @tool
-    def synthesize观点(points: list[str]) -> str:
-        """将多个观点整合为结构化分析"""
-        return "\n".join(f"- {p}" for p in points)
+    def synthesize_points(points: str) -> str:
+        """将多个观点整合为结构化分析。输入为多个观点的文本，用换行分隔。"""
+        point_list = [p.strip() for p in points.split("\n") if p.strip()]
+        return "\n".join(f"- {p}" for p in point_list)
 
-    return [query_paper, synthesize观点]
+    return [query_paper, synthesize_points]
 
 
 class AnalyzerAgent:
