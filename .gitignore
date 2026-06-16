@@ -8,3 +8,5 @@ build/
 .venv/
 milvus_data/
 mongodb_data/
+cache/
+tmp_pdfs/
