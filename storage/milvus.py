@@ -66,6 +66,7 @@ class MilvusClient:
         query_embedding: list[float],
         top_k: int = 5,
         paper_ids: Optional[list[str]] = None,
+        sections: Optional[list[str]] = None,
         output_fields: Optional[list[str]] = None,
     ) -> list[dict]:
         """语义检索"""
@@ -82,9 +83,23 @@ class MilvusClient:
             "output_fields": output_fields,
         }
 
+        # 构建过滤表达式
+        filters = []
         if paper_ids:
             id_list = ", ".join(f'"{pid}"' for pid in paper_ids)
-            kwargs["expr"] = f"paper_arxiv_id in [{id_list}]"
+            filters.append(f"paper_arxiv_id in [{id_list}]")
+
+        if sections:
+            # metadata_json 是 JSON 字符串，需要提取 section 字段
+            # 使用 LIKE 匹配 section 关键词
+            section_filters = []
+            for sec in sections:
+                section_filters.append(f'metadata_json like \'%"section":"{sec}"%\'')
+            if section_filters:
+                filters.append(f"({' or '.join(section_filters)})")
+
+        if filters:
+            kwargs["filter"] = " and ".join(filters)
 
         results = self.client.search(**kwargs)
 

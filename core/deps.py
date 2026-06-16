@@ -65,7 +65,7 @@ class ServiceContainer:
                 self.embedder, self.milvus
             ),
             "retriever": RetrieverAgent(
-                self.embedder, self.milvus, self.mongodb
+                self.embedder, self.milvus, self.mongodb, self.llm
             ),
             "analyzer": AnalyzerAgent(self.llm, self.mongodb),
             "critic": CriticAgent(self.llm),
