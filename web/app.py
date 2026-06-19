@@ -577,10 +577,11 @@ async def list_papers():
 
 @app.delete("/api/papers/{arxiv_id}")
 async def delete_paper(arxiv_id: str):
-    """删除单篇论文"""
+    """删除单篇论文（含 Milvus 向量）"""
     from core.deps import get_container
     container = get_container()
     container.mongodb.delete_paper(arxiv_id)
+    container.milvus.delete_by_paper(arxiv_id)
     return {"message": "deleted"}
 
 
