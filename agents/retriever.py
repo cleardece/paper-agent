@@ -47,7 +47,7 @@ class RetrieverAgent:
         # 如果没有明确意图，不做过滤（返回 None）
         return None
 
-    def _multi_query(self, query: str, session_id: str = None) -> list[str]:
+    def _multi_query(self, query: str, session_id: str = None, user_interests: list[str] = None) -> list[str]:
         """MultiQuery: 用 LLM 生成多个查询变体"""
         # 如果没有 LLM，用规则降级
         if not self.llm:
@@ -59,15 +59,21 @@ class RetrieverAgent:
         if cached:
             return cached
 
+        # 构建用户上下文
+        user_context = ""
+        if user_interests:
+            user_context = f"\n用户研究兴趣: {', '.join(user_interests[:5])}"
+
         prompt = f"""你是一个查询优化专家。给定用户查询，生成3个不同角度的搜索变体，用于检索学术论文。
 
-用户查询: {query}
+用户查询: {query}{user_context}
 
 要求:
 1. 保持语义一致，但用不同的表述
 2. 一个变体用更学术的表达
 3. 一个变体用更具体的关键词
 4. 一个变体用英文（如果原查询是中文）
+5. 考虑用户的研究兴趣
 
 只输出JSON数组，不要其他内容:
 ["变体1", "变体2", "变体3"]"""
@@ -182,11 +188,18 @@ class RetrieverAgent:
         """
         query = state["user_query"]
         session_id = state.get("session_id")
+        user_id = state.get("user_id", "default")
         logger.info(f"[Retriever] 开始检索: {query[:50]}...")
 
+        # 获取用户兴趣
+        user_interests = self.mongo.user_memory.get_interests(user_id, top_k=5)
+
         # 1. MultiQuery 生成变体
-        expanded_queries = self._multi_query(query, session_id)
+        expanded_queries = self._multi_query(query, session_id, user_interests)
         logger.info(f"[Retriever] MultiQuery: {len(expanded_queries)} 个变体")
+
+        # 处理用户交互记忆
+        self.mongo.user_memory.process_interaction(user_id, query)
 
         # 2. Section 意图检测
         target_sections = self._detect_section_intent(query)

@@ -32,6 +32,7 @@ class RetrievedChunk(TypedDict):
 class AgentState(TypedDict):
     """全局共享状态"""
     # 用户输入
+    user_id: Optional[str]                # 用户ID（用于记忆）
     user_query: str
     search_query: Optional[str]  # 从用户输入中提取的搜索关键词
 
@@ -51,6 +52,10 @@ class AgentState(TypedDict):
     next_agent: Optional[str]               # Supervisor决定的下一个Agent
     iteration: int                          # 当前迭代轮次
     max_iterations: int                     # 最大轮次限制
+
+    # Memory 相关
+    reflection: Optional[dict]              # 反思记忆（insights, questions, etc.）
+    session_id: Optional[str]               # 会话ID
 
     # 错误处理
     error: Optional[str]

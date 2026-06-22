@@ -29,6 +29,27 @@ class ServiceContainer:
         self.milvus = MilvusClient()
         self.embedder = EmbeddingService()
 
+        # 注入 LLM 和 KG 到 Memory 系统
+        self.mongodb.memory.llm = self.llm
+        self.mongodb.memory.kg = self.knowledge_graph
+        self.mongodb.user_memory.llm = self.llm
+
+        # Hybrid Search
+        from tools.hybrid_search import HybridSearch
+        self.hybrid_search = HybridSearch()
+
+        # Reranker
+        from tools.reranker import Reranker
+        self.reranker = Reranker()
+
+        # Knowledge Graph
+        from storage.knowledge_graph import KnowledgeGraph
+        self.knowledge_graph = KnowledgeGraph(
+            neo4j_uri=os.getenv("NEO4J_URI"),
+            neo4j_user=os.getenv("NEO4J_USER"),
+            neo4j_password=os.getenv("NEO4J_PASSWORD"),
+        )
+
         # 优先使用 Semantic Scholar，fallback 到 arXiv
         ss_api_key = os.getenv("SEMANTIC_SCHOLAR_API_KEY")
         if ss_api_key:
@@ -57,6 +78,7 @@ class ServiceContainer:
         from agents.analyzer import AnalyzerAgent
         from agents.critic import CriticAgent
         from agents.presenter import PresenterAgent
+        from agents.reflector import ReflectorAgent
 
         return {
             "supervisor": SupervisorAgent(self.llm),
@@ -70,6 +92,7 @@ class ServiceContainer:
             "analyzer": AnalyzerAgent(self.llm, self.mongodb),
             "critic": CriticAgent(self.llm),
             "presenter": PresenterAgent(self.llm, self.code_generator),
+            "reflector": ReflectorAgent(self.llm),
         }
 
     def close(self):

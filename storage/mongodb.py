@@ -14,7 +14,7 @@ logger = logging.getLogger("paper-agent")
 
 
 class MongoDBClient:
-    """MongoDB客户端 - 管理论文元数据"""
+    """MongoDB客户端 - 管理论文元数据和记忆"""
 
     def __init__(self, uri: str = "mongodb://localhost:27017", db_name: str = "paper_agent"):
         logger.info(f"[MongoDB] 正在连接 {uri}...")
@@ -24,6 +24,12 @@ class MongoDBClient:
         logger.info("[MongoDB] 连接成功")
         self.db: Database = self.client[db_name]
         self._ensure_indexes()
+
+        # 初始化 Memory 系统（LLM 和 KG 在 deps.py 中注入）
+        from storage.memory import MemoryManager
+        from storage.user_memory import UserMemory
+        self.memory = MemoryManager(self, llm=None, knowledge_graph=None)
+        self.user_memory = UserMemory(self.db, llm=None)
 
     def _ensure_indexes(self):
         """创建索引，幂等操作"""

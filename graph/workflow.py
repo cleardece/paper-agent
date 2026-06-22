@@ -15,6 +15,7 @@ from agents.retriever import RetrieverAgent
 from agents.analyzer import AnalyzerAgent
 from agents.critic import CriticAgent
 from agents.presenter import PresenterAgent
+from agents.reflector import ReflectorAgent
 
 
 # 路由函数
@@ -40,6 +41,11 @@ def critic_route(state: AgentState) -> str:
     return state.get("next_agent", "END")
 
 
+def reflector_route(state: AgentState) -> str:
+    """Reflector 完成后进入 Presenter"""
+    return "presenter"
+
+
 def build_workflow(
     supervisor: SupervisorAgent,
     translator: TranslatorAgent,
@@ -48,6 +54,7 @@ def build_workflow(
     analyzer: AnalyzerAgent,
     critic: CriticAgent,
     presenter: PresenterAgent,
+    reflector: ReflectorAgent = None,
 ) -> StateGraph:
     graph = StateGraph(AgentState)
 
@@ -59,6 +66,10 @@ def build_workflow(
     graph.add_node("analyzer", analyzer.invoke)
     graph.add_node("critic", critic.invoke)
     graph.add_node("presenter", presenter.invoke)
+
+    # 如果有 reflector，添加节点
+    if reflector:
+        graph.add_node("reflector", reflector.invoke)
 
     # 边
     graph.add_edge(START, "supervisor")

@@ -348,7 +348,13 @@ def build_traced_workflow(session: Session):
         "retriever": "retriever",
         "END": END
     })
-    graph.add_edge("presenter", END)
+    # Presenter 完成后进入 Reflector（如果有）
+    if "reflector" in agents:
+        graph.add_conditional_edges("presenter", lambda s: "reflector", {"reflector": "reflector"})
+        graph.add_edge("reflector", END)
+    else:
+        graph.add_edge("presenter", END)
+
     return graph.compile()
 
 
