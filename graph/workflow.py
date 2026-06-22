@@ -3,7 +3,7 @@ LangGraph Workflow - Supervisor多Agent协作状态图
 
 流程：
 START → Supervisor → Translator → Fetcher → END
-        Supervisor → Retriever → Analyzer → Critic → Presenter → END
+        Supervisor → Retriever → Analyzer → Critic → Presenter → Reflector → END
 """
 
 from langgraph.graph import StateGraph, START, END
@@ -39,11 +39,6 @@ def critic_route(state: AgentState) -> str:
     if state.get("error"):
         return "presenter"
     return state.get("next_agent", "END")
-
-
-def reflector_route(state: AgentState) -> str:
-    """Reflector 完成后进入 Presenter"""
-    return "presenter"
 
 
 def build_workflow(
@@ -92,6 +87,11 @@ def build_workflow(
         {"presenter": "presenter", "retriever": "retriever", "END": END},
     )
 
-    graph.add_edge("presenter", END)
+    # Presenter → Reflector → END（如果有 reflector）
+    if reflector:
+        graph.add_edge("presenter", "reflector")
+        graph.add_edge("reflector", END)
+    else:
+        graph.add_edge("presenter", END)
 
     return graph.compile()
