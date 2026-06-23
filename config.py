@@ -39,6 +39,13 @@ MINERU_URL = os.getenv("MINERU_URL")  # http://localhost:8888
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 SEMANTIC_SCHOLAR_API_KEY = os.getenv("SEMANTIC_SCHOLAR_API_KEY")
 
+# ==================== MCP ====================
+USE_MCP = os.getenv("USE_MCP", "true").lower() == "true"  # 是否启用 MCP
+MCP_ARXIV_COMMAND = os.getenv("MCP_ARXIV_COMMAND", "uvx")
+MCP_ARXIV_ARGS = os.getenv("MCP_ARXIV_ARGS", "arxiv-mcp-server")
+MCP_SS_COMMAND = os.getenv("MCP_SS_COMMAND", "uvx")
+MCP_SS_ARGS = os.getenv("MCP_SS_ARGS", "semantic-scholar-mcp-server")
+
 # ==================== LangSmith ====================
 LANGSMITH_API_KEY = os.getenv("LANGSMITH_API_KEY")
 LANGSMITH_TRACING = os.getenv("LANGSMITH_TRACING", "true")
