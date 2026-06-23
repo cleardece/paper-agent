@@ -1,121 +1,122 @@
-"""
-Paper Agent - MCP Client
-连接外部 MCP Server（ArXiv, Semantic Scholar 等）
-"""
+"""Unified MCP client for external paper services."""
 
-import os
-import json
 import logging
-import asyncio
-from typing import Optional, Any
+from contextlib import AsyncExitStack
+from typing import Any
 
 logger = logging.getLogger("paper-agent")
 
 
 class MCPClient:
-    """MCP 客户端 - 统一管理外部 MCP 连接"""
+    """Manage MCP connections for arXiv, Semantic Scholar, and similar services."""
 
     def __init__(self):
-        self.sessions = {}  # server_name -> session
+        self.sessions: dict[str, Any] = {}
+        self.exit_stacks: dict[str, AsyncExitStack] = {}
         self.config = self._load_config()
 
     def _load_config(self) -> dict:
-        """加载 MCP 配置"""
-        from config import (
-            MCP_ARXIV_COMMAND, MCP_ARXIV_ARGS,
-            MCP_SS_COMMAND, MCP_SS_ARGS
-        )
+        from config import MCP_ARXIV_URL, MCP_SS_URL
 
-        config = {
+        return {
             "arxiv": {
-                "command": MCP_ARXIV_COMMAND,
-                "args": MCP_ARXIV_ARGS.split(),
+                "url": MCP_ARXIV_URL,
+                "transport": "http" if MCP_ARXIV_URL.rstrip("/").endswith("/mcp") else "sse",
             },
             "semantic_scholar": {
-                "command": MCP_SS_COMMAND,
-                "args": MCP_SS_ARGS.split(),
+                "url": MCP_SS_URL,
+                "transport": "http" if MCP_SS_URL.rstrip("/").endswith("/mcp") else "sse",
             },
         }
-        return config
 
-    async def connect(self, server_name: str) -> bool:
-        """连接到 MCP Server"""
+    def _normalize_url(self, url: str, transport: str) -> str:
+        url = url.rstrip("/")
+        if transport == "sse" and not url.endswith("/sse"):
+            return f"{url}/sse"
+        if transport == "http" and not url.endswith("/mcp"):
+            return f"{url}/mcp"
+        return url
+
+    async def connect_sse(self, server_name: str) -> bool:
+        """Connect to a configured MCP server.
+
+        The method name is kept for compatibility with existing callers. It now
+        supports both legacy SSE (`/sse`) and Streamable HTTP (`/mcp`).
+        """
         if server_name in self.sessions:
             return True
 
         config = self.config.get(server_name)
-        if not config:
-            logger.error(f"[MCP] 未找到配置: {server_name}")
+        if not config or not config.get("url"):
+            logger.error("[MCP] missing config or URL: %s", server_name)
             return False
+
+        transport = config.get("transport", "sse")
+        url = self._normalize_url(config["url"], transport)
 
         try:
             from mcp import ClientSession
-            from mcp.client.stdio import stdio_client
 
-            command = config["command"]
-            args = config["args"]
+            stack = AsyncExitStack()
+            if transport == "http":
+                from mcp.client.streamable_http import streamablehttp_client
 
-            logger.info(f"[MCP] 连接 {server_name}: {command} {' '.join(args)}")
+                read, write, _ = await stack.enter_async_context(streamablehttp_client(url))
+            else:
+                from mcp.client.sse import sse_client
 
-            # 创建连接
-            read, write = await stdio_client(command, *args).__aenter__()
+                read, write = await stack.enter_async_context(sse_client(url))
+
             session = ClientSession(read, write)
-            await session.__aenter__()
+            await stack.enter_async_context(session)
             await session.initialize()
 
             self.sessions[server_name] = session
-            logger.info(f"[MCP] 连接成功: {server_name}")
+            self.exit_stacks[server_name] = stack
+            logger.info("[MCP] connected %s via %s: %s", server_name, transport, url)
             return True
-
-        except Exception as e:
-            logger.error(f"[MCP] 连接失败 {server_name}: {e}")
+        except Exception as exc:
+            logger.error("[MCP] connect failed %s: %s", server_name, exc)
             return False
 
     async def call_tool(self, server_name: str, tool_name: str, arguments: dict) -> Any:
-        """调用 MCP 工具"""
         session = self.sessions.get(server_name)
         if not session:
-            # 尝试连接
-            if not await self.connect(server_name):
+            if not await self.connect_sse(server_name):
                 return None
             session = self.sessions[server_name]
 
         try:
-            result = await session.call_tool(tool_name, arguments)
-            return result
-        except Exception as e:
-            logger.error(f"[MCP] 调用失败 {server_name}.{tool_name}: {e}")
+            return await session.call_tool(tool_name, arguments)
+        except Exception as exc:
+            logger.error("[MCP] tool call failed %s.%s: %s", server_name, tool_name, exc)
             return None
 
     async def list_tools(self, server_name: str) -> list:
-        """列出 MCP Server 的所有工具"""
         session = self.sessions.get(server_name)
         if not session:
-            if not await self.connect(server_name):
+            if not await self.connect_sse(server_name):
                 return []
             session = self.sessions[server_name]
 
         try:
-            tools = await session.list_tools()
-            return tools
-        except Exception as e:
-            logger.error(f"[MCP] 列出工具失败 {server_name}: {e}")
+            return await session.list_tools()
+        except Exception as exc:
+            logger.error("[MCP] list tools failed %s: %s", server_name, exc)
             return []
 
     async def disconnect(self, server_name: str):
-        """断开连接"""
-        session = self.sessions.pop(server_name, None)
-        if session:
+        self.sessions.pop(server_name, None)
+        stack = self.exit_stacks.pop(server_name, None)
+        if stack:
             try:
-                await session.__aexit__(None, None, None)
-            except:
+                await stack.aclose()
+            except Exception:
                 pass
 
     async def disconnect_all(self):
-        """断开所有连接"""
         for name in list(self.sessions.keys()):
             await self.disconnect(name)
 
 
-# 全局实例
 mcp_client = MCPClient()

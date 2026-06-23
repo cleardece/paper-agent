@@ -13,3 +13,4 @@ python-dotenv
 tavily-python
 langsmith
 requests
+mcp

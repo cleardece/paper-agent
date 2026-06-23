@@ -1,86 +1,66 @@
-"""
-Paper Agent - ArXiv via MCP
-通过 MCP 调用 ArXiv 服务
-"""
+"""arXiv access through MCP, with direct API fallback."""
 
+import json
 import logging
-from typing import Optional
 
 logger = logging.getLogger("paper-agent")
 
 
 class ArxivMCP:
-    """ArXiv MCP 客户端"""
+    """MCP-backed arXiv client."""
 
     def __init__(self):
         from tools.mcp_client import mcp_client
+
         self.client = mcp_client
         self.server_name = "arxiv"
 
     async def search(self, query: str, max_results: int = 5) -> list[dict]:
-        """搜索论文"""
-        result = await self.client.call_tool(
-            self.server_name,
-            "search_papers",
-            {"query": query, "max_results": max_results}
-        )
-
-        if not result:
-            logger.warning("[ArxivMCP] 搜索返回空结果")
-            return []
-
-        # 解析结果
-        papers = []
         try:
-            content = result.content[0].text if hasattr(result, 'content') else str(result)
-            import json
+            result = await self.client.call_tool(
+                self.server_name,
+                "search_arxiv",
+                {"query": query, "limit": max_results},
+            )
+            if not result:
+                logger.warning("[ArxivMCP] empty search result")
+                return []
+
+            content = result.content[0].text if hasattr(result, "content") else str(result)
             data = json.loads(content) if isinstance(content, str) else content
+            # 返回格式可能是列表或字典
+            if isinstance(data, list):
+                items = data
+            elif isinstance(data, dict):
+                items = data.get("papers", data.get("results", []))
+            else:
+                items = []
 
-            for item in data.get("papers", data) if isinstance(data, dict) else data:
-                papers.append({
-                    "arxiv_id": item.get("id", item.get("arxiv_id", "")),
-                    "title": item.get("title", ""),
-                    "url": item.get("url", f"https://arxiv.org/abs/{item.get('id', '')}"),
-                    "abstract": item.get("abstract", ""),
-                    "authors": item.get("authors", []),
-                    "pdf_url": item.get("pdf_url", f"https://arxiv.org/pdf/{item.get('id', '')}"),
-                })
-        except Exception as e:
-            logger.error(f"[ArxivMCP] 解析结果失败: {e}")
-
-        logger.info(f"[ArxivMCP] 搜索到 {len(papers)} 篇论文")
-        return papers
-
-    async def get_paper(self, paper_id: str) -> Optional[dict]:
-        """获取论文详情"""
-        result = await self.client.call_tool(
-            self.server_name,
-            "get_paper",
-            {"paper_id": paper_id}
-        )
-
-        if not result:
-            return None
-
-        try:
-            content = result.content[0].text if hasattr(result, 'content') else str(result)
-            import json
-            item = json.loads(content) if isinstance(content, str) else content
-
-            return {
-                "arxiv_id": item.get("id", item.get("arxiv_id", "")),
-                "title": item.get("title", ""),
-                "abstract": item.get("abstract", ""),
-                "authors": item.get("authors", []),
-                "pdf_url": item.get("pdf_url", f"https://arxiv.org/pdf/{item.get('id', '')}"),
-            }
-        except Exception as e:
-            logger.error(f"[ArxivMCP] 解析论文失败: {e}")
-            return None
+            papers = []
+            if isinstance(items, list):
+                for item in items:
+                    paper_id = item.get("id", item.get("arxiv_id", item.get("paper_id", "")))
+                    papers.append(
+                        {
+                            "arxiv_id": paper_id,
+                            "title": item.get("title", ""),
+                            "url": item.get("url", item.get("link", f"https://arxiv.org/abs/{paper_id}")),
+                            "abstract": item.get("abstract", item.get("summary", "")),
+                            "authors": item.get("authors", []),
+                            "pdf_url": item.get("pdf_url", item.get("pdf_link", f"https://arxiv.org/pdf/{paper_id}")),
+                        }
+                    )
+            logger.info("[ArxivMCP] found %s papers", len(papers))
+            return papers
+        except Exception as exc:
+            logger.error("[ArxivMCP] search failed: %s", exc)
+            return []
+        finally:
+            await self.client.disconnect(self.server_name)
 
 
 class ArxivAPI:
-    """ArXiv API - 兼容原有接口，优先使用 MCP，降级到直接 API"""
+    """Synchronous arXiv API facade used by FetcherAgent."""
 
     def __init__(self, use_mcp: bool = True):
         self.use_mcp = use_mcp
@@ -89,43 +69,42 @@ class ArxivAPI:
 
         if use_mcp:
             try:
-                self._mcp_client = ArxivMCP()
-                logger.info("[ArxivAPI] 使用 MCP 模式")
-            except Exception as e:
-                logger.warning(f"[ArxivAPI] MCP 初始化失败，降级到直接 API: {e}")
+                from config import MCP_ARXIV_URL
+
+                if MCP_ARXIV_URL:
+                    self._mcp_client = ArxivMCP()
+                    logger.info("[ArxivAPI] using MCP mode")
+                else:
+                    self.use_mcp = False
+            except Exception as exc:
+                logger.warning("[ArxivAPI] MCP init failed: %s", exc)
                 self.use_mcp = False
 
         if not self.use_mcp:
             from tools.arxiv_api import ArxivAPI as DirectArxivAPI
+
             self._direct_client = DirectArxivAPI()
-            logger.info("[ArxivAPI] 使用直接 API 模式")
+            logger.info("[ArxivAPI] using direct API mode")
 
     def search(self, query: str, max_results: int = 5) -> list[dict]:
-        """搜索论文（同步接口）"""
         if self.use_mcp and self._mcp_client:
             try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    # 在异步环境中，创建新任务
-                    import concurrent.futures
-                    with concurrent.futures.ThreadPoolExecutor() as pool:
-                        result = pool.submit(
-                            asyncio.run,
-                            self._mcp_client.search(query, max_results)
-                        ).result()
-                    return result
-                else:
-                    return loop.run_until_complete(
-                        self._mcp_client.search(query, max_results)
-                    )
-            except Exception as e:
-                logger.error(f"[ArxivAPI] MCP 调用失败: {e}")
+                import asyncio
+                import concurrent.futures
 
-        # 降级到直接 API
+                async def _search():
+                    return await self._mcp_client.search(query, max_results)
+
+                try:
+                    asyncio.get_running_loop()
+                    with concurrent.futures.ThreadPoolExecutor() as pool:
+                        return pool.submit(asyncio.run, _search()).result()
+                except RuntimeError:
+                    return asyncio.run(_search())
+            except Exception as exc:
+                logger.error("[ArxivAPI] MCP call failed: %s", exc)
+
         if self._direct_client:
             return self._direct_client.search(query, max_results)
 
         return []
-
-
-import asyncio

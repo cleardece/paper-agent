@@ -16,34 +16,40 @@ logger = logging.getLogger("paper-agent")
 
 
 def _create_paper_search():
-    """创建论文搜索服务 - 优先 MCP，降级到直接 API"""
+    """创建论文搜索服务 - 优先 ArXiv MCP，降级到直接 API"""
     # 检查是否启用 MCP
     use_mcp = os.getenv("USE_MCP", "true").lower() == "true"
 
     if use_mcp:
+        # 优先 ArXiv MCP（已验证可用）
         try:
-            from tools.mcp_semantic_scholar import SemanticScholarAPI
-            logger.info("[Container] 尝试使用 Semantic Scholar MCP...")
-            return SemanticScholarAPI(api_key=SEMANTIC_SCHOLAR_API_KEY, use_mcp=True)
-        except Exception as e:
-            logger.warning(f"[Container] Semantic Scholar MCP 失败: {e}")
-
-        try:
-            from tools.mcp_arxiv import ArxivAPI
-            logger.info("[Container] 尝试使用 ArXiv MCP...")
-            return ArxivAPI(use_mcp=True)
+            from config import MCP_ARXIV_URL
+            if MCP_ARXIV_URL:
+                from tools.mcp_arxiv import ArxivAPI
+                logger.info("[Container] 使用 ArXiv MCP")
+                return ArxivAPI(use_mcp=True)
         except Exception as e:
             logger.warning(f"[Container] ArXiv MCP 失败: {e}")
+
+        # 降级到 Semantic Scholar MCP
+        try:
+            from config import MCP_SS_URL
+            if MCP_SS_URL:
+                from tools.mcp_semantic_scholar import SemanticScholarAPI
+                logger.info("[Container] 使用 Semantic Scholar MCP")
+                return SemanticScholarAPI(api_key=SEMANTIC_SCHOLAR_API_KEY, use_mcp=True)
+        except Exception as e:
+            logger.warning(f"[Container] Semantic Scholar MCP 失败: {e}")
 
     # 降级到直接 API
     if SEMANTIC_SCHOLAR_API_KEY:
         from tools.semantic_scholar import SemanticScholarAPI
         logger.info("[Container] 使用 Semantic Scholar 直接 API")
-        return SemanticScholarAPI(api_key=SEMANTIC_SCHOLAR_API_KEY, use_mcp=False)
+        return SemanticScholarAPI(api_key=SEMANTIC_SCHOLAR_API_KEY)
     else:
         from tools.arxiv_api import ArxivAPI
         logger.info("[Container] 使用 arXiv 直接 API")
-        return ArxivAPI(use_mcp=False)
+        return ArxivAPI()
 
 
 class ServiceContainer:

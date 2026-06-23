@@ -58,18 +58,27 @@ class ReflectorAgent:
     def __init__(self, llm):
         self.llm = llm
 
-    def invoke(self, paper_title: str, analysis: str, retrieved_chunks: list) -> dict:
+    def invoke(self, state: dict) -> dict:
         """
         生成反思记忆
 
         Args:
-            paper_title: 论文标题
-            analysis: 分析结果
-            retrieved_chunks: 检索到的 chunks（用于发现关联）
+            state: AgentState 字典
 
         Returns:
-            反思记忆字典
+            更新后的 state
         """
+        # 从 state 提取信息
+        analysis = state.get("analysis", "")
+        retrieved_chunks = state.get("retrieved_chunks", [])
+        target_papers = state.get("target_papers", [])
+        paper_title = target_papers[0].get("title", "Unknown") if target_papers else "Unknown"
+
+        # 如果没有分析结果，跳过
+        if not analysis:
+            logger.info("[Reflector] 无分析结果，跳过反思")
+            return {"reflection": None}
+
         # 构建上下文
         chunk_summary = "\n".join([
             f"- [{c.get('paper_title', '')}] {c.get('content', '')[:100]}..."
@@ -101,15 +110,18 @@ class ReflectorAgent:
                 import json
                 reflection = json.loads(json_match.group())
                 logger.info(f"[Reflector] 生成反思: {len(reflection.get('insights', []))} 个洞察")
-                return reflection
+                return {"reflection": reflection, "next_agent": "END"}
 
         except Exception as e:
             logger.error(f"[Reflector] 生成反思失败: {e}")
 
         # 默认返回
         return {
-            "insights": [],
-            "unanswered_questions": [],
-            "future_directions": [],
-            "connections": [],
+            "reflection": {
+                "insights": [],
+                "unanswered_questions": [],
+                "future_directions": [],
+                "connections": [],
+            },
+            "next_agent": "END",
         }
