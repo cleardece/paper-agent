@@ -478,6 +478,21 @@ async def upload_paper(file: UploadFile):
 
     container = get_container()
 
+    # 生成 arxiv_id
+    arxiv_id = os.path.splitext(file.filename)[0].replace(" ", "_").replace("/", "_")
+    if len(arxiv_id) > 60:
+        arxiv_id = arxiv_id[:60]
+
+    # 检查是否已存在
+    existing = container.mongodb.get_paper(arxiv_id)
+    if existing:
+        title = existing.get("title", file.filename)
+        status = existing.get("status", "unknown")
+        raise HTTPException(
+            status_code=409,
+            detail=f"论文已存在: {title[:30]}... (状态: {status})"
+        )
+
     # 保存到临时目录
     tmp_dir = "tmp_pdfs"
     os.makedirs(tmp_dir, exist_ok=True)
@@ -488,11 +503,6 @@ async def upload_paper(file: UploadFile):
         f.write(content)
 
     logger.info(f"[Upload] 收到文件: {file.filename} ({len(content)} bytes)")
-
-    # 生成 arxiv_id
-    arxiv_id = os.path.splitext(file.filename)[0].replace(" ", "_").replace("/", "_")
-    if len(arxiv_id) > 60:
-        arxiv_id = arxiv_id[:60]
 
     # 立即返回，后台处理
     asyncio.create_task(_process_upload(container, pdf_path, file.filename, arxiv_id, session_id=None))
