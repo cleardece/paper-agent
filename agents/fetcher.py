@@ -59,10 +59,16 @@ class FetcherAgent:
         for paper_meta in papers:
             arxiv_id = paper_meta["arxiv_id"]
 
-            # 跳过已入库的
-            if self.mongo.paper_exists(arxiv_id):
+            # 检查是否已完全入库（indexed 状态）
+            existing = self.mongo.get_paper(arxiv_id)
+            if existing and existing.get("status") == "indexed":
                 already_exists.append(paper_meta)
                 continue
+            elif existing:
+                # 状态不是 indexed，重新处理
+                logger.info(f"[Fetcher] 论文 {arxiv_id} 状态为 {existing.get('status')}，重新处理")
+                self.mongo.delete_paper(arxiv_id)
+                self.milvus.delete_by_paper(arxiv_id)
 
             # 检查是否有 PDF
             if not paper_meta.get("pdf_url"):
@@ -175,26 +181,36 @@ class FetcherAgent:
         logger.info(f"[Fetcher] 已生成 {len(chunks)} 个分块并存入 MongoDB")
 
         # 5. Embedding
-        logger.info(f"[Fetcher] 正在生成 Embedding...")
-        texts = [c["content"] for c in chunks]
-        vectors = self.embedder.embed_texts(texts)
-        logger.info(f"[Fetcher] Embedding 完成")
+        try:
+            logger.info(f"[Fetcher] 正在生成 Embedding...")
+            texts = [c["content"] for c in chunks]
+            vectors = self.embedder.embed_texts(texts)
+            logger.info(f"[Fetcher] Embedding 完成")
+        except Exception as e:
+            logger.error(f"[Fetcher] Embedding 生成失败: {e}")
+            self.mongo.update_paper_status(arxiv_id, "embed_failed")
+            raise
 
         # 6. 存Milvus
-        import json
-        milvus_records = [
-            {
-                "paper_arxiv_id": arxiv_id,
-                "chunk_index": c["chunk_index"],
-                "content": c["content"],
-                "embedding": vectors[i],
-                "metadata_json": json.dumps(c["metadata"]),
-            }
-            for i, c in enumerate(chunks)
-        ]
-        self.milvus.insert(milvus_records)
-        self.mongo.update_paper_status(arxiv_id, "indexed")
-        logger.info(f"[Fetcher] 论文处理完成: {title}")
+        try:
+            import json
+            milvus_records = [
+                {
+                    "paper_arxiv_id": arxiv_id,
+                    "chunk_index": c["chunk_index"],
+                    "content": c["content"],
+                    "embedding": vectors[i],
+                    "metadata_json": json.dumps(c["metadata"]),
+                }
+                for i, c in enumerate(chunks)
+            ]
+            self.milvus.insert(milvus_records)
+            self.mongo.update_paper_status(arxiv_id, "indexed")
+            logger.info(f"[Fetcher] 论文处理完成: {title}")
+        except Exception as e:
+            logger.error(f"[Fetcher] Milvus 存储失败: {e}")
+            self.mongo.update_paper_status(arxiv_id, "milvus_failed")
+            raise
 
     def _download_pdf(self, url: str, arxiv_id: str) -> str:
         """下载PDF到本地临时目录"""
