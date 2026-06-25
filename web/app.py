@@ -33,9 +33,9 @@ from config import get_llm
 from state.graph_state import AgentState
 
 
-AGENTS = ("supervisor", "fetcher", "retriever", "analyzer", "critic", "presenter")
+AGENTS = ("supervisor", "translator", "fetcher", "retriever", "analyzer", "critic", "presenter")
 QUESTION_FLOW = ("supervisor", "retriever", "analyzer", "critic", "presenter")
-FETCH_FLOW = ("supervisor", "fetcher")
+FETCH_FLOW = ("supervisor", "translator", "fetcher")
 
 
 class ChatRequest(BaseModel):
@@ -253,6 +253,7 @@ def wrap_agent(name: str, invoke: Callable[[AgentState], Any], session: Session)
 def agent_running_detail(name: str, retry_count: int = 0) -> str:
     details = {
         "supervisor": "正在分析用户意图...",
+        "translator": "正在翻译查询关键词...",
         "fetcher": "正在检索并入库论文...",
         "retriever": "正在检索相关论文片段...",
         "analyzer": "正在综合分析证据...",
@@ -296,13 +297,21 @@ def supervisor_route(state: AgentState) -> str:
     if state.get("error"):
         logger.warning("[SupervisorRoute] 检测到错误，路由到 presenter")
         return "presenter"
-    if next_agent not in ("fetcher", "retriever", "END"):
+    if next_agent == "fetcher":
+        # fetcher 需要先经过 translator 翻译查询
+        return "translator"
+    if next_agent not in ("retriever", "END"):
         logger.warning(f"[SupervisorRoute] 非法路由 '{next_agent}'，使用 END")
         return "END"
     return next_agent
 
 
 def fetcher_route(state: AgentState) -> str:
+    # fetcher 成功入库后希望继续检索分析
+    if state.get("next_agent") == "retriever":
+        # 清除 fetcher 的入库摘要，避免覆盖后续 retriever 的分析结果
+        state["answer"] = None
+        return "retriever"
     # 如果 fetcher 直接返回了 answer（如没有 PDF 时），路由到 presenter 展示
     if state.get("answer"):
         return "presenter"
@@ -336,11 +345,12 @@ def build_traced_workflow(session: Session):
     # 构建图结构
     graph.add_edge(START, "supervisor")
     graph.add_conditional_edges("supervisor", supervisor_route, {
-        "fetcher": "fetcher",
+        "translator": "translator",
         "retriever": "retriever",
         "END": "presenter",
     })
-    graph.add_conditional_edges("fetcher", fetcher_route, {"presenter": "presenter", END: END})
+    graph.add_edge("translator", "fetcher")
+    graph.add_conditional_edges("fetcher", fetcher_route, {"presenter": "presenter", "retriever": "retriever", END: END})
     graph.add_edge("retriever", "analyzer")
     graph.add_edge("analyzer", "critic")
     graph.add_conditional_edges("critic", critic_route, {
@@ -559,6 +569,10 @@ async def _process_upload(container, pdf_path, filename, arxiv_id, session_id=No
         ]
         container.milvus.insert(milvus_records)
         logger.info(f"[Upload] Milvus 入库完成: {len(chunks)} 分块")
+
+        # 5. 更新状态为 indexed
+        container.mongodb.update_paper_status(arxiv_id, "indexed")
+        logger.info(f"[Upload] 论文处理完成: {filename}")
 
     except Exception as e:
         logger.error(f"[Upload] 后台处理失败: {e}", exc_info=True)
