@@ -59,16 +59,10 @@ class FetcherAgent:
         for paper_meta in papers:
             arxiv_id = paper_meta["arxiv_id"]
 
-            # 检查是否已完全入库（indexed 状态）
-            existing = self.mongo.get_paper(arxiv_id)
-            if existing and existing.get("status") == "indexed":
+            # 跳过已入库的（任何状态）
+            if self.mongo.paper_exists(arxiv_id):
                 already_exists.append(paper_meta)
                 continue
-            elif existing:
-                # 状态不是 indexed，重新处理
-                logger.info(f"[Fetcher] 论文 {arxiv_id} 状态为 {existing.get('status')}，重新处理")
-                self.mongo.delete_paper(arxiv_id)
-                self.milvus.delete_by_paper(arxiv_id)
 
             # 检查是否有 PDF
             if not paper_meta.get("pdf_url"):
