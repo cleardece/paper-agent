@@ -466,6 +466,26 @@ async def test_connection():
 
 import asyncio
 
+
+def _extract_arxiv_id_from_pdf(pdf_content: bytes) -> Optional[str]:
+    """从 PDF 内容提取 arxiv_id"""
+    import re
+    try:
+        # 尝试从 PDF 文本中提取 arxiv ID
+        text = pdf_content[:5000].decode("utf-8", errors="ignore")
+        # 匹配 arxiv ID 格式：2304.08485 或 2304.08485v1
+        match = re.search(r'arxiv\.org/abs/(\d{4}\.\d{4,5}(?:v\d+)?)', text)
+        if match:
+            return match.group(1)
+        # 匹配纯数字格式
+        match = re.search(r'(\d{4}\.\d{4,5})(?:v\d+)?', text)
+        if match:
+            return match.group(1)
+    except:
+        pass
+    return None
+
+
 @app.post("/api/upload")
 async def upload_paper(file: UploadFile):
     """上传本地 PDF 论文，后台异步解析并入库"""
@@ -479,7 +499,19 @@ async def upload_paper(file: UploadFile):
     container = get_container()
 
     # 生成 arxiv_id
-    arxiv_id = os.path.splitext(file.filename)[0].replace(" ", "_").replace("/", "_")
+    # 1. 先尝试从文件名提取（如果是数字格式如 2304.08485.pdf）
+    base_name = os.path.splitext(file.filename)[0]
+    if base_name.replace(".", "").replace("v1", "").replace("v2", "").isdigit():
+        arxiv_id = base_name
+    else:
+        # 2. 从 PDF 内容提取 arxiv_id
+        arxiv_id = _extract_arxiv_id_from_pdf(content)
+        if not arxiv_id:
+            # 3. 生成唯一 ID（基于文件名 + 哈希）
+            import hashlib
+            file_hash = hashlib.md5(content).hexdigest()[:8]
+            arxiv_id = f"local_{base_name[:40]}_{file_hash}"
+
     if len(arxiv_id) > 60:
         arxiv_id = arxiv_id[:60]
 
