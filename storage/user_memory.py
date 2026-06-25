@@ -245,6 +245,9 @@ class UserMemory:
         for mem in memories:
             last_accessed = mem.get("last_accessed", now)
             if isinstance(last_accessed, datetime):
+                # 确保时区一致
+                if last_accessed.tzinfo is None:
+                    last_accessed = last_accessed.replace(tzinfo=timezone.utc)
                 days_elapsed = (now - last_accessed).total_seconds() / 86400
             else:
                 days_elapsed = 0
