@@ -29,7 +29,7 @@ def init_components():
     code_generator = CodeGenerator(llm)  # 加这行
 
     agents = {
-        "supervisor": SupervisorAgent(llm),
+        "supervisor": SupervisorAgent(llm, mongodb_client),
         "fetcher": FetcherAgent(arxiv_api, pdf_parser, mongodb_client, embedding_service, milvus_client),
         "retriever": RetrieverAgent(embedding_service, milvus_client, mongodb_client),
         "analyzer": AnalyzerAgent(llm, mongodb_client),
@@ -56,6 +56,7 @@ def create_initial_state(query: str) -> AgentState:
         "iteration": 0,
         "max_iterations": 2,
         "error": None,
+        "conversation_context": None,
     }
 
 
@@ -70,6 +71,7 @@ def main():
     print("输入论文名搜索入库，或直接提问。输入 q 退出。\n")
 
     workflow = init_components()
+    chat_history = []  # 保存最近对话用于上下文
 
     while True:
         query = input("你: ").strip()
@@ -77,8 +79,20 @@ def main():
             print("再见！")
             break
 
+        # 构建对话上下文
+        context = ""
+        if chat_history:
+            recent = chat_history[-20:]  # 最近 10 轮
+            context = "\n".join(recent)
+
         state = create_initial_state(query)
+        state["conversation_context"] = context
         result = asyncio.run(workflow.ainvoke(state))
+
+        # 记录对话历史
+        chat_history.append(f"用户: {query[:100]}")
+        answer = result.get("answer") or result.get("error") or "未生成回答"
+        chat_history.append(f"助手: {answer[:100]}")
 
         if result.get("answer"):
             print(f"\n助手: {result['answer']}\n")

@@ -67,26 +67,29 @@ class ArxivAPI:
         self._mcp_client = None
         self._direct_client = None
 
+        # 始终创建直接 API 客户端作为降级备选
+        from tools.arxiv_api import ArxivAPI as DirectArxivAPI
+        self._direct_client = DirectArxivAPI()
+
         if use_mcp:
             try:
                 from config import MCP_ARXIV_URL
 
                 if MCP_ARXIV_URL:
                     self._mcp_client = ArxivMCP()
-                    logger.info("[ArxivAPI] using MCP mode")
+                    logger.info("[ArxivAPI] using MCP mode (direct API as fallback)")
                 else:
                     self.use_mcp = False
+                    logger.info("[ArxivAPI] MCP_ARXIV_URL not set, using direct API")
             except Exception as exc:
                 logger.warning("[ArxivAPI] MCP init failed: %s", exc)
                 self.use_mcp = False
 
         if not self.use_mcp:
-            from tools.arxiv_api import ArxivAPI as DirectArxivAPI
-
-            self._direct_client = DirectArxivAPI()
             logger.info("[ArxivAPI] using direct API mode")
 
     def search(self, query: str, max_results: int = 5) -> list[dict]:
+        # 优先尝试 MCP
         if self.use_mcp and self._mcp_client:
             try:
                 import asyncio
@@ -98,13 +101,22 @@ class ArxivAPI:
                 try:
                     asyncio.get_running_loop()
                     with concurrent.futures.ThreadPoolExecutor() as pool:
-                        return pool.submit(asyncio.run, _search()).result()
+                        results = pool.submit(asyncio.run, _search()).result()
                 except RuntimeError:
-                    return asyncio.run(_search())
-            except Exception as exc:
-                logger.error("[ArxivAPI] MCP call failed: %s", exc)
+                    results = asyncio.run(_search())
 
+                # MCP 返回了结果，直接使用
+                if results:
+                    return results
+
+                # MCP 返回空结果，降级到直接 API
+                logger.warning("[ArxivAPI] MCP 返回 0 篇结果，降级到直接 API")
+            except Exception as exc:
+                logger.error("[ArxivAPI] MCP call failed, falling back to direct API: %s", exc)
+
+        # 降级到直接 arXiv API
         if self._direct_client:
+            logger.info("[ArxivAPI] 使用直接 arXiv API 搜索")
             return self._direct_client.search(query, max_results)
 
         return []

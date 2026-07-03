@@ -14,45 +14,116 @@ SUPERVISOR_PROMPT = SUPERVISOR_PROMPT = """你是论文助手的路由调度器�
 
 ## 判断规则
 
-**→ fetcher**（满足任一）：
-- 要求搜索/查找/下载/抓取论文
-- 提供了arXiv链接或论文标题要求入库
-- 关键词：搜索、找论文、下载、入库、fetch、search
+**→ direct**（单篇论文分析，满足任一）：
+- 用户指定了**一篇**具体论文（标题、arXiv链接、或"这篇论文"指代）
+- 要求分析/总结/解释**一篇**论文的内容
+- 关键词：分析、总结、解释、介绍、这篇论文、它的
 
-**→ retriever**（满足任一）：
-- 对已有论文内容提问（是什么、为什么、怎么、对比、总结）
-- 要求解释/分析/比较论文中的概念
-- 关键词：什么、怎么、为什么、解释、分析、对比、区别
+**→ fetcher**（多篇论文入库，满足任一）：
+- 要求搜索/查找/下载多篇论文
+- 关键词：搜索、找论文、下载、几篇、多篇
+
+**→ retriever**（知识库问答，满足任一）：
+- 对**多篇已有论文**提问、对比
+- 关键词：对比、区别、比较、哪些论文
 
 **→ END**：
 - 闲聊、打招呼、与论文无关的问题
 - 无法判断意图
 
 ## 输出格式（严格JSON）
-{"next_agent": "fetcher" | "retriever" | "END", "search_query": "提取的搜索关键词（仅fetcher需要）", "reason": "判断依据"}
+{"next_agent": "direct" | "fetcher" | "retriever" | "END", "search_query": "提取的搜索关键词（仅fetcher需要）", "reason": "判断依据"}
 
-## 注意
-- 如果判断为fetcher，必须从用户输入中提取核心搜索关键词（英文最佳），去掉"帮我找"、"搜索"等修饰词
-- 比如"帮我找几篇关于RAG的最新论文" → search_query应为"RAG latest papers"
+## 重要规则
+- **单篇分析 → direct**，不要走 fetcher 或 retriever
+- **多篇搜索 → fetcher**
+- **多篇对比/知识库问答 → retriever**
+- 如果判断为fetcher，必须从用户输入中提取核心搜索关键词（英文最佳）
 
 ## 示例
-用户："帮我找几篇关于RAG的最新论文" → fetcher, search_query="RAG latest papers"
-用户："搜索流体力学PINN求解的论文" → fetcher, search_query="fluid dynamics PINN solving"
-用户："Transformer和RNN的区别是什么" → retriever
+用户："帮我分析这篇论文" → direct
+用户："它的实验怎么设计的" → direct（跟随意图，单篇）
+用户："搜索流体力学PINN求解的论文" → fetcher
+用户："对比RAG和GraphRAG" → retriever（多篇对比）
 用户："你好" → END
 """
 
 
 class SupervisorAgent:
-    def __init__(self, llm):
+    def __init__(self, llm, mongodb_client=None):
         self.llm = llm
+        self.mongo = mongodb_client
+
+    def _is_followup_query(self, query: str) -> bool:
+        """检测是否为跟随意图（指代之前讨论的论文）"""
+        followup_patterns = [
+            "这篇论文", "该论文", "上一篇", "刚才的", "之前",
+            "它的", "这篇的", "该文章", "这篇文章",
+        ]
+        return any(p in query for p in followup_patterns)
+
+    def _extract_paper_from_context(self, query: str, context: str) -> str:
+        """从对话上下文中提取最近讨论的论文标题"""
+        import re
+        if not context:
+            # 没有上下文，从知识库取最近的论文
+            if self.mongo:
+                try:
+                    papers = self.mongo.list_papers(limit=3)
+                    if papers:
+                        return papers[-1].get("title", "")
+                except Exception:
+                    pass
+            return None
+
+        # 从上下文中提取英文标题（大写开头的连续词组）
+        titles = re.findall(r'[A-Z][a-zA-Z\s\-:]{5,80}', context)
+        if titles:
+            return titles[-1].strip()
+        return None
+
+    def _check_paper_exists(self, query: str) -> bool:
+        """检查知识库中是否有与查询相关的论文"""
+        if not self.mongo:
+            return False
+        try:
+            papers = self.mongo.list_papers(limit=50)
+            if not papers:
+                return False
+            # 简单关键词匹配：检查论文标题是否包含查询中的关键词
+            query_lower = query.lower()
+            # 提取英文关键词（过滤掉常见中文停用词）
+            import re
+            keywords = re.findall(r'[a-zA-Z]{3,}', query_lower)
+            if not keywords:
+                return False
+            for paper in papers:
+                title = paper.get("title", "").lower()
+                abstract = paper.get("abstract", "").lower()
+                text = f"{title} {abstract}"
+                # 至少匹配 2 个关键词
+                matched = sum(1 for kw in keywords if kw in text)
+                if matched >= 2:
+                    return True
+            return False
+        except Exception as e:
+            logger.warning(f"[Supervisor] 检查知识库失败: {e}")
+            return False
 
     def invoke(self, state: AgentState) -> dict:
         query = state["user_query"]
         logger.info(f"[Supervisor] 收到查询: {query[:50]}...")
+
+        # 构建带对话上下文的输入
+        context = state.get("conversation_context", "")
+        if context:
+            user_input = f"## 对话上下文\n{context}\n\n## 当前用户输入\n{query}"
+        else:
+            user_input = f"用户输入：{query}"
+
         messages = [
             SystemMessage(content=SUPERVISOR_PROMPT),
-            HumanMessage(content=f"用户输入：{query}"),
+            HumanMessage(content=user_input),
         ]
         logger.info("[Supervisor] 正在调用 LLM 判断意图...")
         response = self.llm.invoke(messages)
@@ -84,7 +155,18 @@ class SupervisorAgent:
         if next_agent == "fetcher" and not search_query:
             search_query = query
 
+        # direct 模式不需要 search_query，用原始查询即可
+        if next_agent == "direct" and not search_query:
+            search_query = query
+
+        # 提取目标论文（跟随意图时）
+        target_paper = None
+        if self._is_followup_query(query):
+            target_paper = self._extract_paper_from_context(query, state.get("conversation_context", ""))
+            if target_paper:
+                logger.info(f"[Supervisor] 识别到目标论文: {target_paper[:50]}")
+
         logger.info(f"[Supervisor] 路由: {next_agent}, 搜索词: {search_query}")
 
-        result = {"next_agent": next_agent, "search_query": search_query, "error": None}
+        result = {"next_agent": next_agent, "search_query": search_query, "error": None, "target_paper": target_paper}
         return result

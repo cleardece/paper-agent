@@ -33,11 +33,11 @@ CRITIC_PROMPT = CRITIC_PROMPT = """你是学术论文问答的质量审核员。
   "verdict": "pass" | "revise"
 }
 
-## 评分规则
-- score = 五个维度加权平均 × 10
-- hallucinations 非空 → 直接 revise，不论分数
-- score >= 70 且 hallucinations 为空 → pass
-- 其余 → revise
+## 评分规则（重要：宽松标准，避免不必要的重试）
+- score >= 60 且无严重幻觉 → pass
+- 只有出现严重幻觉（编造数据、错误引用）时才 revise
+- 完整性不足、措辞不完美不算 revise 理由
+- 默认倾向 pass，除非回答有明显错误
 """
 
 

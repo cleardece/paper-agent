@@ -122,7 +122,7 @@ class RetrieverAgent:
 
         return expanded
 
-    def _two_level_retrieval(self, query: str, query_vector, session_id: str = None) -> list[dict]:
+    def _two_level_retrieval(self, query: str, query_vector, session_id: str = None, target_paper: str = None) -> list[dict]:
         """两层检索：先找论文，再在论文内找 chunk"""
 
         # ===== Stage 1: 论文级检索 =====
@@ -133,6 +133,23 @@ class RetrieverAgent:
         all_papers = self.mongo.list_papers(limit=50)
         if not all_papers:
             return []
+
+        # 如果有目标论文，优先匹配（直接用标题关键词匹配）
+        if target_paper:
+            target_lower = target_paper.lower()
+            for paper in all_papers:
+                title = paper.get("title", "").lower()
+                # 标题包含目标关键词 → 直接作为 top-1
+                if any(kw in title for kw in target_lower.split() if len(kw) > 3):
+                    logger.info(f"[Retriever] 直接匹配目标论文: {paper.get('title', '')[:50]}")
+                    # 跳过向量检索，直接取这篇论文的 chunks
+                    hits = self.milvus.search(
+                        query_embedding=query_vector,
+                        top_k=15,
+                        paper_ids=[paper["arxiv_id"]],
+                        output_fields=["paper_arxiv_id", "chunk_index", "content", "metadata_json"],
+                    )
+                    return hits
 
         # 对每篇论文计算与查询的相似度
         paper_scores = []
@@ -177,6 +194,34 @@ class RetrieverAgent:
 
         return hits
 
+    def _extract_target_paper(self, query: str, context: str = "") -> str:
+        """从查询和对话上下文中提取用户指代的论文标题"""
+        import re
+
+        # 检查是否包含跟随意图词
+        followup_patterns = ["这篇论文", "该论文", "它的", "它", "上一篇", "刚才的", "之前"]
+        is_followup = any(p in query for p in followup_patterns)
+        if not is_followup:
+            return None
+
+        # 从对话上下文中提取最近讨论的论文标题
+        if context:
+            # 匹配 "助手: ..." 中提到的论文标题（英文标题）
+            titles = re.findall(r'[A-Z][a-zA-Z\s\-:]{5,80}', context)
+            if titles:
+                # 返回最后一个出现的英文标题（最近讨论的）
+                return titles[-1].strip()
+
+        # 从知识库中匹配最近的论文
+        try:
+            papers = self.mongo.list_papers(limit=5)
+            if papers:
+                return papers[-1].get("title", "")
+        except Exception:
+            pass
+
+        return None
+
     def invoke(self, state: AgentState) -> dict:
         """
         检索流程：
@@ -189,7 +234,13 @@ class RetrieverAgent:
         query = state["user_query"]
         session_id = state.get("session_id")
         user_id = state.get("user_id", "default")
+        context = state.get("conversation_context", "")
         logger.info(f"[Retriever] 开始检索: {query[:50]}...")
+
+        # 提取用户指代的论文
+        target_paper = self._extract_target_paper(query, context)
+        if target_paper:
+            logger.info(f"[Retriever] 识别到目标论文: {target_paper[:50]}")
 
         # 获取用户兴趣
         user_interests = self.mongo.user_memory.get_interests(user_id, top_k=5)
@@ -219,7 +270,7 @@ class RetrieverAgent:
                     cache.set(session_id, cache_key, query_vector)
 
             # 两层检索
-            hits = self._two_level_retrieval(eq, query_vector, session_id)
+            hits = self._two_level_retrieval(eq, query_vector, session_id, target_paper)
 
             # 合并结果
             for h in hits:

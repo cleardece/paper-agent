@@ -24,7 +24,7 @@ def search_papers(query: str, max_results: int = 5, retries: int = 3):
 
     for attempt in range(retries):
         try:
-            logger.info(f"[arXiv] 搜索: {query[:50]}... (第 {attempt + 1} 次)")
+            logger.info(f"[arXiv] 搜索关键词: '{query}' (第 {attempt + 1} 次, max_results={max_results})")
             results = []
             for r in client.results(search):
                 # 从 entry_id 提取 arxiv_id
@@ -39,6 +39,9 @@ def search_papers(query: str, max_results: int = 5, retries: int = 3):
                     "pdf_url": r.pdf_url,
                 })
             logger.info(f"[arXiv] 找到 {len(results)} 篇论文")
+            if results:
+                for i, r in enumerate(results[:3]):
+                    logger.info(f"[arXiv]   {i+1}. {r['title'][:60]}")
             return results
 
         except arxiv.HTTPError as e:

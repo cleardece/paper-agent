@@ -57,5 +57,9 @@ class AgentState(TypedDict):
     reflection: Optional[dict]              # 反思记忆（insights, questions, etc.）
     session_id: Optional[str]               # 会话ID
 
+    # 对话上下文
+    conversation_context: Optional[str]     # 最近对话摘要（帮助理解跟随意图）
+    target_paper: Optional[str]             # 用户指代的论文标题（跟随意图用）
+
     # 错误处理
     error: Optional[str]

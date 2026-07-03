@@ -102,21 +102,28 @@ class ServiceContainer:
     def create_agents(self):
         """创建所有 Agent 实例"""
         from agents.supervisor import SupervisorAgent
+        from agents.translator import TranslatorAgent
         from agents.fetcher import FetcherAgent
         from agents.retriever import RetrieverAgent
+        from agents.direct_analyzer import DirectAnalyzerAgent
         from agents.analyzer import AnalyzerAgent
         from agents.critic import CriticAgent
         from agents.presenter import PresenterAgent
         from agents.reflector import ReflectorAgent
 
         return {
-            "supervisor": SupervisorAgent(self.llm),
+            "supervisor": SupervisorAgent(self.llm, self.mongodb),
+            "translator": TranslatorAgent(self.llm),
             "fetcher": FetcherAgent(
                 self.paper_search, self.pdf_parser, self.mongodb,
                 self.embedder, self.milvus
             ),
             "retriever": RetrieverAgent(
                 self.embedder, self.milvus, self.mongodb, self.llm
+            ),
+            "direct_analyzer": DirectAnalyzerAgent(
+                self.llm, self.mongodb, self.embedder, self.milvus,
+                self.pdf_parser, self.paper_search
             ),
             "analyzer": AnalyzerAgent(self.llm, self.mongodb),
             "critic": CriticAgent(self.llm),

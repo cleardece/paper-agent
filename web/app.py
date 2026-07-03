@@ -33,9 +33,10 @@ from config import get_llm
 from state.graph_state import AgentState
 
 
-AGENTS = ("supervisor", "translator", "fetcher", "retriever", "analyzer", "critic", "presenter")
+AGENTS = ("supervisor", "translator", "fetcher", "retriever", "direct_analyzer", "analyzer", "critic", "presenter")
 QUESTION_FLOW = ("supervisor", "retriever", "analyzer", "critic", "presenter")
 FETCH_FLOW = ("supervisor", "translator", "fetcher")
+DIRECT_FLOW = ("supervisor", "direct_analyzer")
 
 
 class ChatRequest(BaseModel):
@@ -256,6 +257,7 @@ def agent_running_detail(name: str, retry_count: int = 0) -> str:
         "translator": "正在翻译查询关键词...",
         "fetcher": "正在检索并入库论文...",
         "retriever": "正在检索相关论文片段...",
+        "direct_analyzer": "正在下载并分析论文...",
         "analyzer": "正在综合分析证据...",
         "critic": f"正在评估回答质量...（第 {retry_count + 1} 次）",
         "presenter": "正在整理最终回复...",
@@ -274,7 +276,18 @@ def agent_done_detail(name: str, result: dict[str, Any]) -> str:
     return "已完成"
 
 
-def create_web_initial_state(query: str) -> AgentState:
+def create_web_initial_state(query: str, session: Session = None) -> AgentState:
+    # 构建对话上下文摘要，帮助 Supervisor 理解跟随意图
+    context_summary = ""
+    if session and len(session.messages) > 0:
+        # 取最近 10 轮对话作为上下文
+        recent = session.messages[-20:]  # 最近 10 轮（user+assistant 各一条）
+        context_lines = []
+        for msg in recent:
+            role_label = "用户" if msg.role == "user" else "助手"
+            context_lines.append(f"{role_label}: {msg.content[:150]}")
+        context_summary = "\n".join(context_lines)
+
     return {
         "user_query": query,
         "search_query": None,
@@ -287,8 +300,10 @@ def create_web_initial_state(query: str) -> AgentState:
         "critic_score": None,
         "next_agent": None,
         "iteration": 0,
-        "max_iterations": 2,
+        "max_iterations": 1,
         "error": None,
+        "conversation_context": context_summary,
+        "target_paper": None,
     }
 
 
@@ -297,6 +312,8 @@ def supervisor_route(state: AgentState) -> str:
     if state.get("error"):
         logger.warning("[SupervisorRoute] 检测到错误，路由到 presenter")
         return "presenter"
+    if next_agent == "direct":
+        return "direct_analyzer"
     if next_agent == "fetcher":
         # fetcher 需要先经过 translator 翻译查询
         return "translator"
@@ -345,10 +362,14 @@ def build_traced_workflow(session: Session):
     # 构建图结构
     graph.add_edge(START, "supervisor")
     graph.add_conditional_edges("supervisor", supervisor_route, {
+        "direct_analyzer": "direct_analyzer",
         "translator": "translator",
         "retriever": "retriever",
         "END": "presenter",
     })
+    # 快速通道：单篇论文直接分析 → presenter
+    graph.add_edge("direct_analyzer", "presenter")
+    # 完整通道
     graph.add_edge("translator", "fetcher")
     graph.add_conditional_edges("fetcher", fetcher_route, {"presenter": "presenter", "retriever": "retriever", END: END})
     graph.add_edge("retriever", "analyzer")
@@ -820,9 +841,9 @@ async def chat(request: ChatRequest) -> StreamingResponse:
         try:
             logger.info("[Chat] 开始构建 workflow...")
             workflow = build_traced_workflow(session)
-            state = create_web_initial_state(request.message)
+            state = create_web_initial_state(request.message, session)
             logger.info(f"[Chat] 开始执行 workflow，查询: {request.message[:50]}...")
-            result = await asyncio.wait_for(workflow.ainvoke(state), timeout=300)
+            result = await asyncio.wait_for(workflow.ainvoke(state), timeout=600)
             answer = result.get("answer") or result.get("error") or "未生成回复。"
             logger.info(f"[Chat] Workflow 执行完成")
         except asyncio.TimeoutError:
