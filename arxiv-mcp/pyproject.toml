@@ -1,0 +1,15 @@
+[project]
+name = "arxiv-mcp"
+version = "0.1.0"
+description = "MCP server for retrieving papers from arXiv based on keywords"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "aiohttp>=3.11.16",
+    "feedparser>=6.0.11",
+    "mcp[cli]>=1.6.0",
+    "pypdf2>=3.0.1",
+    "python-dotenv>=1.0.0",
+]
+[project.scripts]
+arxiv = "server:main"
