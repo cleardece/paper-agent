@@ -50,13 +50,13 @@ class FetcherAgent:
             if papers:
                 cache.set(state.get("session_id"), cache_key, papers)
 
-        # 2-4. 逐篇处理
+        # 2-4. 逐篇处理（串行，避免资源爆炸）
         fetched = []
         already_exists = []
         failed = []
         no_pdf = []
 
-        for paper_meta in papers:
+        for i, paper_meta in enumerate(papers):
             arxiv_id = paper_meta["arxiv_id"]
 
             # 跳过已入库的（任何状态）
@@ -70,8 +70,22 @@ class FetcherAgent:
                 continue
 
             try:
+                logger.info(f"[Fetcher] 处理论文 {i+1}/{len(papers)}: {paper_meta.get('title', '')[:40]}...")
                 self._process_paper(paper_meta)
                 fetched.append(paper_meta)
+
+                # 处理完一篇后释放资源，等待一下再处理下一篇
+                import gc, time
+                gc.collect()
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except ImportError:
+                    pass
+                if i < len(papers) - 1:
+                    time.sleep(2)  # 给系统喘息时间
+
             except Exception as e:
                 logger.error(f"[Fetcher] 处理失败 {arxiv_id}: {e}")
                 failed.append({"title": paper_meta.get("title", ""), "error": str(e)})
@@ -187,14 +201,15 @@ class FetcherAgent:
 
         # 6. 存Milvus
         try:
-            import json
             milvus_records = [
                 {
                     "paper_arxiv_id": arxiv_id,
                     "chunk_index": c["chunk_index"],
                     "content": c["content"],
                     "embedding": vectors[i],
-                    "metadata_json": json.dumps(c["metadata"]),
+                    "section": c.get("metadata", {}).get("section", ""),
+                    "page": c.get("metadata", {}).get("page", 0),
+                    "heading": c.get("metadata", {}).get("heading", ""),
                 }
                 for i, c in enumerate(chunks)
             ]

@@ -22,29 +22,40 @@ class MilvusClient:
 
     def _ensure_collection(self):
         if self.client.has_collection(COLLECTION_NAME):
-            # 确保 collection 已加载到内存
-            self.client.load_collection(COLLECTION_NAME)
-            return
+            # 检查是否需要迁移旧 schema（metadata_json → 独立字段）
+            schema = self.client.describe_collection(COLLECTION_NAME)
+            fields = [f["name"] for f in schema["fields"]]
+            if "metadata_json" in fields and "section" not in fields:
+                logger.info("[Milvus] 检测到旧 schema，重建 collection...")
+                self.client.drop_collection(COLLECTION_NAME)
+            else:
+                self.client.load_collection(COLLECTION_NAME)
+                return
 
+        # 新 schema：metadata 拆分为独立字段
         schema = self.client.create_schema(auto_id=True, enable_dynamic_field=True)
         schema.add_field("id", DataType.INT64, is_primary=True)
         schema.add_field("paper_arxiv_id", DataType.VARCHAR, max_length=64)
         schema.add_field("chunk_index", DataType.INT64)
         schema.add_field("content", DataType.VARCHAR, max_length=8192)
         schema.add_field("embedding", DataType.FLOAT_VECTOR, dim=VECTOR_DIM)
-        schema.add_field("metadata_json", DataType.VARCHAR, max_length=4096)
+        # Metadata 拆分为独立字段，支持高效过滤
+        schema.add_field("section", DataType.VARCHAR, max_length=128)
+        schema.add_field("page", DataType.INT64)
+        schema.add_field("heading", DataType.VARCHAR, max_length=256)
 
         self.client.create_collection(
             collection_name=COLLECTION_NAME,
             schema=schema,
         )
 
+        # HNSW 索引：检索效果更好，适合本地 GPU
         index_params = self.client.prepare_index_params()
         index_params.add_index(
             field_name="embedding",
-            index_type="IVF_FLAT",
+            index_type="HNSW",
             metric_type="COSINE",
-            params={"nlist": 128},
+            params={"M": 16, "efConstruction": 256},
         )
         self.client.create_index(
             collection_name=COLLECTION_NAME,
@@ -71,9 +82,10 @@ class MilvusClient:
     ) -> list[dict]:
         """语义检索"""
         if output_fields is None:
-            output_fields = ["paper_arxiv_id", "chunk_index", "content", "metadata_json"]
+            output_fields = ["paper_arxiv_id", "chunk_index", "content", "section", "page", "heading"]
 
-        search_params = {"metric_type": "COSINE", "params": {"nprobe": 16}}
+        # HNSW 搜索参数
+        search_params = {"metric_type": "COSINE", "params": {"ef": 64}}
 
         kwargs = {
             "collection_name": COLLECTION_NAME,
@@ -83,20 +95,15 @@ class MilvusClient:
             "output_fields": output_fields,
         }
 
-        # 构建过滤表达式
+        # 构建过滤表达式（使用独立字段，不再解析 JSON）
         filters = []
         if paper_ids:
             id_list = ", ".join(f'"{pid}"' for pid in paper_ids)
             filters.append(f"paper_arxiv_id in [{id_list}]")
 
         if sections:
-            # metadata_json 是 JSON 字符串，需要提取 section 字段
-            # 使用 LIKE 匹配 section 关键词
-            section_filters = []
-            for sec in sections:
-                section_filters.append(f'metadata_json like \'%"section":"{sec}"%\'')
-            if section_filters:
-                filters.append(f"({' or '.join(section_filters)})")
+            section_list = ", ".join(f'"{sec}"' for sec in sections)
+            filters.append(f"section in [{section_list}]")
 
         if filters:
             kwargs["filter"] = " and ".join(filters)
