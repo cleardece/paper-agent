@@ -25,13 +25,15 @@ SECTION_INTENT_MAP = {
 
 
 class RetrieverAgent:
-    """语义检索 Agent - Section-aware + MultiQuery + 两层检索"""
+    """语义检索 Agent - Section-aware + MultiQuery + 两层检索 + 混合搜索 + 重排序"""
 
-    def __init__(self, embedding_service, milvus_client, mongodb_client, llm=None):
+    def __init__(self, embedding_service, milvus_client, mongodb_client, llm=None,
+                 hybrid_search=None):
         self.embedder = embedding_service
         self.milvus = milvus_client
         self.mongo = mongodb_client
         self.llm = llm  # 用于 MultiQuery 生成
+        self.hybrid_search = hybrid_search
 
     def _detect_section_intent(self, query: str) -> Optional[list[str]]:
         """根据查询内容推断应该检索哪些 section"""
@@ -147,7 +149,7 @@ class RetrieverAgent:
                         query_embedding=query_vector,
                         top_k=15,
                         paper_ids=[paper["arxiv_id"]],
-                        output_fields=["paper_arxiv_id", "chunk_index", "content", "metadata_json"],
+                        output_fields=["paper_arxiv_id", "chunk_index", "content", "section", "page", "heading"],
                     )
                     return hits
 
@@ -185,14 +187,62 @@ class RetrieverAgent:
         logger.info("[Retriever] Stage 2: Chunk级检索（限定 top-5 论文）...")
         top_paper_ids = [p["arxiv_id"] for p in top_papers]
 
-        hits = self.milvus.search(
+        vector_hits = self.milvus.search(
             query_embedding=query_vector,
             top_k=10,
             paper_ids=top_paper_ids,
             output_fields=["paper_arxiv_id", "chunk_index", "content", "metadata_json"],
         )
 
-        return hits
+        # ===== Stage 3: 混合搜索（BM25 + Vector RRF 融合）=====
+        if self.hybrid_search and vector_hits:
+            logger.info("[Retriever] Stage 3: BM25 + Vector 混合搜索...")
+            # 获取这些论文的所有 chunks 用于 BM25
+            all_chunks = []
+            for pid in top_paper_ids:
+                chunks = list(self.mongo.get_chunks_by_paper(pid))
+                all_chunks.extend(chunks)
+
+            if all_chunks:
+                # 构建 BM25 索引
+                self.hybrid_search.build_bm25_index(all_chunks)
+
+                # BM25 搜索
+                bm25_results = self.hybrid_search.bm25_search(query, top_k=10)
+
+                # 向量结果转为 (doc_idx, score) 格式
+                vector_results = []
+                for h in vector_hits:
+                    # 找到这个 chunk 在 all_chunks 中的索引
+                    for idx, c in enumerate(all_chunks):
+                        if (c.get("paper_arxiv_id") == h["paper_arxiv_id"] and
+                            c.get("chunk_index") == h.get("chunk_index")):
+                            vector_results.append((idx, h.get("score", 0)))
+                            break
+
+                # RRF 融合
+                fused = self.hybrid_search.rrf_fusion(bm25_results, vector_results)
+
+                # 转换回 hit 格式
+                fused_hits = []
+                for doc_idx, score in fused[:10]:
+                    if doc_idx < len(all_chunks):
+                        c = all_chunks[doc_idx]
+                        meta = c.get("metadata", {})
+                        fused_hits.append({
+                            "paper_arxiv_id": c.get("paper_arxiv_id"),
+                            "chunk_index": c.get("chunk_index", 0),
+                            "content": c.get("content", ""),
+                            "section": meta.get("section", ""),
+                            "page": meta.get("page", 0),
+                            "heading": meta.get("heading", ""),
+                            "score": score,
+                        })
+
+                logger.info(f"[Retriever] 混合搜索完成: BM25 {len(bm25_results)} + Vector {len(vector_hits)} → 融合 {len(fused_hits)}")
+                return fused_hits
+
+        return vector_hits
 
     def _extract_target_paper(self, query: str, context: str = "") -> str:
         """从查询和对话上下文中提取用户指代的论文标题"""
@@ -286,14 +336,7 @@ class RetrieverAgent:
         if target_sections and hits and len(hits) > 3:
             filtered = []
             for h in hits:
-                metadata = {}
-                if h.get("metadata_json"):
-                    try:
-                        metadata = json.loads(h["metadata_json"])
-                    except (json.JSONDecodeError, TypeError):
-                        pass
-
-                chunk_section = metadata.get("section", "").lower()
+                chunk_section = h.get("section", "").lower()
                 # 如果 chunk 有 section 信息且匹配目标，优先保留
                 if chunk_section and any(s in chunk_section for s in target_sections):
                     h["_section_match"] = True
@@ -323,13 +366,12 @@ class RetrieverAgent:
             else:
                 paper = None
 
-            # 解析 metadata_json
-            metadata = {}
-            if hit.get("metadata_json"):
-                try:
-                    metadata = json.loads(hit["metadata_json"])
-                except (json.JSONDecodeError, TypeError):
-                    pass
+            # 构造 metadata（从独立字段）
+            metadata = {
+                "section": hit.get("section", ""),
+                "page": hit.get("page", 0),
+                "heading": hit.get("heading", ""),
+            }
 
             retrieved.append(RetrievedChunk(
                 paper_arxiv_id=arxiv_id,
