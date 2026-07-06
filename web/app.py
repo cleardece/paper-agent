@@ -33,9 +33,9 @@ from config import get_llm
 from state.graph_state import AgentState
 
 
-AGENTS = ("supervisor", "translator", "fetcher", "retriever", "direct_analyzer", "analyzer", "critic", "presenter")
+AGENTS = ("supervisor", "fetcher", "retriever", "direct_analyzer", "analyzer", "critic", "presenter")
 QUESTION_FLOW = ("supervisor", "retriever", "analyzer", "critic", "presenter")
-FETCH_FLOW = ("supervisor", "translator", "fetcher")
+FETCH_FLOW = ("supervisor", "fetcher")
 DIRECT_FLOW = ("supervisor", "direct_analyzer")
 
 
@@ -254,7 +254,6 @@ def wrap_agent(name: str, invoke: Callable[[AgentState], Any], session: Session)
 def agent_running_detail(name: str, retry_count: int = 0) -> str:
     details = {
         "supervisor": "正在分析用户意图...",
-        "translator": "正在翻译查询关键词...",
         "fetcher": "正在检索并入库论文...",
         "retriever": "正在检索相关论文片段...",
         "direct_analyzer": "正在下载并分析论文...",
@@ -278,10 +277,11 @@ def agent_done_detail(name: str, result: dict[str, Any]) -> str:
 
 def create_web_initial_state(query: str, session: Session = None) -> AgentState:
     # 构建对话上下文摘要，帮助 Supervisor 理解跟随意图
+    # 注意：排除当前消息（最后一条 user 消息），只传历史对话
     context_summary = ""
-    if session and len(session.messages) > 0:
-        # 取最近 10 轮对话作为上下文
-        recent = session.messages[-20:]  # 最近 10 轮（user+assistant 各一条）
+    if session and len(session.messages) > 1:
+        # 取最近 10 轮对话，排除最后一条（当前消息）
+        recent = session.messages[-21:-1]  # 倒数第21到倒数第2条
         context_lines = []
         for msg in recent:
             role_label = "用户" if msg.role == "user" else "助手"
@@ -315,8 +315,8 @@ def supervisor_route(state: AgentState) -> str:
     if next_agent == "direct":
         return "direct_analyzer"
     if next_agent == "fetcher":
-        # fetcher 需要先经过 translator 翻译查询
-        return "translator"
+        # 直接路由到 fetcher（Supervisor 已生成英文搜索词）
+        return "fetcher"
     if next_agent not in ("retriever", "END"):
         logger.warning(f"[SupervisorRoute] 非法路由 '{next_agent}'，使用 END")
         return "END"
@@ -363,14 +363,13 @@ def build_traced_workflow(session: Session):
     graph.add_edge(START, "supervisor")
     graph.add_conditional_edges("supervisor", supervisor_route, {
         "direct_analyzer": "direct_analyzer",
-        "translator": "translator",
+        "fetcher": "fetcher",
         "retriever": "retriever",
         "END": "presenter",
     })
     # 快速通道：单篇论文直接分析 → presenter
     graph.add_edge("direct_analyzer", "presenter")
-    # 完整通道
-    graph.add_edge("translator", "fetcher")
+    # fetcher → retriever 或 presenter
     graph.add_conditional_edges("fetcher", fetcher_route, {"presenter": "presenter", "retriever": "retriever", END: END})
     graph.add_edge("retriever", "analyzer")
     graph.add_edge("analyzer", "critic")
@@ -620,13 +619,26 @@ async def _process_upload(container, pdf_path, filename, arxiv_id, session_id=No
         vectors = await asyncio.get_event_loop().run_in_executor(
             None, container.embedder.embed_texts, texts
         )
+
+        # 释放 GPU 显存
+        import gc
+        gc.collect()
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except ImportError:
+            pass
+
         milvus_records = [
             {
                 "paper_arxiv_id": arxiv_id,
                 "chunk_index": c["chunk_index"],
                 "content": c["content"],
                 "embedding": vectors[i],
-                "metadata_json": json.dumps(c.get("metadata", {})),
+                "section": c.get("metadata", {}).get("section", ""),
+                "page": c.get("metadata", {}).get("page", 0),
+                "heading": c.get("metadata", {}).get("heading", ""),
             }
             for i, c in enumerate(chunks)
         ]

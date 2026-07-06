@@ -67,20 +67,16 @@ class ServiceContainer:
         # 论文搜索（MCP 优先）
         self.paper_search = _create_paper_search()
 
-        # PDF 解析：优先 MinerU，fallback 到 pdfplumber
+        # PDF 解析：优先 MinerU（CPU 模式），fallback 到 pdfplumber
         self.pdf_parser = PDFParser(mineru_url=MINERU_URL)
         if MINERU_URL:
-            logger.info(f"[Container] 使用 MinerU: {MINERU_URL}")
+            logger.info(f"[Container] 使用 MinerU: {MINERU_URL}（CPU 模式，GPU 留给 Embedding）")
         else:
             logger.info("[Container] 使用 pdfplumber（未配置 MinerU）")
 
         # Hybrid Search
         from tools.hybrid_search import HybridSearch
         self.hybrid_search = HybridSearch()
-
-        # Reranker
-        from tools.reranker import Reranker
-        self.reranker = Reranker()
 
         # Knowledge Graph
         from storage.knowledge_graph import KnowledgeGraph
@@ -102,7 +98,6 @@ class ServiceContainer:
     def create_agents(self):
         """创建所有 Agent 实例"""
         from agents.supervisor import SupervisorAgent
-        from agents.translator import TranslatorAgent
         from agents.fetcher import FetcherAgent
         from agents.retriever import RetrieverAgent
         from agents.direct_analyzer import DirectAnalyzerAgent
@@ -113,13 +108,13 @@ class ServiceContainer:
 
         return {
             "supervisor": SupervisorAgent(self.llm, self.mongodb),
-            "translator": TranslatorAgent(self.llm),
             "fetcher": FetcherAgent(
                 self.paper_search, self.pdf_parser, self.mongodb,
                 self.embedder, self.milvus
             ),
             "retriever": RetrieverAgent(
-                self.embedder, self.milvus, self.mongodb, self.llm
+                self.embedder, self.milvus, self.mongodb, self.llm,
+                self.hybrid_search
             ),
             "direct_analyzer": DirectAnalyzerAgent(
                 self.llm, self.mongodb, self.embedder, self.milvus,

@@ -10,7 +10,7 @@ from state.graph_state import AgentState
 logger = logging.getLogger("paper-agent")
 
 
-SUPERVISOR_PROMPT = SUPERVISOR_PROMPT = """你是论文助手的路由调度器。根据用户输入判断意图，选择执行Agent。
+SUPERVISOR_PROMPT = """你是论文助手的路由调度器。根据用户输入判断意图，选择执行Agent，并生成英文搜索关键词。
 
 ## 判断规则
 
@@ -32,20 +32,21 @@ SUPERVISOR_PROMPT = SUPERVISOR_PROMPT = """你是论文助手的路由调度器�
 - 无法判断意图
 
 ## 输出格式（严格JSON）
-{"next_agent": "direct" | "fetcher" | "retriever" | "END", "search_query": "提取的搜索关键词（仅fetcher需要）", "reason": "判断依据"}
+{"next_agent": "direct" | "fetcher" | "retriever" | "END", "search_query": "英文搜索关键词（fetcher和retriever需要）", "reason": "判断依据"}
 
 ## 重要规则
 - **单篇分析 → direct**，不要走 fetcher 或 retriever
 - **多篇搜索 → fetcher**
 - **多篇对比/知识库问答 → retriever**
-- 如果判断为fetcher，必须从用户输入中提取核心搜索关键词（英文最佳）
+- 如果判断为fetcher或retriever，**必须生成英文搜索关键词**（直接翻译，不要解释）
+- 英文关键词：3-8个词，空格分隔，学术术语准确
 
 ## 示例
-用户："帮我分析这篇论文" → direct
-用户："它的实验怎么设计的" → direct（跟随意图，单篇）
-用户："搜索流体力学PINN求解的论文" → fetcher
-用户："对比RAG和GraphRAG" → retriever（多篇对比）
-用户："你好" → END
+用户："帮我分析这篇论文" → {"next_agent": "direct", "search_query": "", "reason": "单篇分析"}
+用户："它的实验怎么设计的" → {"next_agent": "direct", "search_query": "", "reason": "跟随意图，单篇"}
+用户："搜索流体力学PINN求解的论文" → {"next_agent": "fetcher", "search_query": "fluid dynamics PINN solving", "reason": "多篇搜索"}
+用户："对比RAG和GraphRAG" → {"next_agent": "retriever", "search_query": "RAG GraphRAG comparison", "reason": "多篇对比"}
+用户："你好" → {"next_agent": "END", "search_query": "", "reason": "闲聊"}
 """
 
 
@@ -161,10 +162,29 @@ class SupervisorAgent:
 
         # 提取目标论文（跟随意图时）
         target_paper = None
-        if self._is_followup_query(query):
-            target_paper = self._extract_paper_from_context(query, state.get("conversation_context", ""))
+        is_followup = self._is_followup_query(query)
+        logger.info(f"[Supervisor] is_followup={is_followup}, query={query[:30]}")
+
+        # 检查查询中是否包含具体论文标题（英文关键词 >= 5 个）
+        import re
+        english_keywords = [kw for kw in re.findall(r'[a-zA-Z]{3,}', query) if len(kw) > 3]
+        has_explicit_title = len(english_keywords) >= 5
+
+        if is_followup:
+            context = state.get("conversation_context", "")
+            logger.info(f"[Supervisor] context={repr(context[:50] if context else '')}, next_agent={next_agent}")
+            target_paper = self._extract_paper_from_context(query, context)
             if target_paper:
                 logger.info(f"[Supervisor] 识别到目标论文: {target_paper[:50]}")
+            elif not context and not has_explicit_title:
+                # 新对话 + 跟随意图 + 没有具体标题 → 走 retriever
+                if next_agent == "direct":
+                    logger.info("[Supervisor] 新对话无上下文且无具体标题，跟随意图改走 retriever")
+                    next_agent = "retriever"
+            elif not context and has_explicit_title:
+                # 新对话 + 有具体标题 → 走 direct，用标题作为 target_paper
+                target_paper = " ".join(english_keywords[:8])
+                logger.info(f"[Supervisor] 有具体标题，提取为: {target_paper[:50]}")
 
         logger.info(f"[Supervisor] 路由: {next_agent}, 搜索词: {search_query}")
 
