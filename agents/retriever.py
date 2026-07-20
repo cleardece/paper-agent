@@ -153,22 +153,38 @@ class RetrieverAgent:
                     )
                     return hits
 
-        # 对每篇论文计算与查询的相似度
+        # 对每篇论文计算与查询的相似度（优先用持久化向量）
         paper_scores = []
+        papers_to_embed = []  # 需要 embedding 的论文
+        paper_texts = []      # 对应的文本
+
         for paper in all_papers:
-            # 用论文标题 + 摘要生成向量
             paper_text = f"{paper.get('title', '')} {paper.get('abstract', '')}"
             if not paper_text.strip():
                 continue
 
-            cache_key = f"paper_emb:{paper.get('arxiv_id', '')}"
-            paper_vector = cache.get(session_id, cache_key) if session_id else None
-            if not paper_vector:
-                paper_vector = self.embedder.embed_query(paper_text)
-                if session_id:
-                    cache.set(session_id, cache_key, paper_vector)
+            # 优先级：session 缓存 > MongoDB 持久化 > 实时计算
+            paper_vector = None
 
-            # 计算余弦相似度
+            # 1. 查 session 缓存
+            cache_key = f"paper_emb:{paper.get('arxiv_id', '')}"
+            if session_id:
+                paper_vector = cache.get(session_id, cache_key)
+
+            # 2. 查 MongoDB 持久化
+            if paper_vector is None:
+                persisted = paper.get("title_embedding")
+                if persisted:
+                    paper_vector = persisted
+                    if session_id:
+                        cache.set(session_id, cache_key, paper_vector)
+
+            # 3. 需要实时计算
+            if paper_vector is None:
+                papers_to_embed.append(paper)
+                paper_texts.append(paper_text)
+                continue
+
             score = float(np.dot(query_vector, paper_vector) /
                          (np.linalg.norm(query_vector) * np.linalg.norm(paper_vector)))
             paper_scores.append({
@@ -176,6 +192,26 @@ class RetrieverAgent:
                 "title": paper.get("title", ""),
                 "score": score,
             })
+
+        # 批量 embedding 未有持久化向量的论文（一次 GPU 调用）
+        if paper_texts:
+            paper_vectors = self.embedder.embed_texts(paper_texts)
+            for paper, vec in zip(papers_to_embed, paper_vectors):
+                # 持久化到 MongoDB
+                self.mongo.update_paper_status(
+                    paper["arxiv_id"], paper.get("status", "indexed"),
+                    title_embedding=vec
+                )
+                cache_key = f"paper_emb:{paper.get('arxiv_id', '')}"
+                if session_id:
+                    cache.set(session_id, cache_key, vec)
+                score = float(np.dot(query_vector, vec) /
+                             (np.linalg.norm(query_vector) * np.linalg.norm(vec)))
+                paper_scores.append({
+                    "arxiv_id": paper.get("arxiv_id"),
+                    "title": paper.get("title", ""),
+                    "score": score,
+                })
 
         # 按分数排序，取 top-5 论文
         paper_scores.sort(key=lambda x: x["score"], reverse=True)
@@ -204,21 +240,31 @@ class RetrieverAgent:
                 all_chunks.extend(chunks)
 
             if all_chunks:
-                # 构建 BM25 索引
-                self.hybrid_search.build_bm25_index(all_chunks)
+                # BM25 索引缓存：用论文 ID 列表的 hash 作为 key
+                import hashlib
+                bm25_cache_key = hashlib.md5(str(sorted(top_paper_ids)).encode()).hexdigest()
+                if getattr(self.hybrid_search, '_cache_key', None) != bm25_cache_key:
+                    self.hybrid_search.build_bm25_index(all_chunks)
+                    self.hybrid_search._cache_key = bm25_cache_key
+                    logger.info(f"[BM25] 索引重建: {len(all_chunks)} chunks")
+                else:
+                    logger.info(f"[BM25] 使用缓存索引")
 
                 # BM25 搜索
                 bm25_results = self.hybrid_search.bm25_search(query, top_k=10)
 
-                # 向量结果转为 (doc_idx, score) 格式
+                # 向量结果转为 (doc_idx, score) 格式（用字典 O(1) 查找）
+                chunk_index_map = {}
+                for idx, c in enumerate(all_chunks):
+                    key = (c.get("paper_arxiv_id"), c.get("chunk_index"))
+                    chunk_index_map[key] = idx
+
                 vector_results = []
                 for h in vector_hits:
-                    # 找到这个 chunk 在 all_chunks 中的索引
-                    for idx, c in enumerate(all_chunks):
-                        if (c.get("paper_arxiv_id") == h["paper_arxiv_id"] and
-                            c.get("chunk_index") == h.get("chunk_index")):
-                            vector_results.append((idx, h.get("score", 0)))
-                            break
+                    key = (h["paper_arxiv_id"], h.get("chunk_index"))
+                    idx = chunk_index_map.get(key)
+                    if idx is not None:
+                        vector_results.append((idx, h.get("score", 0)))
 
                 # RRF 融合
                 fused = self.hybrid_search.rrf_fusion(bm25_results, vector_results)
@@ -305,20 +351,33 @@ class RetrieverAgent:
         # 2. Section 意图检测
         target_sections = self._detect_section_intent(query)
 
-        # 3. 对每个变体做 embedding + 检索，合并去重
+        # 3. 批量 embedding 所有变体，再逐个检索
         all_hits = {}  # key: (arxiv_id, chunk_index) -> hit
 
-        for eq in expanded_queries:
-            # Embedding
+        # 先批量编码所有变体（一次 GPU 调用）
+        uncached_queries = []
+        uncached_indices = []
+        query_vectors = [None] * len(expanded_queries)
+
+        for i, eq in enumerate(expanded_queries):
             cache_key = f"embedding:{eq}"
             cached_vector = cache.get(session_id, cache_key) if session_id else None
             if cached_vector:
-                query_vector = cached_vector
+                query_vectors[i] = cached_vector
             else:
-                query_vector = self.embedder.embed_query(eq)
-                if session_id:
-                    cache.set(session_id, cache_key, query_vector)
+                uncached_queries.append(eq)
+                uncached_indices.append(i)
 
+        if uncached_queries:
+            new_vectors = self.embedder.embed_texts(uncached_queries)
+            for idx, vec in zip(uncached_indices, new_vectors):
+                query_vectors[idx] = vec
+                if session_id:
+                    cache_key = f"embedding:{expanded_queries[idx]}"
+                    cache.set(session_id, cache_key, vec)
+
+        # 逐个检索（embedding 已经批量完成）
+        for eq, query_vector in zip(expanded_queries, query_vectors):
             # 两层检索
             hits = self._two_level_retrieval(eq, query_vector, session_id, target_paper)
 

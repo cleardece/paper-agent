@@ -58,7 +58,8 @@ class DirectAnalyzerAgent:
             logger.info(f"[DirectAnalyzer] 知识库中找到论文: {paper_info['title'][:50]}")
             full_text = paper_info.get("full_text", "")
             if not full_text:
-                return {"answer": "论文全文未存储，请重新入库。", "error": None}
+                logger.info("[DirectAnalyzer] 论文全文缺失，尝试下载补全...")
+                return self._fetch_and_analyze(query)
 
             # 补上 Milvus 入库
             if paper_info.get("status") != "indexed":
@@ -301,8 +302,6 @@ class DirectAnalyzerAgent:
             vectors = self.embedder.embed_texts(texts)
 
             # 释放 GPU 显存
-            import gc
-            gc.collect()
             try:
                 import torch
                 if torch.cuda.is_available():

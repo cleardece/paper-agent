@@ -49,13 +49,14 @@ class MilvusClient:
             schema=schema,
         )
 
-        # HNSW 索引：检索效果更好，适合本地 GPU
+        # HNSW 索引：参数根据硬件自动调整
+        from config import MILVUS_HNSW_M, MILVUS_HNSW_EF_CONSTRUCTION
         index_params = self.client.prepare_index_params()
         index_params.add_index(
             field_name="embedding",
             index_type="HNSW",
             metric_type="COSINE",
-            params={"M": 16, "efConstruction": 256},
+            params={"M": MILVUS_HNSW_M, "efConstruction": MILVUS_HNSW_EF_CONSTRUCTION},
         )
         self.client.create_index(
             collection_name=COLLECTION_NAME,
@@ -85,7 +86,8 @@ class MilvusClient:
             output_fields = ["paper_arxiv_id", "chunk_index", "content", "section", "page", "heading"]
 
         # HNSW 搜索参数
-        search_params = {"metric_type": "COSINE", "params": {"ef": 64}}
+        from config import MILVUS_SEARCH_EF
+        search_params = {"metric_type": "COSINE", "params": {"ef": MILVUS_SEARCH_EF}}
 
         kwargs = {
             "collection_name": COLLECTION_NAME,

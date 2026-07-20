@@ -7,16 +7,20 @@ from sentence_transformers import SentenceTransformer
 logger = logging.getLogger("paper-agent")
 
 
-def wait_for_gpu_release(timeout: int = 30, min_free_gb: float = 4.0) -> bool:
+def wait_for_gpu_release(timeout: int = 30, min_free_gb: float = None) -> bool:
     """等待 GPU 显存释放（MinerU 等外部进程释放后）再加载 embedding
 
     Args:
         timeout: 最长等待秒数
-        min_free_gb: 需要的最小空闲显存（GB），BGE-m3 约需 3-4GB
+        min_free_gb: 需要的最小空闲显存（GB），None=自动根据硬件决定
 
     Returns:
         True=GPU 有足够空间，False=超时或不可用
     """
+    if min_free_gb is None:
+        from config import HW_TIER
+        # BGE-M3 模型 ~2.3GB，加推理缓冲
+        min_free_gb = {"high": 3.0, "medium": 3.5, "low": 4.0}[HW_TIER]
     try:
         import torch
         if not torch.cuda.is_available():
@@ -75,7 +79,7 @@ class EmbeddingService:
 
             # GPU 模式：等待显存释放（MinerU 等外部进程释放）
             if target == "cuda":
-                if not wait_for_gpu_release(timeout=30, min_free_gb=4.0):
+                if not wait_for_gpu_release(timeout=30):
                     logger.warning("[Embedding] GPU 显存不足，降级到 CPU...")
                     target = "cpu"
 
@@ -109,9 +113,10 @@ class EmbeddingService:
             return []
         self._load_model()
 
-        # GPU 用小 batch 省显存，CPU 可以大一点
+        # 使用 config 中的硬件自适应 batch_size
         if batch_size is None:
-            batch_size = 1 if self._device == "cuda" else 4
+            from config import EMBEDDING_BATCH_SIZE
+            batch_size = EMBEDDING_BATCH_SIZE
 
         try:
             import torch

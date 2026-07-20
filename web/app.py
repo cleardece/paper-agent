@@ -209,9 +209,12 @@ def run_sync_or_async(fn: Callable[[AgentState], Any], state: AgentState) -> Awa
 
 def wrap_agent(name: str, invoke: Callable[[AgentState], Any], session: Session) -> Callable[[AgentState], Awaitable[dict[str, Any]]]:
     async def wrapped(state: AgentState) -> dict[str, Any]:
+        # 从 state 获取 session（支持缓存的 workflow 复用）
+        sid = state.get("session_id")
+        sess = sessions.get(sid) if sid else session
         retry_count = int(state.get("iteration", 0)) if name == "critic" else 0
         await push_status(
-            session,
+            sess,
             {
                 "agent": name,
                 "status": "running",
@@ -223,7 +226,7 @@ def wrap_agent(name: str, invoke: Callable[[AgentState], Any], session: Session)
         try:
             result = await run_sync_or_async(invoke, state)
             await push_status(
-                session,
+                sess,
                 {
                     "agent": name,
                     "status": "completed",
@@ -236,7 +239,7 @@ def wrap_agent(name: str, invoke: Callable[[AgentState], Any], session: Session)
         except Exception as exc:
             logger.error(f"[{name}] 执行失败: {exc}", exc_info=True)
             await push_status(
-                session,
+                sess,
                 {
                     "agent": name,
                     "status": "error",
@@ -304,6 +307,7 @@ def create_web_initial_state(query: str, session: Session = None) -> AgentState:
         "error": None,
         "conversation_context": context_summary,
         "target_paper": None,
+        "session_id": session.id if session else None,
     }
 
 
@@ -348,8 +352,16 @@ def critic_route(state: AgentState) -> str:
     return next_agent
 
 
+_compiled_workflow = None  # 缓存编译后的 workflow
+
+
 def build_traced_workflow(session: Session):
+    global _compiled_workflow
     from core.deps import get_container
+
+    # 如果已有缓存的 workflow，直接复用（Agent 是无状态单例，session 通过 state 传递）
+    if _compiled_workflow is not None:
+        return _compiled_workflow
 
     # 获取单例服务容器
     container = get_container()
@@ -386,7 +398,9 @@ def build_traced_workflow(session: Session):
     else:
         graph.add_edge("presenter", END)
 
-    return graph.compile()
+    _compiled_workflow = graph.compile()
+    logger.info("[Workflow] 首次编译完成，已缓存")
+    return _compiled_workflow
 
 
 def get_or_create_session(session_id: str | None, message: str = "") -> Session:
@@ -484,9 +498,6 @@ async def test_connection():
     return results
 
 
-import asyncio
-
-
 def _extract_arxiv_id_from_pdf(pdf_content: bytes) -> Optional[str]:
     """从 PDF 内容提取 arxiv_id"""
     import re
@@ -517,6 +528,9 @@ async def upload_paper(file: UploadFile):
         raise HTTPException(status_code=400, detail="只支持 PDF 文件")
 
     container = get_container()
+
+    # 先读取文件内容（后续提取 arxiv_id 和保存都需要）
+    content = await file.read()
 
     # 生成 arxiv_id
     # 1. 先尝试从文件名提取（如果是数字格式如 2304.08485.pdf）
@@ -549,8 +563,6 @@ async def upload_paper(file: UploadFile):
     tmp_dir = "tmp_pdfs"
     os.makedirs(tmp_dir, exist_ok=True)
     pdf_path = os.path.join(tmp_dir, file.filename)
-
-    content = await file.read()
     with open(pdf_path, "wb") as f:
         f.write(content)
 
@@ -855,8 +867,37 @@ async def chat(request: ChatRequest) -> StreamingResponse:
             workflow = build_traced_workflow(session)
             state = create_web_initial_state(request.message, session)
             logger.info(f"[Chat] 开始执行 workflow，查询: {request.message[:50]}...")
-            result = await asyncio.wait_for(workflow.ainvoke(state), timeout=600)
-            answer = result.get("answer") or result.get("error") or "未生成回复。"
+
+            # 同时获取 LLM token（messages）和节点输出（updates）
+            # Agent 状态更新通过 wrap_agent → push_status → WebSocket 推送
+            final_result = None
+            streamed_tokens = False
+            async for mode, event in workflow.astream(state, stream_mode=["messages", "updates"]):
+                if mode == "messages":
+                    # event: (AIMessageChunk, metadata) — LLM 逐 token 输出
+                    if isinstance(event, tuple) and len(event) == 2:
+                        msg, metadata = event
+                        if hasattr(msg, "content") and msg.content:
+                            node = metadata.get("langgraph_node", "") if isinstance(metadata, dict) else ""
+                            # 只流式输出 presenter 节点的 token（最终回答）
+                            if node == "presenter":
+                                streamed_tokens = True
+                                yield f"event: token\ndata: {json.dumps({'content': msg.content}, ensure_ascii=False)}\n\n"
+                elif mode == "updates":
+                    # event: {node_name: output} — 节点完成事件
+                    if isinstance(event, dict):
+                        for node_name, node_output in event.items():
+                            if node_name == "__end__":
+                                final_result = node_output
+                            # 每个节点完成时，尝试提取 answer（兜底）
+                            if isinstance(node_output, dict) and node_output.get("answer"):
+                                final_result = node_output
+                            # Agent 状态已通过 wrap_agent → WebSocket 推送，无需重复
+
+            if final_result:
+                answer = final_result.get("answer") or final_result.get("error") or "未生成回复。"
+            else:
+                answer = "抱歉，未能生成回复，请稍后重试。"
             logger.info(f"[Chat] Workflow 执行完成")
         except asyncio.TimeoutError:
             answer = "抱歉，处理时间较长，请稍后重试。"
@@ -868,18 +909,14 @@ async def chat(request: ChatRequest) -> StreamingResponse:
         if answer is None:
             answer = "抱歉，未能生成回复，请稍后重试。"
 
+        # 兜底：如果 presenter 直接返回上游 answer（没走 LLM stream），补发完整回答
+        if not streamed_tokens and answer:
+            yield f"event: token\ndata: {json.dumps({'content': answer}, ensure_ascii=False)}\n\n"
+
         timeline = timeline_snapshot(session.events)
         session.messages.append(ChatMessage(role="assistant", content=answer, timeline=timeline))
         session.updated_at = time.time()
         save_session_to_db(session)
-
-        # 流式输出最终回答：逐句发送，模拟打字效果
-        sentences = re.split(r'(?<=[。！？.!?\n])\s*', answer)
-        for sentence in sentences:
-            if not sentence.strip():
-                continue
-            yield f"event: token\ndata: {json.dumps({'content': sentence}, ensure_ascii=False)}\n\n"
-            await asyncio.sleep(0.05)
 
         yield f"event: done\ndata: {json.dumps({'timeline': timeline}, ensure_ascii=False)}\n\n"
 

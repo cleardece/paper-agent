@@ -74,17 +74,13 @@ class FetcherAgent:
                 self._process_paper(paper_meta)
                 fetched.append(paper_meta)
 
-                # 处理完一篇后释放资源，等待一下再处理下一篇
-                import gc, time
-                gc.collect()
+                # 仅在 GPU 模式下清理显存（CPU 模式无需）
                 try:
                     import torch
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
                 except ImportError:
                     pass
-                if i < len(papers) - 1:
-                    time.sleep(2)  # 给系统喘息时间
 
             except Exception as e:
                 logger.error(f"[Fetcher] 处理失败 {arxiv_id}: {e}")
@@ -194,6 +190,12 @@ class FetcherAgent:
             texts = [c["content"] for c in chunks]
             vectors = self.embedder.embed_texts(texts)
             logger.info(f"[Fetcher] Embedding 完成")
+
+            # 同时计算论文级 embedding（标题+摘要），持久化到 MongoDB
+            paper_text = f"{paper_meta.get('title', '')} {paper_meta.get('abstract', '')}"
+            if paper_text.strip():
+                paper_emb = self.embedder.embed_texts([paper_text])[0]
+                self.mongo.update_paper_status(arxiv_id, "indexed", title_embedding=paper_emb)
         except Exception as e:
             logger.error(f"[Fetcher] Embedding 生成失败: {e}")
             self.mongo.update_paper_status(arxiv_id, "embed_failed")

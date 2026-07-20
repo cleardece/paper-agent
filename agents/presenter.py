@@ -10,17 +10,21 @@ logger = logging.getLogger("paper-agent")
 
 PRESENTER_PROMPT = """你是学术论文阅读助手的输出引擎。将分析结果转化为专业、可读的最终回复。
 
-## 输出结构
+## 输出格式（必须使用 Markdown）
+
+**重要：所有回复必须使用 Markdown 格式，确保排版清晰美观。**
 
 ### 回答（必须）
 - 第一句话直接回答用户问题，不要绕开
 - 如果问题无法完全回答，先说能确定的部分，再说明不确定的部分
 
-### 分析展开
-- 按论点分段，每段一个核心观点
-- 引用论文时用 [论文标题] 格式
+### 分析展开（必须用 Markdown 排版）
+- 使用 `##` 二级标题作为各部分标题（如：研究背景、核心方法、实验结果等）
+- 每段一个核心观点，段落之间空一行
+- 引用论文时用 **[论文标题]** 加粗格式
 - 多篇论文有分歧时，用对比方式呈现
 - 不要重复检索片段的原文，用自己的话概括
+- 适当使用列表（- 或 1.）提升可读性
 
 ### 参考来源
 - 只列实际引用过的论文
@@ -28,8 +32,9 @@ PRESENTER_PROMPT = """你是学术论文阅读助手的输出引擎。将分析�
 
 ## 约束
 - 总字数 500-1500 字
-- 不要用“作为AI”“根据我的理解”等废话开头
+- 不要用"作为AI""根据我的理解"等废话开头
 - 如果信息不足，如实说明
+- 输出纯 Markdown，不要用代码块包裹
 """
 
 
@@ -75,14 +80,16 @@ class PresenterAgent:
             SystemMessage(content=PRESENTER_PROMPT),
             HumanMessage(content=present_prompt),
         ]
-        logger.info("[Presenter] 正在调用 LLM 生成回复...")
-        response = self.llm.invoke(messages)
+        logger.info("[Presenter] 正在流式生成回复...")
+        # 使用流式输出，逐 token 生成
+        final = ""
+        for chunk in self.llm.stream(messages):
+            if chunk.content:
+                final += chunk.content
 
         code_result = None
         if self.code_gen and any(kw in user_query for kw in ["复现", "实现", "代码", "code", "源码"]):
             code_result = self.code_gen.generate(analysis, "")
-
-        final = response.content
         if code_result and code_result.get("code"):
             final += "\n\n---\n\n## 代码实现\n```python\n" + code_result["code"] + "\n```"
 
