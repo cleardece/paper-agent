@@ -24,7 +24,7 @@ services:
       - ETCD_QUOTA_BACKEND_BYTES=4294967296
       - ETCD_SNAPSHOT_COUNT=50000
     volumes:
-      - E:\milvus\volumes\etcd:/etcd
+      - ${PA_DATA_ROOT:-./.local-data}/etcd:/etcd
     command: etcd -advertise-client-urls=http://127.0.0.1:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
     restart: "no"
     healthcheck:
@@ -43,7 +43,7 @@ services:
       MINIO_ACCESS_KEY: minioadmin
       MINIO_SECRET_KEY: minioadmin
     volumes:
-      - E:\milvus\volumes\minio:/minio_data
+      - ${PA_DATA_ROOT:-./.local-data}/minio:/minio_data
     command: minio server /minio_data --console-address ":9001"
     restart: "no"
     healthcheck:
@@ -59,7 +59,7 @@ services:
       - "19530:19530"
       - "9091:9091"
     volumes:
-      - E:\milvus\volumes\milvus:/var/lib/milvus
+      - ${PA_DATA_ROOT:-./.local-data}/milvus:/var/lib/milvus
     command: ["milvus", "run", "standalone"]
     environment:
       ETCD_ENDPOINTS: milvus-etcd:2379
