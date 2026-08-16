@@ -110,6 +110,21 @@ python -B -c "import main; from web.app import app; print(len(app.routes))"
 
 本地 PDF、向量库、Mongo 数据、缓存、上传文件和 API 密钥均不应提交。删除论文会影响本地 MongoDB/Milvus 数据，执行前请确认该论文不再需要。
 
+## MinerU 资源策略
+
+本项目默认只在需要解析 PDF 时启动本机 MinerU；单次解析结束后立即停止它，避免模型持续占用内存。下一次上传会自动重新启动 MinerU，因此会有一次模型加载等待，但不会改变解析质量。
+
+若连续批量上传论文，可在 `.env` 中设置 `MINERU_IDLE_SHUTDOWN_SECONDS=300`，让 MinerU 空闲 5 分钟后再释放。该值默认是 `0`，优先保证普通设备在空闲时不被长期占用。
+
+```dotenv
+MINERU_IDLE_SHUTDOWN_SECONDS=0
+MINERU_REQUIRE_ACCURATE_PARSE=true
+MINERU_MEMORY_LIMIT=
+MINERU_CPU_LIMIT=
+```
+
+`MINERU_MEMORY_LIMIT` 与 `MINERU_CPU_LIMIT` 都是可选的本机设置，例如 `MINERU_MEMORY_LIMIT=8g`、`MINERU_CPU_LIMIT=2.0`。留空表示不施加固定限制，避免开源项目假设所有用户有相同硬件。限制触发或 MinerU 出错时，默认严格模式会把论文标记为 `parse_failed`，不会静默用 pdfplumber 的普通解析结果入库；修复环境后可直接重新上传。
+
 ## Git 约定
 
 - 使用 Conventional Commit 前缀：`feat:`、`fix:`、`test:`、`docs:`、`chore:`；
