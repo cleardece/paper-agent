@@ -80,7 +80,10 @@ class DirectAnalyzerAgent:
     def _find_paper(self, query: str, target_paper: str = None):
         """从知识库中查找论文"""
         try:
-            papers = self.mongo.list_papers(limit=50)
+            papers = self.mongo.list_papers(
+                limit=50,
+                projection={"arxiv_id": 1, "title": 1, "abstract": 1, "authors": 1, "full_text": 1, "status": 1},
+            )
             if not papers:
                 return None
 

@@ -16,6 +16,7 @@ from agents.analyzer import AnalyzerAgent
 from agents.critic import CriticAgent
 from agents.presenter import PresenterAgent
 from agents.reflector import ReflectorAgent
+from agents.direct_analyzer import DirectAnalyzerAgent
 
 
 # 路由函数
@@ -46,6 +47,7 @@ def build_workflow(
     critic: CriticAgent,
     presenter: PresenterAgent,
     reflector: ReflectorAgent = None,
+    direct_analyzer: DirectAnalyzerAgent = None,
 ) -> StateGraph:
     graph = StateGraph(AgentState)
 
@@ -61,13 +63,22 @@ def build_workflow(
     if reflector:
         graph.add_node("reflector", reflector.invoke)
 
+    # 如果有 direct_analyzer，添加节点
+    if direct_analyzer:
+        graph.add_node("direct", direct_analyzer.invoke)
+
     # 边
     graph.add_edge(START, "supervisor")
+
+    # 构建 supervisor 路由映射
+    supervisor_targets = {"fetcher": "fetcher", "retriever": "retriever", "END": "presenter"}
+    if direct_analyzer:
+        supervisor_targets["direct"] = "direct"
 
     graph.add_conditional_edges(
         "supervisor",
         supervisor_route,
-        {"fetcher": "fetcher", "retriever": "retriever", "END": "presenter"},
+        supervisor_targets,
     )
 
     graph.add_conditional_edges("fetcher", fetcher_route, {"presenter": "presenter", END: END})
@@ -80,6 +91,10 @@ def build_workflow(
         critic_route,
         {"presenter": "presenter", "retriever": "retriever", "END": END},
     )
+
+    # Direct → Presenter（直接路由到格式化输出）
+    if direct_analyzer:
+        graph.add_edge("direct", "presenter")
 
     # Presenter → Reflector → END（如果有 reflector）
     if reflector:
