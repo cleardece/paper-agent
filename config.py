@@ -78,8 +78,8 @@ else:
 logger.info(f"[Hardware] 硬件等级: {HW_TIER}")
 
 # ==================== LLM ====================
-LLM_MODEL = os.getenv("LLM_MODEL", "deepseek-v4-flash")
-LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://api.deepseek.com")
+LLM_MODEL = os.getenv("LLM_MODEL", "")
+LLM_BASE_URL = os.getenv("LLM_BASE_URL", "")
 LLM_API_KEY = os.getenv("LLM_API_KEY")
 
 # ==================== Embedding ====================
@@ -159,6 +159,10 @@ if not MAX_CONCURRENT_PAPERS:
 
 def get_llm():
     """获取 LLM 实例"""
+    if not LLM_MODEL:
+        raise ValueError("LLM_MODEL 未配置，请在 .env 中设置 LLM_MODEL")
+    if not LLM_BASE_URL:
+        raise ValueError("LLM_BASE_URL 未配置，请在 .env 中设置 LLM_BASE_URL")
     logger.info(f"[LLM] 正在初始化 {LLM_MODEL} @ {LLM_BASE_URL}")
     llm = ChatOpenAI(
         model=LLM_MODEL,
