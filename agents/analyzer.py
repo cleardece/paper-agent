@@ -4,12 +4,41 @@ ReAct模式，综合多篇论文分析问题
 """
 
 import logging
+import re
 from langchain_core.messages import SystemMessage, HumanMessage
 from langgraph.prebuilt import create_react_agent
 
 from state.graph_state import AgentState
 
 logger = logging.getLogger("paper-agent")
+
+
+# 推理残留模式：Analyzer 输出中常见的推理提示词
+_REASONING_PATTERNS = [
+    # 开头推理
+    r'^(根据(以上|上述|检索(结果|内容)|分析|这些论文)|基于(以上|上述|检索)|通过(分析|对比|阅读)|经过(分析|对比))[，,。：:\s]*',
+    r'^(由此(可知|可见|得出)|综上(所述|所述)|总的(来说|来看)|综合(来看|分析|以上))[，,。：:\s]*',
+    r'^(我(认为|推断|觉得|发现)|从(中|内容)可以看出|可以看出|不难发现)[，,。：:\s]*',
+    # 中间过渡推理
+    r'\n(综上|因此|所以|由此可见|由此可知|综上所述)[，,。：:\s]*',
+    # 结尾推理
+    r'(以上(是|为|就是).*?(分析|总结|结论|回答)|如有(疑问|问题)请(提问|咨询|指出))[。.\s]*$',
+]
+
+
+def _strip_reasoning_traces(text: str) -> str:
+    """清洗 Analyzer 输出中的推理残留，只保留结论和证据
+
+    示例：
+        "根据以上分析，论文A提出了X方法..." → "论文A提出了X方法..."
+        "综上所述，Y指标提升了15%..." → "Y指标提升了15%..."
+    """
+    cleaned = text
+    for pattern in _REASONING_PATTERNS:
+        cleaned = re.sub(pattern, '', cleaned, flags=re.MULTILINE | re.IGNORECASE)
+    # 清理多余空行
+    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+    return cleaned.strip()
 
 
 ANALYZER_PROMPT = """你是一个学术论文分析专家。根据检索到的论文片段，综合分析用户的问题。
@@ -35,10 +64,19 @@ ANALYZER_PROMPT = """你是一个学术论文分析专家。根据检索到的�
 - 列出检索到的所有论文，让用户确认
 - 不要假设用户指的是哪篇
 
-## 输出格式
-- 先用一句话直接回答
-- 再展开分析
-- 最后列出参考来源"""
+## 输出格式（严格遵循）
+你的输出必须分为两个明确部分，用分隔符隔开：
+
+### 结论
+（用 1-3 句话直接回答用户问题，不要写推理过程，只写最终结论）
+
+### 分析
+（展开分析：每个论点必须引用 [论文标题] 作为来源。多篇论文有分歧时对比呈现。信息不足时明确说明。）
+
+## 重要
+- **结论部分不要包含推理过程**，只写最终判断/答案
+- **分析部分不要重复结论**，只写支撑证据和逻辑
+- 不要写"我认为""我推断""根据以上分析"等推理提示词"""
 
 
 def _build_analyzer_tools(mongo_client):
@@ -117,8 +155,23 @@ class AnalyzerAgent:
 
         result = agent.invoke({"messages": messages})
 
-        # 提取最终回答
-        answer = result["messages"][-1].content
-        logger.info(f"[Analyzer] 分析完成，回答长度: {len(answer)}")
+        # 提取中间推理步骤（ReAct 的思考链），写入日志
+        intermediate_steps = []
+        for msg in result["messages"][1:-1]:  # 排除 system 和最终回答
+            if hasattr(msg, 'content') and msg.content:
+                intermediate_steps.append(msg.content[:200])
+        if intermediate_steps:
+            logger.info(f"[Analyzer] 推理过程 ({len(intermediate_steps)} 步):\n" +
+                       "\n---\n".join(intermediate_steps))
+
+        # 提取最终回答（结论 + 分析，不含推理过程）
+        raw_answer = result["messages"][-1].content
+
+        # 清洗推理残留（"根据以上分析""综上所述"等），实现对话隔离
+        answer = _strip_reasoning_traces(raw_answer)
+        if len(answer) < len(raw_answer):
+            logger.info(f"[Analyzer] 清洗推理残留: {len(raw_answer)} → {len(answer)} 字符")
+
+        logger.info(f"[Analyzer] 分析完成，输出长度: {len(answer)}")
 
         return {"analysis": answer, "error": None}
