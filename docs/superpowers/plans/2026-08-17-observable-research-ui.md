@@ -274,4 +274,3 @@ Then manually verify both pages in both themes, paper deletion confirmation, and
 git add web/static/papers.html
 git commit -m "feat: align paper library with research workspace theme"
 ~~~
-

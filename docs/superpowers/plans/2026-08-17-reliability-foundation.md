@@ -352,4 +352,3 @@ Expected: all tests pass, Compose validates, the import prints a positive route 
 git add README.md
 git commit -m "docs: document reliable research workflow"
 ~~~
-
