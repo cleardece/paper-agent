@@ -50,6 +50,7 @@ class ChatMessage:
     content: str
     created_at: float = field(default_factory=time.time)
     timeline: list[dict[str, Any]] = field(default_factory=list)
+    evidence_report: dict[str, Any] | None = None
 
 
 @dataclass
@@ -116,6 +117,7 @@ def load_session_from_db(session_id: str) -> Session | None:
             content=msg.get("content", ""),
             created_at=msg.get("created_at", time.time()),
             timeline=msg.get("timeline", []),
+            evidence_report=msg.get("evidence_report"),
         ))
 
     return session
@@ -132,6 +134,7 @@ def save_session_to_db(session: Session):
                 "content": msg.content,
                 "created_at": msg.created_at,
                 "timeline": msg.timeline,
+                "evidence_report": msg.evidence_report,
             }
             for msg in session.messages
         ]
@@ -169,6 +172,7 @@ def timeline_snapshot(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "input_summary": "",
             "output_summary": "",
             "retry_count": 0,
+            "duration_ms": None,
         }
         for agent in AGENTS
     }
@@ -224,6 +228,7 @@ def wrap_agent(name: str, invoke: Callable[[AgentState], Any], session: Session)
             },
         )
         try:
+            started_at = time.perf_counter()
             result = await run_sync_or_async(invoke, state)
             await push_status(
                 sess,
@@ -232,7 +237,8 @@ def wrap_agent(name: str, invoke: Callable[[AgentState], Any], session: Session)
                     "status": "completed",
                     "detail": agent_done_detail(name, result),
                     "output_summary": summarize(result),
-                    "retry_count": int(result.get("iteration", retry_count)) if name == "critic" else retry_count,
+                "retry_count": int(result.get("iteration", retry_count)) if name == "critic" else retry_count,
+                "duration_ms": round((time.perf_counter() - started_at) * 1000, 1),
                 },
             )
             return result
@@ -245,7 +251,8 @@ def wrap_agent(name: str, invoke: Callable[[AgentState], Any], session: Session)
                     "status": "error",
                     "detail": f"{name} 执行失败：{exc}",
                     "output_summary": summarize({"error": str(exc)}),
-                    "retry_count": retry_count,
+                "retry_count": retry_count,
+                "duration_ms": round((time.perf_counter() - started_at) * 1000, 1),
                 },
             )
             # 返回错误状态，不 raise，让 workflow 继续执行
@@ -436,6 +443,7 @@ def serialize_session(session: Session, include_messages: bool = False) -> dict[
                 "content": msg.content,
                 "created_at": msg.created_at,
                 "timeline": msg.timeline,
+                "evidence_report": msg.evidence_report,
             }
             for msg in session.messages
         ]
@@ -875,6 +883,7 @@ async def chat(request: ChatRequest) -> StreamingResponse:
     async def event_stream():
         yield f"event: session\ndata: {json.dumps({'session_id': session.id}, ensure_ascii=False)}\n\n"
         answer = None
+        evidence_report = None
         try:
             logger.info("[Chat] 开始构建 workflow...")
             workflow = build_traced_workflow(session)
@@ -905,6 +914,8 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                             # 每个节点完成时，尝试提取 answer（兜底）
                             if isinstance(node_output, dict) and node_output.get("answer"):
                                 final_result = node_output
+                            if isinstance(node_output, dict) and node_output.get("evidence_report"):
+                                evidence_report = node_output["evidence_report"]
                             # Agent 状态已通过 wrap_agent → WebSocket 推送，无需重复
 
             if final_result:
@@ -927,11 +938,18 @@ async def chat(request: ChatRequest) -> StreamingResponse:
             yield f"event: token\ndata: {json.dumps({'content': answer}, ensure_ascii=False)}\n\n"
 
         timeline = timeline_snapshot(session.events)
-        session.messages.append(ChatMessage(role="assistant", content=answer, timeline=timeline))
+        session.messages.append(
+            ChatMessage(
+                role="assistant",
+                content=answer,
+                timeline=timeline,
+                evidence_report=evidence_report,
+            )
+        )
         session.updated_at = time.time()
         save_session_to_db(session)
 
-        yield f"event: done\ndata: {json.dumps({'timeline': timeline}, ensure_ascii=False)}\n\n"
+        yield f"event: done\ndata: {json.dumps({'timeline': timeline, 'evidence_report': evidence_report}, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 

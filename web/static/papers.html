@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="dark">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -20,7 +20,7 @@
         margin-bottom: 24px;
       }
       .papers-header h1 {
-        color: var(--green);
+        color: var(--text);
         margin: 0;
       }
       .back-btn {
@@ -32,7 +32,7 @@
         cursor: pointer;
         text-decoration: none;
       }
-      .back-btn:hover { color: var(--text); background: #2a2a2a; }
+      .back-btn:hover { color: var(--text); background: var(--surface-subtle); }
       .paper-card {
         background: var(--bubble);
         border: 1px solid var(--border);
@@ -61,11 +61,11 @@
         font-size: 12px;
         margin-left: 8px;
       }
-      .paper-status.chunked { background: #1a3a1a; color: #4ade80; }
-      .paper-status.pending { background: #3a3a1a; color: #fbbf24; }
+      .paper-status.chunked { background: color-mix(in srgb, var(--success) 15%, transparent); color: var(--success); }
+      .paper-status.pending { background: color-mix(in srgb, var(--warning) 15%, transparent); color: var(--warning); }
       .paper-actions { display: flex; gap: 8px; }
       .btn-ask {
-        background: var(--green);
+        background: var(--accent);
         color: white;
         border: none;
         padding: 8px 16px;
@@ -83,7 +83,7 @@
         cursor: pointer;
         font-size: 13px;
       }
-      .btn-delete:hover { color: #f87171; border-color: #f87171; }
+      .btn-delete:hover { color: var(--danger); border-color: var(--danger); }
       .empty-state {
         text-align: center;
         padding: 60px 20px;
@@ -100,16 +100,26 @@
     <main class="papers-page">
       <div class="papers-header">
         <div>
+          <p class="eyebrow">知识库</p>
           <h1>论文库</h1>
           <span id="paperCount" class="paper-count"></span>
         </div>
         <div style="display:flex;gap:8px;">
+          <button id="themeToggle" class="icon-button" type="button" aria-label="切换深浅主题" title="切换深浅主题">◐</button>
           <a href="/" class="back-btn">← 返回对话</a>
         </div>
       </div>
       <div id="papersContainer"></div>
     </main>
     <script>
+      const savedTheme = localStorage.getItem("paperAgentTheme");
+      document.documentElement.dataset.theme = savedTheme || "dark";
+      document.querySelector("#themeToggle")?.addEventListener("click", () => {
+        const next = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
+        document.documentElement.dataset.theme = next;
+        localStorage.setItem("paperAgentTheme", next);
+      });
+
       async function loadPapers() {
         const res = await fetch("/api/papers");
         const papers = await res.json();

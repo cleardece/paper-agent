@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="dark">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -8,21 +8,24 @@
   </head>
   <body>
     <aside class="sidebar">
-      <div class="brand">Paper Agent</div>
+      <div class="brand"><span class="brand-mark">P</span><span>Paper Agent</span></div>
+      <p class="sidebar-caption">可追溯的研究工作台</p>
       <button id="newChat" class="new-chat">+ 新建对话</button>
-      <button id="uploadBtn" class="upload-btn">📄 上传论文</button>
+      <button id="uploadBtn" class="upload-btn">上传本地 PDF</button>
       <input type="file" id="fileInput" accept=".pdf" style="display:none">
       <div id="uploadStatus" class="upload-status" style="display:none"></div>
-      <a href="/papers" class="upload-btn" style="display:block;text-decoration:none;text-align:center;">📚 论文库</a>
+      <a href="/papers" class="library-link">浏览论文库</a>
       <div id="sessions" class="sessions"></div>
     </aside>
 
     <main class="chat-shell">
       <header class="topbar">
-        <div>
+        <div class="workspace-title">
+          <span class="eyebrow">研究工作台</span>
           <strong id="chatTitle">新对话</strong>
-          <span id="connectionState">准备就绪</span>
+          <span id="connectionState" class="connection-state">准备就绪</span>
         </div>
+        <button id="themeToggle" class="icon-button" type="button" aria-label="切换深浅主题" title="切换深浅主题">◐</button>
       </header>
 
       <section id="messages" class="messages"></section>
