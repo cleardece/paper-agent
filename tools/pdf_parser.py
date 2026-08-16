@@ -6,23 +6,40 @@ Paper Agent - PDF解析工具 v3
 import os
 import re
 import logging
-from typing import Optional
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from tools.mineru_lifecycle import MinerUContainerManager
 
 logger = logging.getLogger("paper-agent")
+
+
+class MinerUParseError(RuntimeError):
+    """MinerU 解析失败且当前策略不允许静默降级。"""
 
 
 class PDFParser:
     """PDF论文解析器 - 支持 MinerU 和 pdfplumber"""
 
-    def __init__(self, mineru_url: str = None, mineru_backend: str = None):
+    def __init__(
+        self,
+        mineru_url: str = None,
+        mineru_backend: str = None,
+        mineru_manager: "MinerUContainerManager | None" = None,
+        require_accurate_parse: bool = True,
+    ):
         """
         Args:
             mineru_url: MinerU API 地址，如 http://localhost:8888
                        如果为 None，使用 pdfplumber fallback
             mineru_backend: MinerU 后端；CPU 环境应使用 pipeline
+            mineru_manager: 本机 MinerU 的按需启动/释放管理器
+            require_accurate_parse: MinerU 失败时是否阻止低质量回退结果入库
         """
         self.mineru_url = mineru_url or os.getenv("MINERU_URL")
         self.mineru_backend = mineru_backend or os.getenv("MINERU_BACKEND", "pipeline")
+        self.mineru_manager = mineru_manager
+        self.require_accurate_parse = require_accurate_parse
         self._pdfplumber = None
 
     def parse(self, pdf_path: str) -> dict:
@@ -39,9 +56,14 @@ class PDFParser:
         """
         if self.mineru_url:
             try:
+                if self.mineru_manager:
+                    with self.mineru_manager.lease():
+                        return self._parse_with_mineru(pdf_path)
                 return self._parse_with_mineru(pdf_path)
             except Exception as e:
-                logger.warning(f"[PDFParser] MinerU 解析失败，回退到 pdfplumber: {e}")
+                if self.require_accurate_parse:
+                    raise MinerUParseError(f"MinerU 解析失败: {e}") from e
+                logger.warning(f"[PDFParser] MinerU 解析失败，明确降级到 pdfplumber: {e}")
 
         return self._parse_with_pdfplumber(pdf_path)
 

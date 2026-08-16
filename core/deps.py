@@ -5,14 +5,34 @@ Paper Agent - 依赖注入模块
 
 import logging
 import os
-from config import get_llm, MINERU_BACKEND, MINERU_URL, SEMANTIC_SCHOLAR_API_KEY
+from urllib.parse import urlparse
+
+from config import (
+    MINERU_BACKEND,
+    MINERU_CPU_LIMIT,
+    MINERU_IDLE_SHUTDOWN_SECONDS,
+    MINERU_MEMORY_LIMIT,
+    MINERU_REQUIRE_ACCURATE_PARSE,
+    MINERU_START_TIMEOUT_SECONDS,
+    MINERU_URL,
+    SEMANTIC_SCHOLAR_API_KEY,
+    get_llm,
+)
 from storage.mongodb import MongoDBClient
 from storage.milvus import MilvusClient
 from tools.embeddings import EmbeddingService
 from tools.pdf_parser import PDFParser
+from tools.mineru_lifecycle import MinerUContainerManager
 from tools.code_generator import CodeGenerator
 
 logger = logging.getLogger("paper-agent")
+
+
+def _is_local_mineru_url(url: str | None) -> bool:
+    """仅管理本机 Docker；远程 MinerU 的生命周期属于其部署方。"""
+    if not url:
+        return False
+    return urlparse(url).hostname in {"localhost", "127.0.0.1", "::1"}
 
 
 def _create_paper_search():
@@ -68,14 +88,26 @@ class ServiceContainer:
         self.paper_search = _create_paper_search()
 
         # PDF 解析：优先 MinerU（CPU 模式），fallback 到 pdfplumber
+        mineru_manager = None
+        if _is_local_mineru_url(MINERU_URL):
+            mineru_manager = MinerUContainerManager(
+                MINERU_URL,
+                idle_shutdown_seconds=MINERU_IDLE_SHUTDOWN_SECONDS,
+                start_timeout_seconds=MINERU_START_TIMEOUT_SECONDS,
+                memory_limit=MINERU_MEMORY_LIMIT,
+                cpu_limit=MINERU_CPU_LIMIT,
+            )
+
         self.pdf_parser = PDFParser(
             mineru_url=MINERU_URL,
             mineru_backend=MINERU_BACKEND,
+            mineru_manager=mineru_manager,
+            require_accurate_parse=MINERU_REQUIRE_ACCURATE_PARSE,
         )
         if MINERU_URL:
             logger.info(
                 f"[Container] 使用 MinerU: {MINERU_URL} "
-                f"(backend={MINERU_BACKEND})"
+                f"(backend={MINERU_BACKEND}, local_managed={mineru_manager is not None})"
             )
         else:
             logger.info("[Container] 使用 pdfplumber（未配置 MinerU）")

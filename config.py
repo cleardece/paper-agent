@@ -131,6 +131,13 @@ RERANKER_MODEL = os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")
 MINERU_URL = os.getenv("MINERU_URL")  # http://localhost:8888
 # CPU 环境使用 pipeline；hybrid-auto-engine 需要可用的 vLLM/GPU。
 MINERU_BACKEND = os.getenv("MINERU_BACKEND", "pipeline")
+MINERU_IDLE_SHUTDOWN_SECONDS = int(os.getenv("MINERU_IDLE_SHUTDOWN_SECONDS", "0"))
+MINERU_START_TIMEOUT_SECONDS = int(os.getenv("MINERU_START_TIMEOUT_SECONDS", "90"))
+MINERU_MEMORY_LIMIT = os.getenv("MINERU_MEMORY_LIMIT", "")
+MINERU_CPU_LIMIT = os.getenv("MINERU_CPU_LIMIT", "")
+MINERU_REQUIRE_ACCURATE_PARSE = (
+    os.getenv("MINERU_REQUIRE_ACCURATE_PARSE", "true").lower() == "true"
+)
 
 # ==================== 搜索 API ====================
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
