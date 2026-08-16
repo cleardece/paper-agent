@@ -1,0 +1,14 @@
+[
+  {
+    "id": "retrieval-example",
+    "query": "比较已入库论文中两种方法的核心差异",
+    "expected_papers": ["replace-with-an-arxiv-id"],
+    "should_abstain": false
+  },
+  {
+    "id": "abstention-example",
+    "query": "数据库中没有的主题有什么结论？",
+    "expected_papers": [],
+    "should_abstain": true
+  }
+]

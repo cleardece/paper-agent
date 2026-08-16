@@ -8,6 +8,7 @@ import logging
 import re
 
 from langchain_core.messages import SystemMessage, HumanMessage
+from core.evidence import validate_answer_evidence
 from core.llm_utils import invoke_json_with_retry
 from state.graph_state import AgentState
 
@@ -89,6 +90,24 @@ class CriticAgent:
                 "iteration": iteration + 1,
             }
 
+        evidence_report = validate_answer_evidence(analysis, retrieved_chunks)
+        if evidence_report["status"] == "retry":
+            logger.warning(
+                "[Critic] 证据规则校验未通过: %s",
+                evidence_report["reason"],
+            )
+            if iteration < max_iterations - 1:
+                return {
+                    "critic_score": {
+                        "score": 0,
+                        "verdict": "revise",
+                        "suggestions": [evidence_report["reason"]],
+                    },
+                    "evidence_report": evidence_report,
+                    "next_agent": "retriever",
+                    "iteration": iteration + 1,
+                }
+
         context = "\n".join(
             f"[{c['paper_title']}] {c['content'][:300]}"
             for c in retrieved_chunks[:5]
@@ -143,6 +162,7 @@ AI生成的回答：
 
         return {
             "critic_score": evaluation,
+            "evidence_report": evidence_report,
             "next_agent": next_agent,
             "iteration": iteration + 1,
         }

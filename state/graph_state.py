@@ -47,6 +47,7 @@ class AgentState(TypedDict):
     search_results: Optional[dict]          # web搜索结果
     analysis: Optional[str]                 # 分析结论
     answer: Optional[str]                   # 最终回答
+    evidence_report: Optional[dict]         # 引用与检索证据的规则校验结果
 
     # 流程控制
     next_agent: Optional[str]               # Supervisor决定的下一个Agent
