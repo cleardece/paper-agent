@@ -3,8 +3,12 @@ Paper Agent - Supervisor Agent
 路由中枢，根据用户意图分派任务到 fetcher 或 retriever
 """
 
+import json
 import logging
+import re
+
 from langchain_core.messages import SystemMessage, HumanMessage
+from core.llm_utils import invoke_json_with_retry
 from state.graph_state import AgentState
 
 logger = logging.getLogger("paper-agent")
@@ -65,12 +69,11 @@ class SupervisorAgent:
 
     def _extract_paper_from_context(self, query: str, context: str) -> str:
         """从对话上下文中提取最近讨论的论文标题"""
-        import re
         if not context:
             # 没有上下文，从知识库取最近的论文
             if self.mongo:
                 try:
-                    papers = self.mongo.list_papers(limit=3)
+                    papers = self.mongo.list_papers(limit=3, projection={"title": 1})
                     if papers:
                         return papers[-1].get("title", "")
                 except Exception:
@@ -88,13 +91,15 @@ class SupervisorAgent:
         if not self.mongo:
             return False
         try:
-            papers = self.mongo.list_papers(limit=50)
+            papers = self.mongo.list_papers(
+                limit=50,
+                projection={"arxiv_id": 1, "title": 1, "abstract": 1},
+            )
             if not papers:
                 return False
             # 简单关键词匹配：检查论文标题是否包含查询中的关键词
             query_lower = query.lower()
             # 提取英文关键词（过滤掉常见中文停用词）
-            import re
             keywords = re.findall(r'[a-zA-Z]{3,}', query_lower)
             if not keywords:
                 return False
@@ -127,23 +132,20 @@ class SupervisorAgent:
             HumanMessage(content=user_input),
         ]
         logger.info("[Supervisor] 正在调用 LLM 判断意图...")
-        response = self.llm.invoke(messages)
-        content = response.content.strip()
-        logger.info(f"[Supervisor] LLM 返回: {content[:100]}...")
 
-        import json, re
-        json_match = re.search(r'\{[^}]+\}', content)
+        # 带重试的 JSON 调用，失败时降级到关键词匹配
+        decision = invoke_json_with_retry(self.llm, messages, max_retries=2)
+
         next_agent = "END"
         search_query = None
 
-        if json_match:
-            try:
-                decision = json.loads(json_match.group())
-                next_agent = decision.get("next_agent", "END")
-                search_query = decision.get("search_query")
-            except json.JSONDecodeError:
-                next_agent = "END"
+        if decision:
+            next_agent = decision.get("next_agent", "END")
+            search_query = decision.get("search_query")
+            logger.info(f"[Supervisor] LLM 路由: {next_agent}")
         else:
+            # 降级：关键词匹配
+            logger.warning("[Supervisor] LLM 调用失败，降级到关键词匹配")
             lower = query.lower()
             if any(kw in lower for kw in ["搜索", "抓取", "下载", "找论文", "入库", "search", "fetch"]):
                 next_agent = "fetcher"
@@ -151,6 +153,24 @@ class SupervisorAgent:
                 next_agent = "retriever"
             else:
                 next_agent = "END"
+
+            # 降级模式下额外检查：如果查询指向知识库中已有的论文，走 direct
+            if next_agent == "retriever" and self.mongo:
+                try:
+                    papers = self.mongo.list_papers(limit=50, projection={"title": 1})
+                    # 提取查询中的英文关键词（可能是论文标题片段）
+                    query_keywords = [kw for kw in re.findall(r'[a-zA-Z]{3,}', query) if len(kw) > 3]
+                    if query_keywords and papers:
+                        for paper in papers:
+                            title_lower = paper.get("title", "").lower()
+                            # 查询关键词大部分出现在标题中 → 论文已在库中
+                            matched = sum(1 for kw in query_keywords if kw.lower() in title_lower)
+                            if matched >= min(3, len(query_keywords)) and matched / len(query_keywords) >= 0.5:
+                                next_agent = "direct"
+                                logger.info(f"[Supervisor] 降级模式：论文已在知识库中 → 路由到 direct")
+                                break
+                except Exception:
+                    pass
 
         # 如果是 fetcher 但没有提取到 search_query，使用用户原始输入
         if next_agent == "fetcher" and not search_query:
@@ -166,7 +186,6 @@ class SupervisorAgent:
         logger.info(f"[Supervisor] is_followup={is_followup}, query={query[:30]}")
 
         # 检查查询中是否包含具体论文标题（英文关键词 >= 5 个）
-        import re
         english_keywords = [kw for kw in re.findall(r'[a-zA-Z]{3,}', query) if len(kw) > 3]
         has_explicit_title = len(english_keywords) >= 5
 
