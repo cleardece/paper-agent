@@ -5,7 +5,7 @@ Paper Agent - 依赖注入模块
 
 import logging
 import os
-from config import get_llm, MINERU_URL, SEMANTIC_SCHOLAR_API_KEY
+from config import get_llm, MINERU_BACKEND, MINERU_URL, SEMANTIC_SCHOLAR_API_KEY
 from storage.mongodb import MongoDBClient
 from storage.milvus import MilvusClient
 from tools.embeddings import EmbeddingService
@@ -68,9 +68,15 @@ class ServiceContainer:
         self.paper_search = _create_paper_search()
 
         # PDF 解析：优先 MinerU（CPU 模式），fallback 到 pdfplumber
-        self.pdf_parser = PDFParser(mineru_url=MINERU_URL)
+        self.pdf_parser = PDFParser(
+            mineru_url=MINERU_URL,
+            mineru_backend=MINERU_BACKEND,
+        )
         if MINERU_URL:
-            logger.info(f"[Container] 使用 MinerU: {MINERU_URL}（CPU 模式，GPU 留给 Embedding）")
+            logger.info(
+                f"[Container] 使用 MinerU: {MINERU_URL} "
+                f"(backend={MINERU_BACKEND})"
+            )
         else:
             logger.info("[Container] 使用 pdfplumber（未配置 MinerU）")
 

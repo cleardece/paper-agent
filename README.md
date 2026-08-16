@@ -58,7 +58,7 @@ python -m uvicorn web.app:app --host 0.0.0.0 --port 8000 --reload
 | `LLM_MODEL`、`LLM_BASE_URL`、`LLM_API_KEY` | 对话、路由、分析和审核模型配置 |
 | `MONGODB_URI`、`MONGODB_DB` | 论文、会话和记忆存储 |
 | `MILVUS_HOST`、`MILVUS_PORT` | 向量检索服务 |
-| `MINERU_URL` | 可选的 MinerU PDF 解析服务 |
+| `MINERU_URL`、`MINERU_BACKEND` | 可选的 MinerU 服务；无 GPU 时使用 `pipeline` |
 | `USE_MCP`、`MCP_ARXIV_URL` | arXiv MCP 搜索优先级 |
 | `SEMANTIC_SCHOLAR_API_KEY` | 可选的 Semantic Scholar 搜索 |
 | `PA_DATA_ROOT` | Docker Compose 数据卷根目录 |

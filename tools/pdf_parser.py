@@ -14,13 +14,15 @@ logger = logging.getLogger("paper-agent")
 class PDFParser:
     """PDF论文解析器 - 支持 MinerU 和 pdfplumber"""
 
-    def __init__(self, mineru_url: str = None):
+    def __init__(self, mineru_url: str = None, mineru_backend: str = None):
         """
         Args:
             mineru_url: MinerU API 地址，如 http://localhost:8888
                        如果为 None，使用 pdfplumber fallback
+            mineru_backend: MinerU 后端；CPU 环境应使用 pipeline
         """
         self.mineru_url = mineru_url or os.getenv("MINERU_URL")
+        self.mineru_backend = mineru_backend or os.getenv("MINERU_BACKEND", "pipeline")
         self._pdfplumber = None
 
     def parse(self, pdf_path: str) -> dict:
@@ -47,13 +49,21 @@ class PDFParser:
         """使用 MinerU API 解析 PDF"""
         import httpx
 
-        logger.info(f"[PDFParser] 使用 MinerU 解析: {pdf_path}")
+        logger.info(
+            f"[PDFParser] 使用 MinerU 解析: {pdf_path} "
+            f"(backend={self.mineru_backend})"
+        )
 
         with open(pdf_path, "rb") as f:
             files = {"files": (os.path.basename(pdf_path), f, "application/pdf")}
             response = httpx.post(
                 f"{self.mineru_url}/file_parse",
                 files=files,
+                data={
+                    "backend": self.mineru_backend,
+                    "parse_method": "auto",
+                    "return_md": "true",
+                },
                 timeout=300,
             )
             response.raise_for_status()
