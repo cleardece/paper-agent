@@ -6,6 +6,7 @@ Paper Agent - User Memory System
 import math
 import json
 import logging
+import re
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 from pymongo import MongoClient, ASCENDING, DESCENDING
@@ -63,7 +64,6 @@ class UserMemory:
             content = response.content.strip()
 
             # 提取 JSON
-            import re
             json_match = re.search(r'\{[\s\S]*\}', content)
             if json_match:
                 return json.loads(json_match.group())

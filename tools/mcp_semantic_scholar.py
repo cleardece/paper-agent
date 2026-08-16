@@ -3,6 +3,7 @@ Paper Agent - Semantic Scholar via MCP
 通过 MCP 调用 Semantic Scholar 服务
 """
 
+import json
 import logging
 from typing import Optional
 
@@ -31,7 +32,6 @@ class SemanticScholarMCP:
         papers = []
         try:
             content = result.content[0].text if hasattr(result, 'content') else str(result)
-            import json
             data = json.loads(content) if isinstance(content, str) else content
 
             for item in data.get("papers", data) if isinstance(data, dict) else data:
@@ -77,7 +77,6 @@ class SemanticScholarMCP:
 
         try:
             content = result.content[0].text if hasattr(result, 'content') else str(result)
-            import json
             item = json.loads(content) if isinstance(content, str) else content
 
             return {
@@ -107,7 +106,6 @@ class SemanticScholarMCP:
 
         try:
             content = result.content[0].text if hasattr(result, 'content') else str(result)
-            import json
             data = json.loads(content) if isinstance(content, str) else content
             return data.get("citations", data) if isinstance(data, dict) else data
         except Exception as e:

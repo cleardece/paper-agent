@@ -86,7 +86,6 @@ class RetrieverAgent:
             content = response.content.strip()
 
             # 提取 JSON 数组
-            import re
             match = re.search(r'\[.*?\]', content, re.DOTALL)
             if match:
                 variants = json.loads(match.group())
@@ -127,24 +126,20 @@ class RetrieverAgent:
     def _two_level_retrieval(self, query: str, query_vector, session_id: str = None, target_paper: str = None) -> list[dict]:
         """两层检索：先找论文，再在论文内找 chunk"""
 
-        # ===== Stage 1: 论文级检索 =====
-        # 用查询找最相关的论文（通过标题和摘要的向量）
-        logger.info("[Retriever] Stage 1: 论文级检索...")
+        # ===== Stage 1: 论文级检索（Milvus HNSW 向量搜索）=====
+        logger.info("[Retriever] Stage 1: 论文级检索（Milvus）...")
 
-        # 获取所有已入库论文
-        all_papers = self.mongo.list_papers(limit=50)
-        if not all_papers:
-            return []
-
-        # 如果有目标论文，优先匹配（直接用标题关键词匹配）
+        # 优先用目标论文直接匹配
         if target_paper:
+            # 从 MongoDB 查论文 ID
+            all_papers = self.mongo.list_papers(
+                limit=50, projection={"arxiv_id": 1, "title": 1},
+            )
             target_lower = target_paper.lower()
             for paper in all_papers:
                 title = paper.get("title", "").lower()
-                # 标题包含目标关键词 → 直接作为 top-1
                 if any(kw in title for kw in target_lower.split() if len(kw) > 3):
                     logger.info(f"[Retriever] 直接匹配目标论文: {paper.get('title', '')[:50]}")
-                    # 跳过向量检索，直接取这篇论文的 chunks
                     hits = self.milvus.search(
                         query_embedding=query_vector,
                         top_k=15,
@@ -153,69 +148,31 @@ class RetrieverAgent:
                     )
                     return hits
 
-        # 对每篇论文计算与查询的相似度（优先用持久化向量）
-        paper_scores = []
-        papers_to_embed = []  # 需要 embedding 的论文
-        paper_texts = []      # 对应的文本
-
-        for paper in all_papers:
-            paper_text = f"{paper.get('title', '')} {paper.get('abstract', '')}"
-            if not paper_text.strip():
-                continue
-
-            # 优先级：session 缓存 > MongoDB 持久化 > 实时计算
-            paper_vector = None
-
-            # 1. 查 session 缓存
-            cache_key = f"paper_emb:{paper.get('arxiv_id', '')}"
-            if session_id:
-                paper_vector = cache.get(session_id, cache_key)
-
-            # 2. 查 MongoDB 持久化
-            if paper_vector is None:
-                persisted = paper.get("title_embedding")
-                if persisted:
-                    paper_vector = persisted
-                    if session_id:
-                        cache.set(session_id, cache_key, paper_vector)
-
-            # 3. 需要实时计算
-            if paper_vector is None:
-                papers_to_embed.append(paper)
-                paper_texts.append(paper_text)
-                continue
-
-            score = float(np.dot(query_vector, paper_vector) /
-                         (np.linalg.norm(query_vector) * np.linalg.norm(paper_vector)))
-            paper_scores.append({
-                "arxiv_id": paper.get("arxiv_id"),
-                "title": paper.get("title", ""),
-                "score": score,
-            })
-
-        # 批量 embedding 未有持久化向量的论文（一次 GPU 调用）
-        if paper_texts:
-            paper_vectors = self.embedder.embed_texts(paper_texts)
-            for paper, vec in zip(papers_to_embed, paper_vectors):
-                # 持久化到 MongoDB
-                self.mongo.update_paper_status(
-                    paper["arxiv_id"], paper.get("status", "indexed"),
-                    title_embedding=vec
-                )
-                cache_key = f"paper_emb:{paper.get('arxiv_id', '')}"
-                if session_id:
-                    cache.set(session_id, cache_key, vec)
-                score = float(np.dot(query_vector, vec) /
-                             (np.linalg.norm(query_vector) * np.linalg.norm(vec)))
+        # Milvus 论文级向量搜索（HNSW 近似最近邻，替代 Python 逐篇计算）
+        top_papers = self.milvus.search_papers(query_embedding=query_vector, top_k=5)
+        if not top_papers:
+            logger.info("[Retriever] Milvus 论文级搜索无结果，尝试 MongoDB 兜底...")
+            # 兜底：如果 paper_embeddings collection 为空（旧数据未迁移），走 MongoDB
+            all_papers = self.mongo.list_papers(
+                limit=50, projection={"arxiv_id": 1, "title": 1, "title_embedding": 1},
+            )
+            all_papers = [p for p in all_papers if p.get("title_embedding")]
+            if not all_papers:
+                return []
+            # 用 numpy 计算（仅兜底路径）
+            paper_scores = []
+            for paper in all_papers:
+                paper_vector = paper["title_embedding"]
+                score = float(np.dot(query_vector, paper_vector) /
+                             (np.linalg.norm(query_vector) * np.linalg.norm(paper_vector)))
                 paper_scores.append({
-                    "arxiv_id": paper.get("arxiv_id"),
+                    "arxiv_id": paper["arxiv_id"],
                     "title": paper.get("title", ""),
                     "score": score,
                 })
+            paper_scores.sort(key=lambda x: x["score"], reverse=True)
+            top_papers = paper_scores[:5]
 
-        # 按分数排序，取 top-5 论文
-        paper_scores.sort(key=lambda x: x["score"], reverse=True)
-        top_papers = paper_scores[:5]
         top3_info = [(p['title'][:30], f"{p['score']:.3f}") for p in top_papers[:3]]
         logger.info(f"[Retriever] Top-5 论文 (前3): {top3_info}")
 
@@ -292,10 +249,9 @@ class RetrieverAgent:
 
     def _extract_target_paper(self, query: str, context: str = "") -> str:
         """从查询和对话上下文中提取用户指代的论文标题"""
-        import re
-
         # 检查是否包含跟随意图词
-        followup_patterns = ["这篇论文", "该论文", "它的", "它", "上一篇", "刚才的", "之前"]
+        # 注意："它" 会误匹配 "它们"，用 "它的" / "这篇" 等更精确的模式
+        followup_patterns = ["这篇论文", "该论文", "它的", "上一篇", "刚才的", "之前"]
         is_followup = any(p in query for p in followup_patterns)
         if not is_followup:
             return None
@@ -310,7 +266,7 @@ class RetrieverAgent:
 
         # 从知识库中匹配最近的论文
         try:
-            papers = self.mongo.list_papers(limit=5)
+            papers = self.mongo.list_papers(limit=5, projection={"title": 1})
             if papers:
                 return papers[-1].get("title", "")
         except Exception:

@@ -3,8 +3,12 @@ Paper Agent - Reflection Agent
 分析完论文后自动生成洞察、问题、未来方向
 """
 
+import json
 import logging
+import re
+
 from langchain_core.messages import SystemMessage, HumanMessage
+from core.llm_utils import invoke_json_with_retry
 
 logger = logging.getLogger("paper-agent")
 
@@ -95,25 +99,14 @@ class ReflectorAgent:
 
 请生成反思记忆（严格JSON格式）："""
 
-        try:
-            messages = [
-                SystemMessage(content=REFLECTOR_PROMPT),
-                HumanMessage(content=prompt),
-            ]
-            response = self.llm.invoke(messages)
-            content = response.content.strip()
-
-            # 提取 JSON
-            import re
-            json_match = re.search(r'\{[\s\S]*\}', content)
-            if json_match:
-                import json
-                reflection = json.loads(json_match.group())
-                logger.info(f"[Reflector] 生成反思: {len(reflection.get('insights', []))} 个洞察")
-                return {"reflection": reflection, "next_agent": "END"}
-
-        except Exception as e:
-            logger.error(f"[Reflector] 生成反思失败: {e}")
+        messages = [
+            SystemMessage(content=REFLECTOR_PROMPT),
+            HumanMessage(content=prompt),
+        ]
+        reflection = invoke_json_with_retry(self.llm, messages, max_retries=1)
+        if reflection:
+            logger.info(f"[Reflector] 生成反思: {len(reflection.get('insights', []))} 个洞察")
+            return {"reflection": reflection, "next_agent": "END"}
 
         # 默认返回
         return {
