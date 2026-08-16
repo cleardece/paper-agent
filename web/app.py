@@ -500,7 +500,6 @@ async def test_connection():
 
 def _extract_arxiv_id_from_pdf(pdf_content: bytes) -> Optional[str]:
     """从 PDF 内容提取 arxiv_id"""
-    import re
     try:
         # 尝试从 PDF 文本中提取 arxiv ID
         text = pdf_content[:5000].decode("utf-8", errors="ignore")
@@ -520,7 +519,6 @@ def _extract_arxiv_id_from_pdf(pdf_content: bytes) -> Optional[str]:
 @app.post("/api/upload")
 async def upload_paper(file: UploadFile):
     """上传本地 PDF 论文，后台异步解析并入库"""
-    import json
     import os
     from core.deps import get_container
 
@@ -580,7 +578,6 @@ async def upload_paper(file: UploadFile):
 
 async def _process_upload(container, pdf_path, filename, arxiv_id, session_id=None):
     """后台处理上传的 PDF"""
-    import json
     from core.cache import cache
 
     try:
@@ -656,6 +653,22 @@ async def _process_upload(container, pdf_path, filename, arxiv_id, session_id=No
         ]
         container.milvus.insert(milvus_records)
         logger.info(f"[Upload] Milvus 入库完成: {len(chunks)} 分块")
+
+        # 4.5 论文级 embedding（标题+摘要）→ Milvus paper_embeddings collection
+        paper_title = result.get("title", filename)
+        paper_abstract = result.get("abstract", "")
+        paper_text = f"{paper_title} {paper_abstract}".strip()
+        if paper_text:
+            paper_emb = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: container.embedder.embed_texts([paper_text])[0]
+            )
+            container.milvus.insert_paper_embedding(
+                arxiv_id=arxiv_id,
+                title=paper_title,
+                embedding=paper_emb,
+            )
+            container.mongodb.update_paper_status(arxiv_id, "indexed", title_embedding=paper_emb)
+            logger.info(f"[Upload] 论文级 embedding 已写入 Milvus")
 
         # 5. 更新状态为 indexed
         container.mongodb.update_paper_status(arxiv_id, "indexed")

@@ -84,8 +84,14 @@ class MongoDBClient:
     def get_papers_by_status(self, status: str, limit: int = 100) -> list[dict]:
         return list(self.papers.find({"status": status}).limit(limit))
 
-    def list_papers(self, limit: int = 50, skip: int = 0) -> list[dict]:
-        return list(self.papers.find().sort("created_at", DESCENDING).skip(skip).limit(limit))
+    def list_papers(self, limit: int = 50, skip: int = 0, projection: dict = None) -> list[dict]:
+        """列出论文
+
+        Args:
+            projection: MongoDB 投影字典，指定返回字段。None 返回全部字段。
+                        示例: {"arxiv_id": 1, "title": 1, "abstract": 1, "title_embedding": 1}
+        """
+        return list(self.papers.find(projection=projection).sort("created_at", DESCENDING).skip(skip).limit(limit))
 
     def delete_paper(self, arxiv_id: str) -> bool:
         paper_result = self.papers.delete_one({"arxiv_id": arxiv_id})

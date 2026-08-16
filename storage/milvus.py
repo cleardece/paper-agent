@@ -1,5 +1,8 @@
 """
 Paper Agent - Milvus向量存储层
+两个 collection：
+  - paper_chunks: chunk 级向量（用于 Stage 2 精细检索）
+  - paper_embeddings: 论文级向量（标题+摘要，用于 Stage 1 论文排序）
 """
 
 import logging
@@ -9,7 +12,8 @@ from pymilvus import MilvusClient as PyMilvusClient
 
 logger = logging.getLogger("paper-agent")
 
-COLLECTION_NAME = "paper_chunks"
+CHUNK_COLLECTION = "paper_chunks"
+PAPER_COLLECTION = "paper_embeddings"
 VECTOR_DIM = 1024  # BGE-M3
 
 
@@ -18,59 +22,73 @@ class MilvusClient:
         logger.info(f"[Milvus] 正在连接 {uri}...")
         self.client = PyMilvusClient(uri=uri, timeout=10)
         logger.info("[Milvus] 连接成功")
-        self._ensure_collection()
+        self._ensure_collections()
 
-    def _ensure_collection(self):
-        if self.client.has_collection(COLLECTION_NAME):
-            # 检查是否需要迁移旧 schema（metadata_json → 独立字段）
-            schema = self.client.describe_collection(COLLECTION_NAME)
+    def _ensure_collections(self):
+        """确保两个 collection 存在：paper_chunks + paper_embeddings"""
+        from config import MILVUS_HNSW_M, MILVUS_HNSW_EF_CONSTRUCTION
+
+        # ===== paper_chunks（chunk 级向量）=====
+        if self.client.has_collection(CHUNK_COLLECTION):
+            schema = self.client.describe_collection(CHUNK_COLLECTION)
             fields = [f["name"] for f in schema["fields"]]
             if "metadata_json" in fields and "section" not in fields:
-                logger.info("[Milvus] 检测到旧 schema，重建 collection...")
-                self.client.drop_collection(COLLECTION_NAME)
+                logger.info("[Milvus] 检测到旧 schema，重建 chunk collection...")
+                self.client.drop_collection(CHUNK_COLLECTION)
             else:
-                self.client.load_collection(COLLECTION_NAME)
-                return
+                self.client.load_collection(CHUNK_COLLECTION)
+        else:
+            schema = self.client.create_schema(auto_id=True, enable_dynamic_field=True)
+            schema.add_field("id", DataType.INT64, is_primary=True)
+            schema.add_field("paper_arxiv_id", DataType.VARCHAR, max_length=64)
+            schema.add_field("chunk_index", DataType.INT64)
+            schema.add_field("content", DataType.VARCHAR, max_length=8192)
+            schema.add_field("embedding", DataType.FLOAT_VECTOR, dim=VECTOR_DIM)
+            schema.add_field("section", DataType.VARCHAR, max_length=128)
+            schema.add_field("page", DataType.INT64)
+            schema.add_field("heading", DataType.VARCHAR, max_length=256)
 
-        # 新 schema：metadata 拆分为独立字段
-        schema = self.client.create_schema(auto_id=True, enable_dynamic_field=True)
-        schema.add_field("id", DataType.INT64, is_primary=True)
-        schema.add_field("paper_arxiv_id", DataType.VARCHAR, max_length=64)
-        schema.add_field("chunk_index", DataType.INT64)
-        schema.add_field("content", DataType.VARCHAR, max_length=8192)
-        schema.add_field("embedding", DataType.FLOAT_VECTOR, dim=VECTOR_DIM)
-        # Metadata 拆分为独立字段，支持高效过滤
-        schema.add_field("section", DataType.VARCHAR, max_length=128)
-        schema.add_field("page", DataType.INT64)
-        schema.add_field("heading", DataType.VARCHAR, max_length=256)
+            self.client.create_collection(collection_name=CHUNK_COLLECTION, schema=schema)
 
-        self.client.create_collection(
-            collection_name=COLLECTION_NAME,
-            schema=schema,
-        )
+            index_params = self.client.prepare_index_params()
+            index_params.add_index(
+                field_name="embedding",
+                index_type="HNSW",
+                metric_type="COSINE",
+                params={"M": MILVUS_HNSW_M, "efConstruction": MILVUS_HNSW_EF_CONSTRUCTION},
+            )
+            self.client.create_index(collection_name=CHUNK_COLLECTION, index_params=index_params)
+            self.client.load_collection(CHUNK_COLLECTION)
 
-        # HNSW 索引：参数根据硬件自动调整
-        from config import MILVUS_HNSW_M, MILVUS_HNSW_EF_CONSTRUCTION
-        index_params = self.client.prepare_index_params()
-        index_params.add_index(
-            field_name="embedding",
-            index_type="HNSW",
-            metric_type="COSINE",
-            params={"M": MILVUS_HNSW_M, "efConstruction": MILVUS_HNSW_EF_CONSTRUCTION},
-        )
-        self.client.create_index(
-            collection_name=COLLECTION_NAME,
-            index_params=index_params,
-        )
+        # ===== paper_embeddings（论文级向量，用于 Stage 1 排序）=====
+        if self.client.has_collection(PAPER_COLLECTION):
+            self.client.load_collection(PAPER_COLLECTION)
+        else:
+            schema = self.client.create_schema(auto_id=True, enable_dynamic_field=True)
+            schema.add_field("id", DataType.INT64, is_primary=True)
+            schema.add_field("paper_arxiv_id", DataType.VARCHAR, max_length=64)
+            schema.add_field("title", DataType.VARCHAR, max_length=512)
+            schema.add_field("embedding", DataType.FLOAT_VECTOR, dim=VECTOR_DIM)
 
-        # 加载 collection 到内存
-        self.client.load_collection(COLLECTION_NAME)
+            self.client.create_collection(collection_name=PAPER_COLLECTION, schema=schema)
+
+            index_params = self.client.prepare_index_params()
+            index_params.add_index(
+                field_name="embedding",
+                index_type="HNSW",
+                metric_type="COSINE",
+                params={"M": MILVUS_HNSW_M, "efConstruction": MILVUS_HNSW_EF_CONSTRUCTION},
+            )
+            self.client.create_index(collection_name=PAPER_COLLECTION, index_params=index_params)
+            self.client.load_collection(PAPER_COLLECTION)
+
+        logger.info(f"[Milvus] Collection 就绪: {CHUNK_COLLECTION}, {PAPER_COLLECTION}")
 
     def insert(self, records: list[dict]) -> int:
-        """批量插入向量"""
+        """批量插入 chunk 向量"""
         if not records:
             return 0
-        result = self.client.insert(collection_name=COLLECTION_NAME, data=records)
+        result = self.client.insert(collection_name=CHUNK_COLLECTION, data=records)
         return result["insert_count"]
 
     def search(
@@ -90,7 +108,7 @@ class MilvusClient:
         search_params = {"metric_type": "COSINE", "params": {"ef": MILVUS_SEARCH_EF}}
 
         kwargs = {
-            "collection_name": COLLECTION_NAME,
+            "collection_name": CHUNK_COLLECTION,
             "data": [query_embedding],
             "limit": top_k,
             "search_params": search_params,
@@ -122,25 +140,71 @@ class MilvusClient:
         return hits
 
     def delete_by_paper(self, arxiv_id: str):
+        """删除论文的 chunk 向量 + 论文级向量"""
         self.client.delete(
-            collection_name=COLLECTION_NAME,
+            collection_name=CHUNK_COLLECTION,
+            filter=f'paper_arxiv_id == "{arxiv_id}"',
+        )
+        self.client.delete(
+            collection_name=PAPER_COLLECTION,
             filter=f'paper_arxiv_id == "{arxiv_id}"',
         )
 
     def delete_all(self):
-        self.client.drop_collection(COLLECTION_NAME)
-        self._ensure_collection()
+        self.client.drop_collection(CHUNK_COLLECTION)
+        self.client.drop_collection(PAPER_COLLECTION)
+        self._ensure_collections()
 
     def count(self, arxiv_id: Optional[str] = None) -> int:
         if arxiv_id:
             results = self.client.query(
-                collection_name=COLLECTION_NAME,
+                collection_name=CHUNK_COLLECTION,
                 filter=f'paper_arxiv_id == "{arxiv_id}"',
                 output_fields=["id"],
             )
             return len(results)
-        stats = self.client.get_collection_stats(COLLECTION_NAME)
+        stats = self.client.get_collection_stats(CHUNK_COLLECTION)
         return int(stats["row_count"])
+
+    # ==================== 论文级向量操作 ====================
+
+    def insert_paper_embedding(self, arxiv_id: str, title: str, embedding: list[float]):
+        """插入论文级向量（标题+摘要的 embedding）"""
+        self.client.insert(
+            collection_name=PAPER_COLLECTION,
+            data=[{
+                "paper_arxiv_id": arxiv_id,
+                "title": title,
+                "embedding": embedding,
+            }],
+        )
+
+    def search_papers(
+        self,
+        query_embedding: list[float],
+        top_k: int = 5,
+    ) -> list[dict]:
+        """论文级语义检索：返回最相关的论文列表"""
+        from config import MILVUS_SEARCH_EF
+        search_params = {"metric_type": "COSINE", "params": {"ef": MILVUS_SEARCH_EF}}
+
+        results = self.client.search(
+            collection_name=PAPER_COLLECTION,
+            data=[query_embedding],
+            limit=top_k,
+            search_params=search_params,
+            output_fields=["paper_arxiv_id", "title"],
+        )
+
+        hits = []
+        if results and len(results) > 0:
+            for hit in results[0]:
+                hits.append({
+                    "arxiv_id": hit["entity"]["paper_arxiv_id"],
+                    "title": hit["entity"]["title"],
+                    "score": hit["distance"],
+                })
+        return hits
 
     def close(self):
         self.client.close()
