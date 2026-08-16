@@ -10,3 +10,8 @@ milvus_data/
 mongodb_data/
 cache/
 tmp_pdfs/
+
+# 本地脚本（不入库）
+test_local_paper.py
+start.bat
+stop.bat
