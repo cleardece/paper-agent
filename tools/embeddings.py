@@ -62,12 +62,13 @@ class EmbeddingService:
         from config import EMBEDDING_MODEL, EMBEDDING_DEVICE
         self._model = None
         self._model_name = model_name or EMBEDDING_MODEL
-        self._device = device or EMBEDDING_DEVICE or ("cuda" if _cuda_available() else "cpu")
+        raw_device = device or EMBEDDING_DEVICE or ("cuda" if _cuda_available() else "cpu")
+        self._device = raw_device.lower()  # PyTorch 只接受小写设备名（cuda, cpu）
         self._lock = threading.Lock()
 
     def _load_model(self, device: str = None):
         """加载模型到指定设备，失败则降级到 CPU"""
-        target = device or self._device
+        target = (device or self._device).lower()  # PyTorch 只接受小写设备名
         if self._model is not None and self._device == target:
             return
 

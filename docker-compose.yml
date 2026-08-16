@@ -7,7 +7,7 @@ services:
       - "27017:27017"
     volumes:
       - mongodb_data:/data/db
-    restart: unless-stopped
+    restart: "no"
     healthcheck:
       test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
       interval: 10s
@@ -26,6 +26,7 @@ services:
     volumes:
       - E:\milvus\volumes\etcd:/etcd
     command: etcd -advertise-client-urls=http://127.0.0.1:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
+    restart: "no"
     healthcheck:
       test: ["CMD", "etcdctl", "endpoint", "health"]
       interval: 30s
@@ -44,6 +45,7 @@ services:
     volumes:
       - E:\milvus\volumes\minio:/minio_data
     command: minio server /minio_data --console-address ":9001"
+    restart: "no"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
       interval: 30s
@@ -67,6 +69,7 @@ services:
         condition: service_healthy
       milvus-minio:
         condition: service_healthy
+    restart: "no"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
       interval: 30s
@@ -89,7 +92,7 @@ services:
     #         - driver: nvidia
     #           count: 1
     #           capabilities: [gpu]
-    restart: unless-stopped
+    restart: "no"
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:8000/ || exit 1"]
       interval: 15s
@@ -103,7 +106,7 @@ services:
     ports:
       - "8060:8060"
     command: ["uv", "run", "src/server.py"]
-    restart: unless-stopped
+    restart: "no"
 
 volumes:
   mongodb_data:
