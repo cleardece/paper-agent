@@ -137,7 +137,6 @@ class FetcherAgent:
         logger.info(f"[Fetcher] 正在处理论文: {title}...")
 
         # 检查缓存（会话级）
-        from core.cache import cache
         cache_key = f"paper:{arxiv_id}"
         cached = None
         if session_id:
@@ -191,11 +190,17 @@ class FetcherAgent:
             vectors = self.embedder.embed_texts(texts)
             logger.info(f"[Fetcher] Embedding 完成")
 
-            # 同时计算论文级 embedding（标题+摘要），持久化到 MongoDB
+            # 同时计算论文级 embedding（标题+摘要），持久化到 MongoDB + Milvus
             paper_text = f"{paper_meta.get('title', '')} {paper_meta.get('abstract', '')}"
             if paper_text.strip():
                 paper_emb = self.embedder.embed_texts([paper_text])[0]
                 self.mongo.update_paper_status(arxiv_id, "indexed", title_embedding=paper_emb)
+                # 写入 Milvus 论文级 collection（用于 Stage 1 快速排序）
+                self.milvus.insert_paper_embedding(
+                    arxiv_id=arxiv_id,
+                    title=paper_meta.get("title", ""),
+                    embedding=paper_emb,
+                )
         except Exception as e:
             logger.error(f"[Fetcher] Embedding 生成失败: {e}")
             self.mongo.update_paper_status(arxiv_id, "embed_failed")

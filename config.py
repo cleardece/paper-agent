@@ -78,8 +78,8 @@ else:
 logger.info(f"[Hardware] 硬件等级: {HW_TIER}")
 
 # ==================== LLM ====================
-LLM_MODEL = os.getenv("LLM_MODEL", "mimo-v2.5")
-LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://token-plan-cn.xiaomimimo.com/v1")
+LLM_MODEL = os.getenv("LLM_MODEL", "deepseek-v4-flash")
+LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://api.deepseek.com")
 LLM_API_KEY = os.getenv("LLM_API_KEY")
 
 # ==================== Embedding ====================

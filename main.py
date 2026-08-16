@@ -5,6 +5,7 @@ Paper Agent - 主入口
 import asyncio
 from agents.analyzer import AnalyzerAgent
 from agents.critic import CriticAgent
+from agents.direct_analyzer import DirectAnalyzerAgent
 from agents.fetcher import FetcherAgent
 from agents.presenter import PresenterAgent
 from agents.retriever import RetrieverAgent
@@ -34,7 +35,8 @@ def init_components():
         "retriever": RetrieverAgent(embedding_service, milvus_client, mongodb_client),
         "analyzer": AnalyzerAgent(llm, mongodb_client),
         "critic": CriticAgent(llm),
-        "presenter": PresenterAgent(llm, code_generator),  # 这里传进去
+        "presenter": PresenterAgent(llm, code_generator),
+        "direct_analyzer": DirectAnalyzerAgent(llm, mongodb_client, embedding_service, milvus_client, pdf_parser, arxiv_api),
     }
 
     workflow = build_workflow(**agents)
@@ -82,7 +84,7 @@ def main():
         # 构建对话上下文
         context = ""
         if chat_history:
-            recent = chat_history[-20:]  # 最近 10 轮
+            recent = chat_history[-20:]  # 最近 10 轮（每轮 = 用户 + 助手 = 2条）
             context = "\n".join(recent)
 
         state = create_initial_state(query)
@@ -101,5 +103,6 @@ def main():
         else:
             print("\n提示: 未生成回答\n")
 
-    if __name__ == "__main__":
-        main()
+
+if __name__ == "__main__":
+    main()
