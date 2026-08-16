@@ -560,10 +560,18 @@ async def upload_paper(file: UploadFile):
     if existing:
         title = existing.get("title", file.filename)
         status = existing.get("status", "unknown")
-        raise HTTPException(
-            status_code=409,
-            detail=f"论文已存在: {title[:30]}... (状态: {status})"
-        )
+        if status == "parse_failed":
+            # 严格 MinerU 解析失败没有可用向量；允许用户修复环境后直接重传。
+            container.mongodb.delete_paper(arxiv_id)
+            try:
+                container.milvus.delete_by_paper(arxiv_id)
+            except Exception as exc:
+                logger.warning(f"[Upload] 清理失败论文的 Milvus 向量失败: {exc}")
+        else:
+            raise HTTPException(
+                status_code=409,
+                detail=f"论文已存在: {title[:30]}... (状态: {status})"
+            )
 
     # 保存到临时目录
     tmp_dir = "tmp_pdfs"
@@ -587,6 +595,7 @@ async def upload_paper(file: UploadFile):
 async def _process_upload(container, pdf_path, filename, arxiv_id, session_id=None):
     """后台处理上传的 PDF"""
     from core.cache import cache
+    from tools.pdf_parser import MinerUParseError
 
     try:
         # 检查缓存（会话级）
@@ -682,6 +691,15 @@ async def _process_upload(container, pdf_path, filename, arxiv_id, session_id=No
         container.mongodb.update_paper_status(arxiv_id, "indexed")
         logger.info(f"[Upload] 论文处理完成: {filename}")
 
+    except MinerUParseError as e:
+        container.mongodb.upsert_paper({
+            "arxiv_id": arxiv_id,
+            "title": filename,
+            "status": "parse_failed",
+            "parse_error": str(e),
+            "parser_source": "mineru",
+        })
+        logger.error(f"[Upload] MinerU 严格解析失败: {e}", exc_info=True)
     except Exception as e:
         logger.error(f"[Upload] 后台处理失败: {e}", exc_info=True)
 
@@ -699,6 +717,7 @@ async def list_papers():
             "arxiv_id": p.get("arxiv_id", ""),
             "title": p.get("title", ""),
             "status": p.get("status", ""),
+            "parse_error": p.get("parse_error", ""),
         }
         for p in papers
     ]

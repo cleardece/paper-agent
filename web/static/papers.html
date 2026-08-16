@@ -63,6 +63,7 @@
       }
       .paper-status.chunked { background: color-mix(in srgb, var(--success) 15%, transparent); color: var(--success); }
       .paper-status.pending { background: color-mix(in srgb, var(--warning) 15%, transparent); color: var(--warning); }
+      .paper-status.parse_failed { background: color-mix(in srgb, var(--danger) 15%, transparent); color: var(--danger); }
       .paper-actions { display: flex; gap: 8px; }
       .btn-ask {
         background: var(--accent);
@@ -137,7 +138,7 @@
               <div class="paper-title">${escapeHtml(p.title)}</div>
               <div class="paper-meta">
                 ${escapeHtml(p.arxiv_id)}
-                <span class="paper-status ${p.status}">${p.status}</span>
+                <span class="paper-status ${p.status}" title="${escapeHtml(p.parse_error || "")}">${p.status === "parse_failed" ? "解析失败" : p.status}</span>
               </div>
             </div>
             <div class="paper-actions">

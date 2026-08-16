@@ -80,6 +80,7 @@ services:
   mineru-api:
     image: mineru:latest
     container_name: mineru-api
+    profiles: ["parser"]
     ports:
       - "8888:8000"
     entrypoint: ["mineru-api"]
@@ -94,7 +95,7 @@ services:
     #           capabilities: [gpu]
     restart: "no"
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:8000/ || exit 1"]
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
       interval: 15s
       timeout: 10s
       retries: 5
