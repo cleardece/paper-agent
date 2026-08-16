@@ -15,6 +15,21 @@ logger = logging.getLogger("paper-agent")
 CHUNK_COLLECTION = "paper_chunks"
 PAPER_COLLECTION = "paper_embeddings"
 VECTOR_DIM = 1024  # BGE-M3
+_CHUNK_VARCHAR_LIMITS = {
+    "paper_arxiv_id": 64,
+    "content": 8192,
+    "section": 128,
+    "heading": 256,
+}
+
+
+def _truncate_utf8(value: object, max_bytes: int) -> str:
+    """Fit a value into a Milvus VARCHAR field without splitting UTF-8 text."""
+    text = str(value)
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return text
+    return encoded[:max_bytes].decode("utf-8", errors="ignore")
 
 
 class MilvusClient:
@@ -88,7 +103,27 @@ class MilvusClient:
         """批量插入 chunk 向量"""
         if not records:
             return 0
-        result = self.client.insert(collection_name=CHUNK_COLLECTION, data=records)
+        sanitized_records = []
+        for record in records:
+            sanitized = dict(record)
+            for field_name, max_bytes in _CHUNK_VARCHAR_LIMITS.items():
+                if field_name not in sanitized or sanitized[field_name] is None:
+                    continue
+                original = str(sanitized[field_name])
+                value = _truncate_utf8(original, max_bytes)
+                if value != original:
+                    logger.warning(
+                        "[Milvus] 截断 %s 字段以满足 %s 字节 VARCHAR 限制",
+                        field_name,
+                        max_bytes,
+                    )
+                sanitized[field_name] = value
+            sanitized_records.append(sanitized)
+
+        result = self.client.insert(
+            collection_name=CHUNK_COLLECTION,
+            data=sanitized_records,
+        )
         return result["insert_count"]
 
     def search(
