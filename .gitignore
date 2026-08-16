@@ -1,17 +1,38 @@
+# Editors and platform files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Python tooling
 venv/
+.venv/
 __pycache__/
-*.pyc
-.env
+*.py[cod]
 *.egg-info/
 dist/
 build/
-.venv/
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+*.log
+
+# Credentials and local runtime data
+.env
+.local-data/
 milvus_data/
 mongodb_data/
 cache/
 tmp_pdfs/
+uploads/
+models/
+evaluation/cases.local.json
+evaluation/results/
 
-# 本地脚本（不入库）
+# Ad-hoc scripts used only with personal data
 test_local_paper.py
 start.bat
 stop.bat
