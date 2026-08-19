@@ -83,11 +83,9 @@ class DirectAnalyzerAgent:
                 logger.info("[DirectAnalyzer] 论文全文缺失，尝试下载补全...")
                 return self._fetch_and_analyze(query)
 
-            # 补上 Milvus 入库
-            if paper_info.get("status") != "indexed":
-                logger.info("[DirectAnalyzer] 论文未完成向量化，补上入库...")
-                if chunks:
-                    self._index_paper(paper_info["arxiv_id"], None, chunks)
+            # 复核并恢复 Milvus 索引。正文分析不依赖索引恢复成功。
+            if chunks and self.embedder is not None and self.milvus is not None:
+                self._ensure_indexed(paper_info, chunks)
 
             # 动态提取章节 + 分析
             sections = self._parse_sections_from_text(full_text)
@@ -309,14 +307,14 @@ class DirectAnalyzerAgent:
 
     def _index_paper(self, arxiv_id: str, sections: list, existing_chunks: list = None):
         """分块 + embedding + 存 Milvus"""
-        try:
-            if existing_chunks:
-                chunks = existing_chunks
-            else:
+        if existing_chunks:
+            chunks = existing_chunks
+        else:
+            try:
                 chunks = self.parser.chunk(sections)
                 if not chunks:
                     logger.warning(f"[DirectAnalyzer] 分块结果为空: {arxiv_id}")
-                    return
+                    return False
                 mongo_chunks = [
                     {
                         "paper_arxiv_id": arxiv_id,
@@ -328,9 +326,44 @@ class DirectAnalyzerAgent:
                 ]
                 self.mongo.insert_chunks(mongo_chunks)
                 self.mongo.update_paper_status(arxiv_id, "chunked")
+            except Exception as e:
+                logger.error(f"[DirectAnalyzer] 分块入库失败: {e}", exc_info=True)
+                return False
 
+        paper = self.mongo.get_paper(arxiv_id) or {"arxiv_id": arxiv_id, "title": arxiv_id}
+        return self._ensure_indexed(paper, chunks)
+
+    def _ensure_indexed(self, paper: dict, chunks: list[dict]) -> bool:
+        """从已有 chunks 恢复完整索引，避免残缺或重复的 Milvus 记录。"""
+        arxiv_id = paper["arxiv_id"]
+        expected_chunk_count = len(chunks)
+        try:
+            current_chunk_count = self.milvus.count(arxiv_id)
+            current_paper_count = self.milvus.count_paper_embeddings(arxiv_id)
+        except Exception as e:
+            logger.error(f"[DirectAnalyzer] 无法检查索引状态: {e}", exc_info=True)
+            self.mongo.update_paper_status(arxiv_id, "milvus_failed")
+            return False
+
+        if (
+            paper.get("status") == "indexed"
+            and current_chunk_count == expected_chunk_count
+            and current_paper_count == 1
+        ):
+            return True
+
+        try:
+            self.milvus.delete_by_paper(arxiv_id)
+        except Exception as e:
+            logger.error(f"[DirectAnalyzer] 清理残缺向量失败: {e}", exc_info=True)
+            self.mongo.update_paper_status(arxiv_id, "milvus_failed")
+            return False
+
+        try:
             texts = [c["content"] for c in chunks]
             vectors = self.embedder.embed_texts(texts)
+            paper_text = f"{paper.get('title', '')} {paper.get('abstract', '')}".strip()
+            paper_embedding = self.embedder.embed_texts([paper_text])[0] if paper_text else None
 
             # 释放 GPU 显存
             try:
@@ -339,7 +372,12 @@ class DirectAnalyzerAgent:
                     torch.cuda.empty_cache()
             except ImportError:
                 pass
+        except Exception as e:
+            logger.error(f"[DirectAnalyzer] Embedding 生成失败: {e}", exc_info=True)
+            self.mongo.update_paper_status(arxiv_id, "embedding_failed")
+            return False
 
+        try:
             milvus_records = [
                 {
                     "paper_arxiv_id": arxiv_id,
@@ -353,11 +391,20 @@ class DirectAnalyzerAgent:
                 for i, c in enumerate(chunks)
             ]
             self.milvus.insert(milvus_records)
+            if paper_embedding is not None:
+                self.milvus.insert_paper_embedding(
+                    arxiv_id,
+                    paper.get("title", arxiv_id),
+                    paper_embedding,
+                )
             self.mongo.update_paper_status(arxiv_id, "indexed")
-            logger.info(f"[DirectAnalyzer] 入库完成: {len(chunks)} 个分块")
+            logger.info(f"[DirectAnalyzer] 索引恢复完成: {len(chunks)} 个分块")
+            return True
 
         except Exception as e:
-            logger.error(f"[DirectAnalyzer] 入库失败: {e}", exc_info=True)
+            logger.error(f"[DirectAnalyzer] Milvus 写入失败: {e}", exc_info=True)
+            self.mongo.update_paper_status(arxiv_id, "milvus_failed")
+            return False
 
     def _analyze(self, paper_info: dict, core_text: str, query: str = ""):
         """核心章节喂 LLM 分析"""

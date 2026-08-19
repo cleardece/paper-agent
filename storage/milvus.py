@@ -201,6 +201,15 @@ class MilvusClient:
         stats = self.client.get_collection_stats(CHUNK_COLLECTION)
         return int(stats["row_count"])
 
+    def count_paper_embeddings(self, arxiv_id: str) -> int:
+        """返回某论文的论文级向量数量，用于检测未完成或重复的索引。"""
+        results = self.client.query(
+            collection_name=PAPER_COLLECTION,
+            filter=f'paper_arxiv_id == "{arxiv_id}"',
+            output_fields=["id"],
+        )
+        return len(results)
+
     # ==================== 论文级向量操作 ====================
 
     def insert_paper_embedding(self, arxiv_id: str, title: str, embedding: list[float]):
