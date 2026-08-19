@@ -67,16 +67,15 @@ class SupervisorAgent:
         ]
         return any(p in query for p in followup_patterns)
 
-    def _extract_paper_from_context(self, query: str, context: str) -> str:
-        """从对话上下文中提取最近讨论的论文标题"""
-        if not context:
-            return None
-
-        # 从上下文中提取英文标题（大写开头的连续词组）
-        titles = re.findall(r'[A-Z][a-zA-Z\s\-:]{5,80}', context)
-        if titles:
-            return titles[-1].strip()
-        return None
+    @staticmethod
+    def _has_explicit_paper_reference(query: str) -> bool:
+        """判断用户是否明确给出新的论文标识，而不是仅在追问当前焦点。"""
+        if re.search(r'(arxiv\.org|\d{4}\.\d{4,5}(?:v\d+)?)', query, re.IGNORECASE):
+            return True
+        if re.search(r'["“][^"”]{8,}["”]', query):
+            return True
+        english_keywords = [kw for kw in re.findall(r'[a-zA-Z]{3,}', query) if len(kw) > 3]
+        return len(english_keywords) >= 5
 
     def _check_paper_exists(self, query: str) -> bool:
         """检查知识库中是否有与查询相关的论文"""
@@ -121,6 +120,27 @@ class SupervisorAgent:
                 "error": None,
                 "target_paper": None,
                 "target_paper_id": target_paper_id,
+            }
+
+        is_followup = self._is_followup_query(query)
+        if is_followup and not self._has_explicit_paper_reference(query):
+            active_paper_ids = state.get("active_paper_ids") or []
+            if len(active_paper_ids) == 1:
+                logger.info(f"[Supervisor] 使用会话论文焦点: {active_paper_ids[0]}")
+                return {
+                    "next_agent": "direct",
+                    "search_query": query,
+                    "error": None,
+                    "target_paper": None,
+                    "target_paper_id": active_paper_ids[0],
+                }
+            logger.info("[Supervisor] 跟随问题没有唯一论文焦点，路由到知识库检索")
+            return {
+                "next_agent": "retriever",
+                "search_query": query,
+                "error": None,
+                "target_paper": None,
+                "target_paper_id": None,
             }
 
         # 构建带对话上下文的输入
@@ -183,30 +203,17 @@ class SupervisorAgent:
         if next_agent == "direct" and not search_query:
             search_query = query
 
-        # 提取目标论文（跟随意图时）
+        # 仅对明确给出的论文标题构建 target_paper；省略追问已在上方由稳定 ID 处理。
         target_paper = None
-        is_followup = self._is_followup_query(query)
         logger.info(f"[Supervisor] is_followup={is_followup}, query={query[:30]}")
 
         # 检查查询中是否包含具体论文标题（英文关键词 >= 5 个）
         english_keywords = [kw for kw in re.findall(r'[a-zA-Z]{3,}', query) if len(kw) > 3]
         has_explicit_title = len(english_keywords) >= 5
 
-        if is_followup:
-            context = state.get("conversation_context", "")
-            logger.info(f"[Supervisor] context={repr(context[:50] if context else '')}, next_agent={next_agent}")
-            target_paper = self._extract_paper_from_context(query, context)
-            if target_paper:
-                logger.info(f"[Supervisor] 识别到目标论文: {target_paper[:50]}")
-            elif not context and not has_explicit_title:
-                # 新对话 + 跟随意图 + 没有具体标题 → 走 retriever
-                if next_agent == "direct":
-                    logger.info("[Supervisor] 新对话无上下文且无具体标题，跟随意图改走 retriever")
-                    next_agent = "retriever"
-            elif not context and has_explicit_title:
-                # 新对话 + 有具体标题 → 走 direct，用标题作为 target_paper
-                target_paper = " ".join(english_keywords[:8])
-                logger.info(f"[Supervisor] 有具体标题，提取为: {target_paper[:50]}")
+        if is_followup and has_explicit_title:
+            target_paper = " ".join(english_keywords[:8])
+            logger.info(f"[Supervisor] 有明确论文标题，提取为: {target_paper[:50]}")
 
         logger.info(f"[Supervisor] 路由: {next_agent}, 搜索词: {search_query}")
 

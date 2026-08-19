@@ -90,7 +90,9 @@ class DirectAnalyzerAgent:
             # 动态提取章节 + 分析
             sections = self._parse_sections_from_text(full_text)
             core_text = self._extract_relevant_sections(query, sections)
-            return self._analyze(paper_info, core_text, query)
+            result = self._analyze(paper_info, core_text, query)
+            result.setdefault("resolved_paper_id", paper_info["arxiv_id"])
+            return result
 
         # 2. 库中没有 → 下载 + 解析 + 分析 + 后台入库
         logger.info("[DirectAnalyzer] 知识库中未找到，开始下载论文...")

@@ -939,6 +939,7 @@ async def chat(request: ChatRequest) -> StreamingResponse:
         yield f"event: session\ndata: {json.dumps({'session_id': session.id}, ensure_ascii=False)}\n\n"
         answer = None
         evidence_report = None
+        resolved_paper_id = None
         try:
             logger.info("[Chat] 开始构建 workflow...")
             workflow = build_traced_workflow(session)
@@ -975,6 +976,8 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                                 final_result = node_output
                             if isinstance(node_output, dict) and node_output.get("evidence_report"):
                                 evidence_report = node_output["evidence_report"]
+                            if isinstance(node_output, dict) and node_output.get("resolved_paper_id"):
+                                resolved_paper_id = node_output["resolved_paper_id"]
                             # Agent 状态已通过 wrap_agent → WebSocket 推送，无需重复
 
             if final_result:
@@ -1005,6 +1008,17 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                 evidence_report=evidence_report,
             )
         )
+        if resolved_paper_id:
+            session.active_paper_ids = [resolved_paper_id]
+            session.active_task = request.message[:500]
+            if not session.open_questions or session.open_questions[-1] != request.message:
+                session.open_questions.append(request.message[:500])
+                session.open_questions = session.open_questions[-10:]
+        elif request.target_paper_id and "selected_paper_not_found" in str(answer):
+            session.active_paper_ids = [
+                paper_id for paper_id in session.active_paper_ids
+                if paper_id != request.target_paper_id
+            ]
         session.updated_at = time.time()
         save_session_to_db(session)
 
