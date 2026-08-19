@@ -50,8 +50,8 @@
 
 ## 验收标准
 
-- 点击 MMC 论文的“分析”后，日志和回答引用同一个 `arxiv_id`，不会选择 Ultra Fast Silicon 论文。
-- 已有 53 个 chunks 的 MMC 论文不触发 PDF 下载。
-- `chunked` 论文在补索引成功后变为 `indexed`；失败时保留 chunks 和明确失败状态。
-- 手动模糊提问不再因为一个公共英文词关联到无关论文。
-- 现有 `indexed` 论文仍可正常直接分析。
+- 从论文库点击任意论文的“分析”后，日志、分析内容和索引操作始终使用该按钮携带的同一 `arxiv_id`，不会选择其他论文。
+- 任意已有 chunks 的论文，无论状态为 `chunked`、`indexed`、`embedding_failed` 或 `milvus_failed`，都不触发 PDF 下载，并可基于已有 chunks 进行单篇分析。
+- `chunked` 或可恢复失败状态的论文在补索引成功后变为 `indexed`；失败时保留 chunks 与明确失败状态。
+- 无稳定 ID 的手动模糊提问不再因为一个公共英文词关联到无关论文。
+- 已有 `indexed` 论文保持可直接分析，且不会重复写入向量。
