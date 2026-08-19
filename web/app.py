@@ -30,6 +30,11 @@ from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel
 
 from config import get_llm
+from core.conversation_context import (
+    build_conversation_context,
+    needs_summary_refresh,
+    refresh_summary,
+)
 from state.graph_state import AgentState
 
 
@@ -70,6 +75,7 @@ class Session:
     open_questions: list[str] = field(default_factory=list)
     conversation_summary: str = ""
     summary_through_message_count: int = 0
+    summary_refresh_inflight: bool = False
 
 
 class ConnectionManager:
@@ -172,6 +178,34 @@ def save_session_to_db(session: Session):
         logger.info(f"[Session] 已保存 Session: {session.id[:20]}...")
     except Exception as e:
         logger.error(f"[Session] 保存 Session 失败: {e}")
+
+
+async def refresh_session_context(session: Session) -> None:
+    """Best-effort refresh that never delays or changes an answer SSE stream."""
+    if session.summary_refresh_inflight or not needs_summary_refresh(
+        len(session.messages), session.summary_through_message_count
+    ):
+        return
+
+    session.summary_refresh_inflight = True
+    try:
+        from core.deps import get_container
+
+        summary = await asyncio.to_thread(
+            refresh_summary,
+            get_container().llm,
+            session.conversation_summary,
+            list(session.messages),
+        )
+        if summary != session.conversation_summary:
+            session.conversation_summary = summary
+        session.summary_through_message_count = len(session.messages)
+        session.updated_at = time.time()
+        save_session_to_db(session)
+    except Exception as exc:
+        logger.warning(f"[Session] 更新对话摘要失败: {exc}")
+    finally:
+        session.summary_refresh_inflight = False
 
 
 def summarize(value: Any, limit: int = 220) -> str:
@@ -318,14 +352,12 @@ def create_web_initial_state(
     # 构建对话上下文摘要，帮助 Supervisor 理解跟随意图
     # 注意：排除当前消息（最后一条 user 消息），只传历史对话
     context_summary = ""
-    if session and len(session.messages) > 1:
-        # 取最近 10 轮对话，排除最后一条（当前消息）
-        recent = session.messages[-21:-1]  # 倒数第21到倒数第2条
-        context_lines = []
-        for msg in recent:
-            role_label = "用户" if msg.role == "user" else "助手"
-            context_lines.append(f"{role_label}: {msg.content[:150]}")
-        context_summary = "\n".join(context_lines)
+    if session:
+        # chat() 已先放入当前用户消息，因此这里只保留历史消息。
+        context_summary = build_conversation_context(
+            session.conversation_summary,
+            session.messages[:-1],
+        )
 
     return {
         "user_query": query,
@@ -1021,6 +1053,7 @@ async def chat(request: ChatRequest) -> StreamingResponse:
             ]
         session.updated_at = time.time()
         save_session_to_db(session)
+        asyncio.create_task(refresh_session_context(session))
 
         yield f"event: done\ndata: {json.dumps({'timeline': timeline, 'evidence_report': evidence_report}, ensure_ascii=False)}\n\n"
 
