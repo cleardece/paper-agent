@@ -61,6 +61,7 @@ class AgentState(TypedDict):
     # 对话上下文
     conversation_context: Optional[str]     # 最近对话摘要（帮助理解跟随意图）
     target_paper: Optional[str]             # 用户指代的论文标题（跟随意图用）
+    target_paper_id: Optional[str]          # 论文库显式选择的稳定 arXiv/本地论文 ID
 
     # 错误处理
     error: Optional[str]

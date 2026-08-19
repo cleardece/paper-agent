@@ -142,7 +142,7 @@
               </div>
             </div>
             <div class="paper-actions">
-              <button class="btn-ask" onclick="askAbout('${escapeHtml(p.title.replace(/'/g, "\\'"))}')">提问</button>
+              <button class="btn-ask" onclick="askAbout('${escapeHtml(p.title.replace(/'/g, "\\'"))}', '${escapeHtml(p.arxiv_id)}')">提问</button>
               <button class="btn-delete" onclick="deletePaper('${p.arxiv_id}')">删除</button>
             </div>
           </div>
@@ -159,9 +159,10 @@
         loadPapers();
       }
 
-      function askAbout(title) {
+      function askAbout(title, arxivId) {
         // 存入 localStorage，由 app.js 在首页加载时取出并自动发送
         localStorage.setItem("pendingPaperQuestion", `关于"${title}"这篇论文，帮我分析一下`);
+        localStorage.setItem("pendingPaperId", arxivId);
         window.location.href = "/";
       }
 

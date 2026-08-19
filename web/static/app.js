@@ -225,7 +225,7 @@ async function loadSession(sessionId) {
   await loadSessions();
 }
 
-async function sendMessage(text) {
+async function sendMessage(text, targetPaperId = null) {
   sendButton.disabled = true;
   if (!currentSessionId) {
     currentSessionId = crypto.randomUUID();
@@ -242,7 +242,11 @@ async function sendMessage(text) {
     const response = await fetch("/api/chat", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message: text, session_id: currentSessionId }),
+      body: JSON.stringify({
+        message: text,
+        session_id: currentSessionId,
+        target_paper_id: targetPaperId,
+      }),
     });
     if (!response.ok || !response.body) {
       throw new Error(`请求失败 (${response.status})`);
@@ -333,9 +337,11 @@ loadSessions();
 // 从论文库页面跳转回来时，自动填充并发送提问
 const pendingQuestion = localStorage.getItem("pendingPaperQuestion");
 if (pendingQuestion) {
+  const pendingPaperId = localStorage.getItem("pendingPaperId");
   localStorage.removeItem("pendingPaperQuestion");
+  localStorage.removeItem("pendingPaperId");
   // 等 DOM 和 session 就绪后自动发送
-  setTimeout(() => sendMessage(pendingQuestion), 300);
+  setTimeout(() => sendMessage(pendingQuestion, pendingPaperId), 300);
 }
 
 // ========== 论文上传 ==========

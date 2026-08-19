@@ -42,6 +42,7 @@ DIRECT_FLOW = ("supervisor", "direct_analyzer")
 class ChatRequest(BaseModel):
     message: str
     session_id: str | None = None
+    target_paper_id: str | None = None
 
 
 @dataclass
@@ -285,7 +286,11 @@ def agent_done_detail(name: str, result: dict[str, Any]) -> str:
     return "已完成"
 
 
-def create_web_initial_state(query: str, session: Session = None) -> AgentState:
+def create_web_initial_state(
+    query: str,
+    session: Session = None,
+    target_paper_id: str | None = None,
+) -> AgentState:
     # 构建对话上下文摘要，帮助 Supervisor 理解跟随意图
     # 注意：排除当前消息（最后一条 user 消息），只传历史对话
     context_summary = ""
@@ -314,6 +319,7 @@ def create_web_initial_state(query: str, session: Session = None) -> AgentState:
         "error": None,
         "conversation_context": context_summary,
         "target_paper": None,
+        "target_paper_id": target_paper_id,
         "session_id": session.id if session else None,
     }
 
@@ -906,7 +912,11 @@ async def chat(request: ChatRequest) -> StreamingResponse:
         try:
             logger.info("[Chat] 开始构建 workflow...")
             workflow = build_traced_workflow(session)
-            state = create_web_initial_state(request.message, session)
+            state = create_web_initial_state(
+                request.message,
+                session,
+                target_paper_id=request.target_paper_id,
+            )
             logger.info(f"[Chat] 开始执行 workflow，查询: {request.message[:50]}...")
 
             # 同时获取 LLM token（messages）和节点输出（updates）
