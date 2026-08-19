@@ -49,6 +49,7 @@ class ChatRequest(BaseModel):
 class ChatMessage:
     role: str
     content: str
+    id: str = field(default_factory=lambda: uuid4().hex)
     created_at: float = field(default_factory=time.time)
     timeline: list[dict[str, Any]] = field(default_factory=list)
     evidence_report: dict[str, Any] | None = None
@@ -58,10 +59,17 @@ class ChatMessage:
 class Session:
     id: str
     title: str
+    user_id: str = "local-user"
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
     messages: list[ChatMessage] = field(default_factory=list)
     events: list[dict[str, Any]] = field(default_factory=list)
+    active_paper_ids: list[str] = field(default_factory=list)
+    active_section: str | None = None
+    active_task: str | None = None
+    open_questions: list[str] = field(default_factory=list)
+    conversation_summary: str = ""
+    summary_through_message_count: int = 0
 
 
 class ConnectionManager:
@@ -106,8 +114,15 @@ def load_session_from_db(session_id: str) -> Session | None:
     session = Session(
         id=doc["session_id"],
         title=doc.get("title", ""),
+        user_id=doc.get("user_id", "local-user"),
         created_at=doc.get("created_at", time.time()),
         updated_at=doc.get("updated_at", time.time()),
+        active_paper_ids=doc.get("active_paper_ids", []),
+        active_section=doc.get("active_section"),
+        active_task=doc.get("active_task"),
+        open_questions=doc.get("open_questions", []),
+        conversation_summary=doc.get("conversation_summary", ""),
+        summary_through_message_count=doc.get("summary_through_message_count", 0),
     )
 
     # 加载消息
@@ -116,6 +131,7 @@ def load_session_from_db(session_id: str) -> Session | None:
         session.messages.append(ChatMessage(
             role=msg.get("role", ""),
             content=msg.get("content", ""),
+            id=msg.get("id", uuid4().hex),
             created_at=msg.get("created_at", time.time()),
             timeline=msg.get("timeline", []),
             evidence_report=msg.get("evidence_report"),
@@ -133,6 +149,7 @@ def save_session_to_db(session: Session):
             {
                 "role": msg.role,
                 "content": msg.content,
+                "id": msg.id,
                 "created_at": msg.created_at,
                 "timeline": msg.timeline,
                 "evidence_report": msg.evidence_report,
@@ -144,6 +161,13 @@ def save_session_to_db(session: Session):
             title=session.title,
             messages=messages_data,
             updated_at=session.updated_at,
+            user_id=session.user_id,
+            active_paper_ids=session.active_paper_ids,
+            active_section=session.active_section,
+            active_task=session.active_task,
+            open_questions=session.open_questions,
+            conversation_summary=session.conversation_summary,
+            summary_through_message_count=session.summary_through_message_count,
         )
         logger.info(f"[Session] 已保存 Session: {session.id[:20]}...")
     except Exception as e:
@@ -318,9 +342,15 @@ def create_web_initial_state(
         "max_iterations": 1,
         "error": None,
         "conversation_context": context_summary,
+        "conversation_summary": session.conversation_summary if session else "",
         "target_paper": None,
         "target_paper_id": target_paper_id,
         "session_id": session.id if session else None,
+        "user_id": session.user_id if session else "local-user",
+        "active_paper_ids": list(session.active_paper_ids) if session else [],
+        "active_section": session.active_section if session else None,
+        "active_task": session.active_task if session else None,
+        "open_questions": list(session.open_questions) if session else [],
     }
 
 

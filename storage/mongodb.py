@@ -145,19 +145,29 @@ class MongoDBClient:
 
     # ==================== Session 持久化 ====================
 
-    def save_session(self, session_id: str, title: str, messages: list[dict] = None, updated_at: float = None):
+    def save_session(
+        self,
+        session_id: str,
+        title: str,
+        messages: list[dict] = None,
+        updated_at: float = None,
+        **session_fields,
+    ):
         """保存 Session 到 MongoDB"""
         doc = {
             "session_id": session_id,
             "title": title,
             "updated_at": updated_at or datetime.now(timezone.utc).timestamp(),
-            "created_at": datetime.now(timezone.utc),
+            **session_fields,
         }
-        if messages:
+        if messages is not None:
             doc["messages"] = messages
         self.db["sessions"].update_one(
             {"session_id": session_id},
-            {"$set": doc},
+            {
+                "$set": doc,
+                "$setOnInsert": {"created_at": datetime.now(timezone.utc)},
+            },
             upsert=True,
         )
 
