@@ -49,22 +49,43 @@ class DirectAnalyzerAgent:
     def invoke(self, state: AgentState) -> dict:
         query = state["user_query"]
         target_paper = state.get("target_paper")
+        target_paper_id = state.get("target_paper_id")
         logger.info(f"[DirectAnalyzer] 开始分析: {query[:50]}...")
 
         # 1. 尝试从知识库找到论文
-        paper_info = self._find_paper(query, target_paper)
+        if target_paper_id:
+            paper_info = self.mongo.get_paper(target_paper_id)
+            if not paper_info:
+                logger.warning(f"[DirectAnalyzer] 论文库选择不存在: {target_paper_id}")
+                return {
+                    "answer": "所选论文已不存在，请从论文库重新选择。",
+                    "error": "selected_paper_not_found",
+                }
+            logger.info(
+                f"[DirectAnalyzer] 使用论文库显式选择: "
+                f"{paper_info.get('arxiv_id', target_paper_id)}"
+            )
+        else:
+            paper_info = self._find_paper(query, target_paper)
 
         if paper_info:
             logger.info(f"[DirectAnalyzer] 知识库中找到论文: {paper_info['title'][:50]}")
             full_text = paper_info.get("full_text", "")
+            chunks = list(self.mongo.get_chunks_by_paper(paper_info["arxiv_id"]))
+            if not full_text and chunks:
+                full_text = self._chunks_to_full_text(chunks)
             if not full_text:
+                if target_paper_id:
+                    return {
+                        "answer": "所选论文没有可用正文片段，无法分析。",
+                        "error": "selected_paper_has_no_content",
+                    }
                 logger.info("[DirectAnalyzer] 论文全文缺失，尝试下载补全...")
                 return self._fetch_and_analyze(query)
 
             # 补上 Milvus 入库
             if paper_info.get("status") != "indexed":
                 logger.info("[DirectAnalyzer] 论文未完成向量化，补上入库...")
-                chunks = list(self.mongo.get_chunks_by_paper(paper_info["arxiv_id"]))
                 if chunks:
                     self._index_paper(paper_info["arxiv_id"], None, chunks)
 
@@ -87,36 +108,43 @@ class DirectAnalyzerAgent:
             if not papers:
                 return None
 
-            # 优先用 target_paper 匹配
+            candidates = []
             if target_paper:
-                target_lower = target_paper.lower()
+                candidates.append(target_paper)
+            candidates.extend(re.findall(r'["“]([^"”]{8,})["”]', query))
+
+            for candidate in candidates:
+                normalized = self._normalize_title(candidate)
+                if not normalized:
+                    continue
                 for paper in papers:
-                    title = paper.get("title", "").lower()
-                    if any(kw in title for kw in target_lower.split() if len(kw) > 3):
-                        logger.info(f"[DirectAnalyzer] 通过 target_paper 匹配: {paper.get('title', '')[:50]}")
+                    if normalized == self._normalize_title(paper.get("title", "")):
+                        logger.info(
+                            f"[DirectAnalyzer] 通过精确标题匹配: "
+                            f"{paper.get('title', '')[:50]}"
+                        )
                         return paper
-
-            # 用查询关键词匹配
-            query_lower = query.lower()
-            keywords = [kw for kw in re.findall(r'[a-zA-Z]{3,}', query_lower) if len(kw) > 3]
-            if not keywords:
-                return None
-
-            best_match = None
-            best_score = 0
-            for paper in papers:
-                title = paper.get("title", "").lower()
-                matched = sum(1 for kw in keywords if kw in title)
-                if matched > best_score:
-                    best_score = matched
-                    best_match = paper
-
-            if best_score >= 1:
-                return best_match
             return None
         except Exception as e:
             logger.warning(f"[DirectAnalyzer] 查找论文失败: {e}")
             return None
+
+    @staticmethod
+    def _normalize_title(title: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "", title.lower())
+
+    @staticmethod
+    def _chunks_to_full_text(chunks: list[dict]) -> str:
+        """将 MongoDB 中按序保存的 chunks 组合为可供单篇分析的正文。"""
+        parts = []
+        for chunk in sorted(chunks, key=lambda item: item.get("chunk_index", 0)):
+            content = str(chunk.get("content", "")).strip()
+            if not content:
+                continue
+            metadata = chunk.get("metadata") or {}
+            section = str(metadata.get("section") or "Content").strip()
+            parts.append(f"# {section}\n{content}")
+        return "\n\n".join(parts)
 
     def _fetch_and_analyze(self, query: str):
         """下载论文 → 解析 → 动态提取章节 → 分析 + 后台入库"""

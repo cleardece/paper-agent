@@ -70,14 +70,6 @@ class SupervisorAgent:
     def _extract_paper_from_context(self, query: str, context: str) -> str:
         """从对话上下文中提取最近讨论的论文标题"""
         if not context:
-            # 没有上下文，从知识库取最近的论文
-            if self.mongo:
-                try:
-                    papers = self.mongo.list_papers(limit=3, projection={"title": 1})
-                    if papers:
-                        return papers[-1].get("title", "")
-                except Exception:
-                    pass
             return None
 
         # 从上下文中提取英文标题（大写开头的连续词组）
@@ -119,6 +111,17 @@ class SupervisorAgent:
     def invoke(self, state: AgentState) -> dict:
         query = state["user_query"]
         logger.info(f"[Supervisor] 收到查询: {query[:50]}...")
+
+        target_paper_id = state.get("target_paper_id")
+        if target_paper_id:
+            logger.info(f"[Supervisor] 使用论文库显式选择: {target_paper_id}")
+            return {
+                "next_agent": "direct",
+                "search_query": query,
+                "error": None,
+                "target_paper": None,
+                "target_paper_id": target_paper_id,
+            }
 
         # 构建带对话上下文的输入
         context = state.get("conversation_context", "")
