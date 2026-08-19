@@ -378,6 +378,7 @@ def create_web_initial_state(
     query: str,
     session: Session = None,
     target_paper_id: str | None = None,
+    research_profile_context: dict[str, Any] | None = None,
 ) -> AgentState:
     # 构建对话上下文摘要，帮助 Supervisor 理解跟随意图
     # 注意：排除当前消息（最后一条 user 消息），只传历史对话
@@ -405,6 +406,7 @@ def create_web_initial_state(
         "error": None,
         "conversation_context": context_summary,
         "conversation_summary": session.conversation_summary if session else "",
+        "research_profile_context": research_profile_context,
         "target_paper": None,
         "target_paper_id": target_paper_id,
         "session_id": session.id if session else None,
@@ -962,6 +964,14 @@ async def get_session(session_id: str) -> dict[str, Any]:
     return serialize_session(session, include_messages=True)
 
 
+@app.get("/api/research-profile/{user_id}")
+async def get_research_profile(user_id: str) -> dict[str, Any]:
+    """Return user-controlled research context; it is never paper evidence."""
+    from core.deps import get_container
+
+    return get_container().research_memory.get_profile(user_id)
+
+
 @app.delete("/api/sessions/{session_id}")
 async def delete_session(session_id: str) -> dict[str, str]:
     """删除单个 Session 及其缓存"""
@@ -1007,10 +1017,14 @@ async def chat(request: ChatRequest) -> StreamingResponse:
         try:
             logger.info("[Chat] 开始构建 workflow...")
             workflow = build_traced_workflow(session)
+            from core.deps import get_container
+
+            research_profile = get_container().research_memory.get_profile(session.user_id)
             state = create_web_initial_state(
                 request.message,
                 session,
                 target_paper_id=request.target_paper_id,
+                research_profile_context=research_profile,
             )
             logger.info(f"[Chat] 开始执行 workflow，查询: {request.message[:50]}...")
 

@@ -61,6 +61,7 @@ class AgentState(TypedDict):
     # 对话上下文
     conversation_context: Optional[str]     # 最近对话摘要（帮助理解跟随意图）
     conversation_summary: Optional[str]     # 较早对话的滚动摘要（不作为论文证据）
+    research_profile_context: Optional[dict]  # 用户研究档案，仅用于理解意图，不作论文证据
     target_paper: Optional[str]             # 用户指代的论文标题（跟随意图用）
     target_paper_id: Optional[str]          # 论文库显式选择的稳定 arXiv/本地论文 ID
     active_paper_ids: list[str]             # 会话当前论文焦点，供追问消解使用

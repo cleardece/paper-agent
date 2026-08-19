@@ -145,10 +145,17 @@ class SupervisorAgent:
 
         # 构建带对话上下文的输入
         context = state.get("conversation_context", "")
+        profile = state.get("research_profile_context") or {}
+        profile_context = ""
+        if profile:
+            profile_context = (
+                "## 用户研究档案（仅用于理解用户意图，不是论文事实或引用来源）\n"
+                f"{json.dumps(profile, ensure_ascii=False, default=str)}\n\n"
+            )
         if context:
-            user_input = f"## 对话上下文\n{context}\n\n## 当前用户输入\n{query}"
+            user_input = f"{profile_context}## 对话上下文\n{context}\n\n## 当前用户输入\n{query}"
         else:
-            user_input = f"用户输入：{query}"
+            user_input = f"{profile_context}用户输入：{query}"
 
         messages = [
             SystemMessage(content=SUPERVISOR_PROMPT),
