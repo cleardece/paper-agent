@@ -19,6 +19,7 @@ from config import (
     get_llm,
 )
 from storage.mongodb import MongoDBClient
+from storage.research_memory import ResearchMemoryService
 from storage.milvus import MilvusClient
 from tools.embeddings import EmbeddingService
 from tools.pdf_parser import PDFParser
@@ -128,6 +129,7 @@ class ServiceContainer:
         self.mongodb.memory.llm = self.llm
         self.mongodb.memory.kg = self.knowledge_graph
         self.mongodb.user_memory.llm = self.llm
+        self.research_memory = ResearchMemoryService(self.mongodb.db, self.llm)
 
         self.code_generator = CodeGenerator(self.llm)
 

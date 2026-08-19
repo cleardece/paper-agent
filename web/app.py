@@ -208,6 +208,36 @@ async def refresh_session_context(session: Session) -> None:
         session.summary_refresh_inflight = False
 
 
+async def update_research_memory(session: Session, user_message: ChatMessage) -> None:
+    """Silently extract profile updates after an answer without affecting chat."""
+    try:
+        from core.deps import get_container
+
+        research_memory = get_container().research_memory
+        focus = {
+            "active_paper_ids": session.active_paper_ids,
+            "active_section": session.active_section,
+            "active_task": session.active_task,
+            "open_questions": session.open_questions,
+        }
+        updates = await asyncio.to_thread(
+            research_memory.extract_updates,
+            user_message.content,
+            session.conversation_summary,
+            focus,
+        )
+        if updates:
+            await asyncio.to_thread(
+                research_memory.apply_updates,
+                session.user_id,
+                updates,
+                session.id,
+                [user_message.id],
+            )
+    except Exception as exc:
+        logger.warning(f"[ResearchMemory] 更新失败，已跳过本轮: {exc}")
+
+
 def summarize(value: Any, limit: int = 220) -> str:
     if value is None:
         return ""
@@ -509,6 +539,7 @@ def serialize_session(session: Session, include_messages: bool = False) -> dict[
             {
                 "role": msg.role,
                 "content": msg.content,
+                "id": msg.id,
                 "created_at": msg.created_at,
                 "timeline": msg.timeline,
                 "evidence_report": msg.evidence_report,
@@ -963,7 +994,8 @@ async def chat(request: ChatRequest) -> StreamingResponse:
     session = get_or_create_session(request.session_id, request.message)
     session.updated_at = time.time()
     session.events = []
-    session.messages.append(ChatMessage(role="user", content=request.message))
+    user_message = ChatMessage(role="user", content=request.message)
+    session.messages.append(user_message)
     # 持久化用户消息
     save_session_to_db(session)
 
@@ -1054,6 +1086,7 @@ async def chat(request: ChatRequest) -> StreamingResponse:
         session.updated_at = time.time()
         save_session_to_db(session)
         asyncio.create_task(refresh_session_context(session))
+        asyncio.create_task(update_research_memory(session, user_message))
 
         yield f"event: done\ndata: {json.dumps({'timeline': timeline, 'evidence_report': evidence_report}, ensure_ascii=False)}\n\n"
 
