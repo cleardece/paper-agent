@@ -125,6 +125,14 @@ MINERU_CPU_LIMIT=
 
 `MINERU_MEMORY_LIMIT` 与 `MINERU_CPU_LIMIT` 都是可选的本机设置，例如 `MINERU_MEMORY_LIMIT=8g`、`MINERU_CPU_LIMIT=2.0`。留空表示不施加固定限制，避免开源项目假设所有用户有相同硬件。限制触发或 MinerU 出错时，默认严格模式会把论文标记为 `parse_failed`，不会静默用 pdfplumber 的普通解析结果入库；修复环境后可直接重新上传。
 
+## 论文入库状态
+
+- `chunked`：PDF 已解析，正文片段已保存到 MongoDB；可以直接进行单篇分析。系统会在需要时对已有 chunks 补索引，不会重新下载 PDF。
+- `indexed`：chunk 向量和论文级向量都已写入 Milvus，可参与语义检索和跨论文问答。
+- `embedding_failed` / `milvus_failed`：原始 chunks 被保留；后续从论文库分析时会尝试补索引。失败不会被伪装成 `indexed`。
+
+论文库的“提问”会携带所选论文的稳定 ID，因此分析和补索引只会针对被点击的那篇论文，不按标题中的单个英文词猜测其他论文。
+
 ## Git 约定
 
 - 使用 Conventional Commit 前缀：`feat:`、`fix:`、`test:`、`docs:`、`chore:`；
