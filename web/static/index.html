@@ -12,8 +12,13 @@
       <p class="sidebar-caption">可追溯的研究工作台</p>
       <button id="newChat" class="new-chat">+ 新建对话</button>
       <button id="uploadBtn" class="upload-btn">上传本地 PDF</button>
-      <input type="file" id="fileInput" accept=".pdf" style="display:none">
-      <div id="uploadStatus" class="upload-status" style="display:none"></div>
+        <input type="file" id="fileInput" accept=".pdf" multiple style="display:none">
+        <div id="uploadStatus" class="upload-status" style="display:none"></div>
+        <details id="uploadBatchPanel" class="upload-batch-panel" style="display:none">
+          <summary>本批上传</summary>
+          <div id="uploadBatchSummary" class="upload-batch-summary"></div>
+          <div id="uploadBatchJobs" class="upload-batch-jobs"></div>
+        </details>
       <a href="/papers" class="library-link">浏览论文库</a>
       <div id="sessions" class="sessions"></div>
     </aside>

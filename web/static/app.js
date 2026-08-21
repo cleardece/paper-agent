@@ -348,26 +348,59 @@ if (pendingQuestion) {
 const uploadBtn = document.querySelector("#uploadBtn");
 const fileInput = document.querySelector("#fileInput");
 const uploadStatus = document.querySelector("#uploadStatus");
+const uploadBatchPanel = document.querySelector("#uploadBatchPanel");
+const uploadBatchSummary = document.querySelector("#uploadBatchSummary");
+const uploadBatchJobs = document.querySelector("#uploadBatchJobs");
+let uploadPollTimer = null;
 
 uploadBtn.addEventListener("click", () => fileInput.click());
 
+function stopUploadPolling() {
+  if (uploadPollTimer) clearInterval(uploadPollTimer);
+  uploadPollTimer = null;
+}
+
+function renderUploadBatch(batch) {
+  uploadBatchPanel.style.display = "block";
+  uploadBatchPanel.open = true;
+  const failed = batch.jobs.filter((job) => job.status === "failed");
+  uploadBatchSummary.textContent = `共 ${batch.total_count} 篇${failed.length ? ` · ${failed.length} 篇失败` : ""}`;
+  uploadBatchJobs.innerHTML = batch.jobs.map((job) => `<div class="upload-job ${job.status}"><strong>${escapeHtml(job.filename)}</strong><span>${escapeHtml(job.stage_detail || job.status)}</span>${job.chunk_count ? `<small>${job.chunk_count} 个分块 · ${escapeHtml(job.parse_source || "")}</small>` : ""}${job.error ? `<small class="error">${escapeHtml(job.error)}</small>` : ""}</div>`).join("");
+}
+
+async function refreshUploadBatch(batchId) {
+  const response = await fetch(`/api/upload-batches/${batchId}`);
+  if (!response.ok) return stopUploadPolling();
+  const batch = await response.json();
+  renderUploadBatch(batch);
+  if (!batch.jobs.some((job) => ["queued", "parsing", "chunking", "indexing"].includes(job.status))) stopUploadPolling();
+}
+
+function startUploadPolling(batchId) {
+  stopUploadPolling();
+  refreshUploadBatch(batchId);
+  uploadPollTimer = setInterval(() => refreshUploadBatch(batchId), 1000);
+}
+
 fileInput.addEventListener("change", async () => {
-  const file = fileInput.files[0];
-  if (!file) return;
+  const files = Array.from(fileInput.files);
+  if (!files.length) return;
 
   uploadStatus.style.display = "block";
   uploadStatus.className = "upload-status";
-  uploadStatus.textContent = `正在上传并解析: ${file.name}...`;
+  uploadStatus.textContent = `正在加入队列: ${files.length} 篇 PDF...`;
   uploadBtn.disabled = true;
 
   const formData = new FormData();
-  formData.append("file", file);
+  files.forEach((file) => formData.append("files", file));
 
   try {
-    const res = await fetch("/api/upload", { method: "POST", body: formData });
+    const res = await fetch("/api/uploads", { method: "POST", body: formData });
     const data = await res.json();
     if (res.ok) {
-      uploadStatus.textContent = `✅ ${data.title.slice(0, 40)}... (${data.chunks} 个分块, ${data.source})`;
+      uploadStatus.textContent = `✅ 已加入队列: ${data.accepted_count} 篇`;
+      localStorage.setItem("paperAgentLastUploadBatch", data.batch_id);
+      startUploadPolling(data.batch_id);
     } else {
       uploadStatus.className = "upload-status error";
       uploadStatus.textContent = `❌ ${data.detail || "上传失败"}`;
@@ -381,3 +414,6 @@ fileInput.addEventListener("change", async () => {
   fileInput.value = "";
   setTimeout(() => { uploadStatus.style.display = "none"; }, 5000);
 });
+
+const lastUploadBatch = localStorage.getItem("paperAgentLastUploadBatch");
+if (lastUploadBatch) startUploadPolling(lastUploadBatch);

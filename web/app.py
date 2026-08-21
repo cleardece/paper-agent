@@ -29,7 +29,13 @@ from fastapi.staticfiles import StaticFiles
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel
 
-from config import get_llm
+from config import (
+    UPLOAD_BATCH_MAX_FILES,
+    UPLOAD_MAX_FILE_MB,
+    UPLOAD_QUEUE_MAX_PENDING,
+    UPLOAD_JOB_RETENTION_DAYS,
+    get_llm,
+)
 from core.conversation_context import (
     build_conversation_context,
     needs_summary_refresh,
@@ -107,6 +113,19 @@ class ConnectionManager:
 # Session 内存缓存（热数据）
 sessions: dict[str, Session] = {}
 manager = ConnectionManager()
+upload_queue_repository = None
+upload_queue_worker = None
+upload_queue_task = None
+upload_queue_wakeup = None
+
+
+def get_upload_queue():
+    global upload_queue_repository
+    if upload_queue_repository is None:
+        from core.deps import get_container
+        from storage.upload_queue import UploadQueueRepository
+        upload_queue_repository = UploadQueueRepository(get_container().mongodb.db)
+    return upload_queue_repository
 
 
 def load_session_from_db(session_id: str) -> Session | None:
@@ -563,9 +582,17 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def startup_event():
+    global upload_queue_worker, upload_queue_task, upload_queue_wakeup
     from core.deps import get_container
+    from tools.upload_worker import UploadQueueWorker
     # 初始化服务容器（单例）
-    get_container()
+    container = get_container()
+    repository = get_upload_queue()
+    repository.requeue_interrupted_jobs()
+    repository.cleanup_terminal_jobs(UPLOAD_JOB_RETENTION_DAYS)
+    upload_queue_wakeup = asyncio.Event()
+    upload_queue_worker = UploadQueueWorker(container, repository, upload_queue_wakeup)
+    upload_queue_task = asyncio.create_task(upload_queue_worker.run())
     logger.info("=" * 60)
     logger.info("Paper Agent Web 启动成功!")
     logger.info("访问 http://localhost:8000 开始使用")
@@ -574,6 +601,16 @@ async def startup_event():
 
 @app.on_event("shutdown")
 async def shutdown_event():
+    global upload_queue_task
+    if upload_queue_worker:
+        upload_queue_worker.stop()
+    if upload_queue_task:
+        upload_queue_task.cancel()
+        try:
+            await upload_queue_task
+        except asyncio.CancelledError:
+            pass
+        upload_queue_task = None
     from core.deps import close_container
     close_container()
     logger.info("Paper Agent Web 已关闭")
@@ -625,72 +662,93 @@ def _extract_arxiv_id_from_pdf(pdf_content: bytes) -> Optional[str]:
     return None
 
 
-@app.post("/api/upload")
-async def upload_paper(file: UploadFile):
-    """上传本地 PDF 论文，后台异步解析并入库"""
+async def _submit_upload_files(files: list[UploadFile]) -> dict[str, Any]:
+    """Save accepted files and enqueue them; parsing is exclusively worker-owned."""
+    import hashlib
     import os
+    from uuid import uuid4
     from core.deps import get_container
 
-    if not file.filename.endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="只支持 PDF 文件")
-
+    if not files:
+        raise HTTPException(status_code=400, detail="请选择至少一份 PDF")
+    repository = get_upload_queue()
     container = get_container()
+    batch_id = uuid4().hex
+    accepted: list[dict[str, Any]] = []
+    rejected: list[dict[str, str]] = []
+    pending = repository.count_pending()
+    for sequence, file in enumerate(files[:UPLOAD_BATCH_MAX_FILES]):
+        filename = file.filename or "unnamed.pdf"
+        content = await file.read()
+        if not filename.lower().endswith(".pdf"):
+            rejected.append({"filename": filename, "reason": "只支持 PDF 文件"})
+            continue
+        if len(content) > UPLOAD_MAX_FILE_MB * 1024 * 1024:
+            rejected.append({"filename": filename, "reason": f"文件超过 {UPLOAD_MAX_FILE_MB} MB 限制"})
+            continue
+        if pending + len(accepted) >= UPLOAD_QUEUE_MAX_PENDING:
+            rejected.append({"filename": filename, "reason": "等待队列已满"})
+            continue
 
-    # 先读取文件内容（后续提取 arxiv_id 和保存都需要）
-    content = await file.read()
-
-    # 生成 arxiv_id
+        # 生成 arxiv_id
     # 1. 先尝试从文件名提取（如果是数字格式如 2304.08485.pdf）
-    base_name = os.path.splitext(file.filename)[0]
-    if base_name.replace(".", "").replace("v1", "").replace("v2", "").isdigit():
-        arxiv_id = base_name
-    else:
+        base_name = os.path.splitext(filename)[0]
+        if base_name.replace(".", "").replace("v1", "").replace("v2", "").isdigit():
+            arxiv_id = base_name
+        else:
         # 2. 从 PDF 内容提取 arxiv_id
-        arxiv_id = _extract_arxiv_id_from_pdf(content)
+            arxiv_id = _extract_arxiv_id_from_pdf(content)
         if not arxiv_id:
             # 3. 生成唯一 ID（基于文件名 + 哈希）
-            import hashlib
             file_hash = hashlib.md5(content).hexdigest()[:8]
             arxiv_id = f"local_{base_name[:40]}_{file_hash}"
-
-    if len(arxiv_id) > 60:
         arxiv_id = arxiv_id[:60]
-
-    # 检查是否已存在
-    existing = container.mongodb.get_paper(arxiv_id)
-    if existing:
-        title = existing.get("title", file.filename)
-        status = existing.get("status", "unknown")
-        if status == "parse_failed":
-            # 严格 MinerU 解析失败没有可用向量；允许用户修复环境后直接重传。
-            container.mongodb.delete_paper(arxiv_id)
-            try:
-                container.milvus.delete_by_paper(arxiv_id)
-            except Exception as exc:
-                logger.warning(f"[Upload] 清理失败论文的 Milvus 向量失败: {exc}")
+        job_id = uuid4().hex
+        status = "queued"
+        detail = "等待处理"
+        existing = container.mongodb.get_paper(arxiv_id)
+        if existing or repository.has_nonterminal_arxiv_id(arxiv_id):
+            status, detail = "skipped", "论文已存在或已在队列中"
+            pdf_path = ""
         else:
-            raise HTTPException(
-                status_code=409,
-                detail=f"论文已存在: {title[:30]}... (状态: {status})"
-            )
+            os.makedirs("tmp_pdfs", exist_ok=True)
+            pdf_path = os.path.join("tmp_pdfs", f"{job_id}.pdf")
+            with open(pdf_path, "wb") as stream:
+                stream.write(content)
+        accepted.append({"job_id": job_id, "batch_id": batch_id, "sequence": sequence, "arxiv_id": arxiv_id, "filename": filename, "pdf_path": pdf_path, "status": status, "stage_detail": detail})
+    for file in files[UPLOAD_BATCH_MAX_FILES:]:
+        rejected.append({"filename": file.filename or "unnamed.pdf", "reason": f"单批最多 {UPLOAD_BATCH_MAX_FILES} 篇"})
+    repository.create_batch(batch_id, len(accepted))
+    repository.create_jobs(batch_id, accepted)
+    if upload_queue_wakeup:
+        upload_queue_wakeup.set()
+    return {"batch_id": batch_id, "accepted_count": len(accepted), "jobs": accepted, "rejected": rejected}
 
-    # 保存到临时目录
-    tmp_dir = "tmp_pdfs"
-    os.makedirs(tmp_dir, exist_ok=True)
-    pdf_path = os.path.join(tmp_dir, file.filename)
-    with open(pdf_path, "wb") as f:
-        f.write(content)
 
-    logger.info(f"[Upload] 收到文件: {file.filename} ({len(content)} bytes)")
+@app.post("/api/uploads", status_code=202)
+async def upload_papers(files: list[UploadFile]):
+    return await _submit_upload_files(files)
 
-    # 立即返回，后台处理
-    asyncio.create_task(_process_upload(container, pdf_path, file.filename, arxiv_id, session_id=None))
 
-    return {
-        "message": "上传成功，正在后台解析...",
-        "arxiv_id": arxiv_id,
-        "title": file.filename,
-    }
+@app.post("/api/upload", status_code=202)
+async def upload_paper(file: UploadFile):
+    result = await _submit_upload_files([file])
+    job = result["jobs"][0] if result["jobs"] else None
+    if not job:
+        raise HTTPException(status_code=400, detail=result["rejected"][0]["reason"])
+    return {"message": job["stage_detail"], "arxiv_id": job["arxiv_id"], "title": job["filename"], "batch_id": result["batch_id"]}
+
+
+@app.get("/api/upload-batches/{batch_id}")
+async def get_upload_batch(batch_id: str):
+    batch = get_upload_queue().get_batch(batch_id)
+    if not batch:
+        raise HTTPException(status_code=404, detail="上传批次不存在")
+    batch.pop("_id", None)
+    for job in batch["jobs"]:
+        job.pop("_id", None)
+        job.pop("pdf_path", None)
+    return batch
 
 
 async def _process_upload(container, pdf_path, filename, arxiv_id, session_id=None):

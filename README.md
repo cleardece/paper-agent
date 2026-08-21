@@ -125,6 +125,15 @@ MINERU_CPU_LIMIT=
 
 `MINERU_MEMORY_LIMIT` 与 `MINERU_CPU_LIMIT` 都是可选的本机设置，例如 `MINERU_MEMORY_LIMIT=8g`、`MINERU_CPU_LIMIT=2.0`。留空表示不施加固定限制，避免开源项目假设所有用户有相同硬件。限制触发或 MinerU 出错时，默认严格模式会把论文标记为 `parse_failed`，不会静默用 pdfplumber 的普通解析结果入库；修复环境后可直接重新上传。
 
+## 批量上传队列
+
+上传按钮支持一次选择多份 PDF。任务会保存到 MongoDB，并严格串行执行；页面的“本批上传”面板会动态显示排队、解析、分块、索引、完成或失败状态，刷新页面后可恢复查看。
+
+- 单篇上传完成解析后立即释放 MinerU；同一批次有两篇及以上时，MinerU 在该批次内保持热启动，最后一篇结束后释放。
+- 每篇失败会自动重试一次；第二次失败会清理论文库中的元数据、chunks 和向量，仅保留原始 PDF 与失败任务记录，然后继续下一篇。
+- 服务异常重启后，未完成任务会重新进入队列；已完成任务不重复解析。
+- 默认限制可通过 `.env` 调整：`UPLOAD_BATCH_MAX_FILES=20`、`UPLOAD_MAX_FILE_MB=100`、`UPLOAD_QUEUE_MAX_PENDING=50`、`UPLOAD_JOB_RETENTION_DAYS=30`。队列不提供并发模式。
+
 ## 论文入库状态
 
 - `chunked`：PDF 已解析，正文片段已保存到 MongoDB；可以直接进行单篇分析。系统会在需要时对已有 chunks 补索引，不会重新下载 PDF。

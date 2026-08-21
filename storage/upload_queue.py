@@ -72,10 +72,13 @@ class UploadQueueRepository:
             "status": {"$in": ["queued", *PROCESSING_STATUSES]},
         }) > 0
 
-    def claim_next_job(self) -> dict[str, Any] | None:
+    def claim_next_job(self, batch_id: str | None = None) -> dict[str, Any] | None:
         now = self._now()
+        query = {"status": "queued"}
+        if batch_id:
+            query["batch_id"] = batch_id
         return self.jobs.find_one_and_update(
-            {"status": "queued"},
+            query,
             {
                 "$set": {
                     "status": "parsing",
@@ -86,6 +89,15 @@ class UploadQueueRepository:
             },
             sort=[("created_at", ASCENDING), ("sequence", ASCENDING)],
             return_document=ReturnDocument.AFTER,
+        )
+
+    def mark_retrying(self, job_id: str, detail: str) -> None:
+        self.jobs.update_one(
+            {"job_id": job_id},
+            {
+                "$set": {"status": "parsing", "stage_detail": detail, "updated_at": self._now()},
+                "$inc": {"attempt_count": 1},
+            },
         )
 
     def update_job(self, job_id: str, status: str, *, detail: str = "", **fields: Any) -> None:

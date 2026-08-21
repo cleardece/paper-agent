@@ -232,6 +232,16 @@ details { margin-top: 8px; color: var(--muted); font-size: 13px; }
 summary { color: var(--accent); cursor: pointer; font-weight: 600; }
 .summary-block { margin-top: 7px; padding: 9px; border-radius: 8px; background: var(--surface-subtle); color: var(--text); white-space: pre-wrap; }
 
+.upload-batch-panel { margin-top: 10px; padding: 0 10px 10px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-raised); }
+.upload-batch-panel summary { padding: 10px 0; }
+.upload-batch-summary { margin-bottom: 8px; color: var(--muted); font-size: 12px; }
+.upload-batch-jobs { display: grid; gap: 7px; }
+.upload-job { display: grid; gap: 2px; padding: 8px; border-radius: 8px; background: var(--surface-subtle); font-size: 12px; }
+.upload-job span, .upload-job small { color: var(--muted); overflow-wrap: anywhere; }
+.upload-job.parsing strong, .upload-job.chunking strong, .upload-job.indexing strong { color: var(--accent); }
+.upload-job.completed strong { color: var(--success); }
+.upload-job.failed strong, .upload-job .error { color: var(--danger); }
+
 .evidence-panel { padding: 0 14px; }
 .evidence-panel summary { padding: 13px 0; }
 .evidence-status { font-weight: 750; }
