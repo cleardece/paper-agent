@@ -165,6 +165,13 @@ if not MAX_CONCURRENT_PAPERS:
     else:
         MAX_CONCURRENT_PAPERS = 1
 
+# ==================== 批量上传队列 ====================
+# 上传队列始终串行处理，避免 MinerU、Embedding 和 Milvus 同时占用资源。
+UPLOAD_BATCH_MAX_FILES = int(os.getenv("UPLOAD_BATCH_MAX_FILES", "20"))
+UPLOAD_MAX_FILE_MB = int(os.getenv("UPLOAD_MAX_FILE_MB", "100"))
+UPLOAD_QUEUE_MAX_PENDING = int(os.getenv("UPLOAD_QUEUE_MAX_PENDING", "50"))
+UPLOAD_JOB_RETENTION_DAYS = int(os.getenv("UPLOAD_JOB_RETENTION_DAYS", "30"))
+
 
 def get_llm():
     """获取 LLM 实例"""
