@@ -64,6 +64,7 @@ class AgentState(TypedDict):
     research_profile_context: Optional[dict]  # 用户研究档案，仅用于理解意图，不作论文证据
     target_paper: Optional[str]             # 用户指代的论文标题（跟随意图用）
     target_paper_id: Optional[str]          # 论文库显式选择的稳定 arXiv/本地论文 ID
+    resolved_paper_id: Optional[str]        # DirectAnalyzer 实际分析的论文 ID，供会话持久化
     active_paper_ids: list[str]             # 会话当前论文焦点，供追问消解使用
     active_section: Optional[str]           # 当前讨论章节
     active_task: Optional[str]              # 当前阅读/实验/写作任务
