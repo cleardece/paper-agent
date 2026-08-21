@@ -51,6 +51,17 @@ class MinerUContainerManager:
         finally:
             self.release()
 
+    @contextmanager
+    def batch_lease(self) -> Iterator[None]:
+        """在多文件批次处理期间保持 MinerU 热启动。
+
+        PDFParser 的单篇解析仍使用 ``lease``。外层批次租约使其内部
+        acquire/release 不会将活跃计数降为零，因此批次最后一篇结束前
+        不会停止容器。
+        """
+        with self.lease():
+            yield
+
     def acquire(self) -> None:
         with self._lock:
             if self._stop_timer is not None:
