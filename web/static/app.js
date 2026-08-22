@@ -348,72 +348,185 @@ if (pendingQuestion) {
 const uploadBtn = document.querySelector("#uploadBtn");
 const fileInput = document.querySelector("#fileInput");
 const uploadStatus = document.querySelector("#uploadStatus");
+const uploadDraftPanel = document.querySelector("#uploadDraftPanel");
+const uploadDraftSummary = document.querySelector("#uploadDraftSummary");
+const uploadDraftFiles = document.querySelector("#uploadDraftFiles");
+const startUploadBtn = document.querySelector("#startUploadBtn");
 const uploadBatchPanel = document.querySelector("#uploadBatchPanel");
 const uploadBatchSummary = document.querySelector("#uploadBatchSummary");
 const uploadBatchJobs = document.querySelector("#uploadBatchJobs");
+const recentUploadBatches = document.querySelector("#recentUploadBatches");
+const recentUploadBatchList = document.querySelector("#recentUploadBatchList");
+const uploadRefreshWarning = document.querySelector("#uploadRefreshWarning");
+const draftFiles = new Map();
 let uploadPollTimer = null;
+let currentUploadBatchId = localStorage.getItem("paperAgentLastUploadBatch");
+let currentBatchHasActiveJob = false;
+let recentBatchesHaveActiveJob = false;
 
 uploadBtn.addEventListener("click", () => fileInput.click());
 
-function stopUploadPolling() {
-  if (uploadPollTimer) clearInterval(uploadPollTimer);
-  uploadPollTimer = null;
+function uploadFileKey(file) {
+  return `${file.name}:${file.size}:${file.lastModified}`;
+}
+
+function isUploadJobActive(job) {
+  return ["queued", "parsing", "chunking", "indexing"].includes(job.status);
+}
+
+function uploadCounts(jobs) {
+  return jobs.reduce((counts, job) => {
+    if (isUploadJobActive(job)) counts.active += 1;
+    else if (Object.hasOwn(counts, job.status)) counts[job.status] += 1;
+    return counts;
+  }, { active: 0, completed: 0, failed: 0, skipped: 0 });
+}
+
+function renderUploadJobs(jobs) {
+  return jobs.map((job) => `<div class="upload-job ${escapeHtml(job.status)}">
+    <div class="upload-job-head"><strong>${escapeHtml(job.filename)}</strong><span>${escapeHtml(job.stage_detail || job.status)}</span></div>
+    ${job.chunk_count ? `<small>${job.chunk_count} 个分块 · ${escapeHtml(job.parse_source || "")}</small>` : ""}
+    ${job.error ? `<small class="error">${escapeHtml(job.error)}</small>` : ""}
+  </div>`).join("");
+}
+
+function renderUploadDraft() {
+  const entries = Array.from(draftFiles.entries());
+  uploadDraftPanel.style.display = entries.length ? "block" : "none";
+  startUploadBtn.disabled = !entries.length;
+  startUploadBtn.textContent = `开始上传（${entries.length} 篇）`;
+  uploadDraftSummary.textContent = entries.length ? `已选择 ${entries.length} 篇，确认后一次创建一个批次` : "";
+  uploadDraftFiles.innerHTML = entries.map(([key, entry]) => `<div class="upload-job ${entry.reason ? "failed" : ""}">
+    <div class="upload-job-head"><strong>${escapeHtml(entry.file.name)}</strong><button class="upload-remove" type="button" data-file-key="${escapeHtml(key)}">移除</button></div>
+    <small>${Math.ceil(entry.file.size / 1024)} KB${entry.reason ? ` · <span class="error">${escapeHtml(entry.reason)}</span>` : ""}</small>
+  </div>`).join("");
+  uploadDraftFiles.querySelectorAll(".upload-remove").forEach((button) => {
+    button.addEventListener("click", () => {
+      draftFiles.delete(button.dataset.fileKey);
+      renderUploadDraft();
+    });
+  });
+}
+
+function addFilesToDraft() {
+  Array.from(fileInput.files).forEach((file) => {
+    if (!file.name.toLowerCase().endsWith(".pdf")) return;
+    const key = uploadFileKey(file);
+    if (!draftFiles.has(key)) draftFiles.set(key, { file, reason: "" });
+  });
+  fileInput.value = "";
+  renderUploadDraft();
 }
 
 function renderUploadBatch(batch) {
   uploadBatchPanel.style.display = "block";
   uploadBatchPanel.open = true;
-  const failed = batch.jobs.filter((job) => job.status === "failed");
-  uploadBatchSummary.textContent = `共 ${batch.total_count} 篇${failed.length ? ` · ${failed.length} 篇失败` : ""}`;
-  uploadBatchJobs.innerHTML = batch.jobs.map((job) => `<div class="upload-job ${job.status}"><strong>${escapeHtml(job.filename)}</strong><span>${escapeHtml(job.stage_detail || job.status)}</span>${job.chunk_count ? `<small>${job.chunk_count} 个分块 · ${escapeHtml(job.parse_source || "")}</small>` : ""}${job.error ? `<small class="error">${escapeHtml(job.error)}</small>` : ""}</div>`).join("");
+  const counts = uploadCounts(batch.jobs);
+  uploadBatchSummary.textContent = `共 ${batch.total_count} 篇 · 成功 ${counts.completed} · 处理中 ${counts.active} · 失败 ${counts.failed} · 跳过 ${counts.skipped}`;
+  uploadBatchJobs.innerHTML = renderUploadJobs(batch.jobs);
 }
 
-async function refreshUploadBatch(batchId) {
-  const response = await fetch(`/api/upload-batches/${batchId}`);
-  if (!response.ok) return stopUploadPolling();
+function renderRecentUploadBatches(batches) {
+  recentUploadBatches.style.display = "block";
+  recentUploadBatchList.innerHTML = batches.length ? batches.map((batch) => {
+    const counts = uploadCounts(batch.jobs);
+    const createdAt = batch.created_at ? new Date(batch.created_at).toLocaleString() : "时间未知";
+    return `<details class="upload-history-item"><summary>${escapeHtml(createdAt)} · ${batch.total_count} 篇 · 成功 ${counts.completed} / 处理中 ${counts.active} / 失败 ${counts.failed} / 跳过 ${counts.skipped}</summary><div class="upload-batch-jobs">${renderUploadJobs(batch.jobs)}</div></details>`;
+  }).join("") : "<small>近 7 天暂无上传批次</small>";
+}
+
+function setUploadRefreshWarning(message = "") {
+  uploadRefreshWarning.style.display = message ? "block" : "none";
+  uploadRefreshWarning.textContent = message;
+}
+
+function updateUploadPolling() {
+  const needsPolling = currentBatchHasActiveJob || recentBatchesHaveActiveJob;
+  if (needsPolling && !uploadPollTimer) {
+    uploadPollTimer = setInterval(refreshUploadDashboard, 1000);
+  } else if (!needsPolling && uploadPollTimer) {
+    clearInterval(uploadPollTimer);
+    uploadPollTimer = null;
+  }
+}
+
+async function refreshCurrentUploadBatch() {
+  if (!currentUploadBatchId) {
+    currentBatchHasActiveJob = false;
+    return;
+  }
+  const response = await fetch(`/api/upload-batches/${currentUploadBatchId}`);
+  if (!response.ok) {
+    currentBatchHasActiveJob = false;
+    return;
+  }
   const batch = await response.json();
   renderUploadBatch(batch);
-  if (!batch.jobs.some((job) => ["queued", "parsing", "chunking", "indexing"].includes(job.status))) stopUploadPolling();
+  currentBatchHasActiveJob = batch.jobs.some(isUploadJobActive);
 }
 
-function startUploadPolling(batchId) {
-  stopUploadPolling();
-  refreshUploadBatch(batchId);
-  uploadPollTimer = setInterval(() => refreshUploadBatch(batchId), 1000);
+async function refreshRecentUploadBatches() {
+  const response = await fetch("/api/upload-batches?days=7&limit=20");
+  if (!response.ok) throw new Error(`历史批次请求失败 (${response.status})`);
+  const data = await response.json();
+  renderRecentUploadBatches(data.batches);
+  recentBatchesHaveActiveJob = data.batches.some((batch) => batch.jobs.some(isUploadJobActive));
 }
 
-fileInput.addEventListener("change", async () => {
-  const files = Array.from(fileInput.files);
-  if (!files.length) return;
+async function refreshUploadDashboard() {
+  try {
+    await Promise.all([refreshCurrentUploadBatch(), refreshRecentUploadBatches()]);
+    setUploadRefreshWarning();
+  } catch (error) {
+    console.error("Upload progress refresh failed", error);
+    setUploadRefreshWarning("上传进度暂时无法刷新，将自动重试。");
+  } finally {
+    updateUploadPolling();
+  }
+}
+
+startUploadBtn.addEventListener("click", async () => {
+  const submittedEntries = Array.from(draftFiles.entries());
+  if (!submittedEntries.length) return;
 
   uploadStatus.style.display = "block";
   uploadStatus.className = "upload-status";
-  uploadStatus.textContent = `正在加入队列: ${files.length} 篇 PDF...`;
-  uploadBtn.disabled = true;
+  uploadStatus.textContent = `正在加入队列: ${submittedEntries.length} 篇 PDF...`;
+  startUploadBtn.disabled = true;
 
   const formData = new FormData();
-  files.forEach((file) => formData.append("files", file));
+  submittedEntries.forEach(([, entry]) => formData.append("files", entry.file));
 
   try {
     const res = await fetch("/api/uploads", { method: "POST", body: formData });
     const data = await res.json();
-    if (res.ok) {
+    if (res.ok && data.batch_id) {
       uploadStatus.textContent = `✅ 已加入队列: ${data.accepted_count} 篇`;
-      localStorage.setItem("paperAgentLastUploadBatch", data.batch_id);
-      startUploadPolling(data.batch_id);
+      data.jobs.forEach((job) => {
+        const entry = submittedEntries[job.sequence];
+        if (entry) draftFiles.delete(entry[0]);
+      });
+      (data.rejected || []).forEach((rejected) => {
+        for (const entry of draftFiles.values()) {
+          if (entry.file.name === rejected.filename) entry.reason = rejected.reason;
+        }
+      });
+      currentUploadBatchId = data.batch_id;
+      localStorage.setItem("paperAgentLastUploadBatch", currentUploadBatchId);
+      renderUploadDraft();
+      await refreshUploadDashboard();
     } else {
       uploadStatus.className = "upload-status error";
-      uploadStatus.textContent = `❌ ${data.detail || "上传失败"}`;
+      uploadStatus.textContent = `❌ ${data.detail || "没有文件加入队列"}`;
     }
   } catch (e) {
     uploadStatus.className = "upload-status error";
     uploadStatus.textContent = `❌ 网络错误: ${e.message}`;
   }
 
-  uploadBtn.disabled = false;
-  fileInput.value = "";
+  renderUploadDraft();
   setTimeout(() => { uploadStatus.style.display = "none"; }, 5000);
 });
 
-const lastUploadBatch = localStorage.getItem("paperAgentLastUploadBatch");
-if (lastUploadBatch) startUploadPolling(lastUploadBatch);
+fileInput.addEventListener("change", addFilesToDraft);
+refreshUploadDashboard();

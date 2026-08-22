@@ -241,6 +241,16 @@ summary { color: var(--accent); cursor: pointer; font-weight: 600; }
 .upload-job.parsing strong, .upload-job.chunking strong, .upload-job.indexing strong { color: var(--accent); }
 .upload-job.completed strong { color: var(--success); }
 .upload-job.failed strong, .upload-job .error { color: var(--danger); }
+.upload-job.skipped strong { color: var(--warning); }
+.upload-job-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.upload-job-head strong { min-width: 0; overflow-wrap: anywhere; }
+.upload-remove { border: 0; background: transparent; color: var(--danger); cursor: pointer; font-size: 12px; }
+.start-upload-btn { width: 100%; min-height: 36px; margin-top: 9px; border: 1px solid transparent; border-radius: 8px; background: var(--accent); color: white; cursor: pointer; font-size: 13px; font-weight: 700; }
+.start-upload-btn:disabled { cursor: not-allowed; opacity: .5; }
+.upload-history-item { padding: 8px; border-radius: 8px; background: var(--surface-subtle); }
+.upload-history-item summary { color: var(--text); font-size: 12px; }
+.upload-history-item .upload-batch-jobs { margin-top: 8px; }
+.upload-refresh-warning { margin: -3px 0 2px; color: var(--warning); font-size: 12px; line-height: 1.4; }
 
 .evidence-panel { padding: 0 14px; }
 .evidence-panel summary { padding: 13px 0; }

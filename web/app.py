@@ -718,6 +718,8 @@ async def _submit_upload_files(files: list[UploadFile]) -> dict[str, Any]:
         accepted.append({"job_id": job_id, "batch_id": batch_id, "sequence": sequence, "arxiv_id": arxiv_id, "filename": filename, "pdf_path": pdf_path, "status": status, "stage_detail": detail})
     for file in files[UPLOAD_BATCH_MAX_FILES:]:
         rejected.append({"filename": file.filename or "unnamed.pdf", "reason": f"单批最多 {UPLOAD_BATCH_MAX_FILES} 篇"})
+    if not accepted:
+        return {"batch_id": None, "accepted_count": 0, "jobs": [], "rejected": rejected}
     repository.create_batch(batch_id, len(accepted))
     repository.create_jobs(batch_id, accepted)
     if upload_queue_wakeup:
@@ -739,16 +741,34 @@ async def upload_paper(file: UploadFile):
     return {"message": job["stage_detail"], "arxiv_id": job["arxiv_id"], "title": job["filename"], "batch_id": result["batch_id"]}
 
 
+def _public_upload_batch(batch: dict[str, Any]) -> dict[str, Any]:
+    """Copy queue data into the safe response schema used by upload APIs."""
+    public_batch = {key: value for key, value in batch.items() if key != "_id"}
+    public_batch["jobs"] = [
+        {
+            key: value
+            for key, value in job.items()
+            if key not in {"_id", "pdf_path"}
+        }
+        for job in batch.get("jobs", [])
+    ]
+    return public_batch
+
+
+@app.get("/api/upload-batches")
+async def list_recent_upload_batches(days: int = 7, limit: int = 20):
+    safe_days = min(max(int(days), 1), 7)
+    safe_limit = min(max(int(limit), 1), 20)
+    batches = get_upload_queue().list_recent_batches(safe_days, safe_limit)
+    return {"days": safe_days, "batches": [_public_upload_batch(batch) for batch in batches]}
+
+
 @app.get("/api/upload-batches/{batch_id}")
 async def get_upload_batch(batch_id: str):
     batch = get_upload_queue().get_batch(batch_id)
     if not batch:
         raise HTTPException(status_code=404, detail="上传批次不存在")
-    batch.pop("_id", None)
-    for job in batch["jobs"]:
-        job.pop("_id", None)
-        job.pop("pdf_path", None)
-    return batch
+    return _public_upload_batch(batch)
 
 
 async def _process_upload(container, pdf_path, filename, arxiv_id, session_id=None):

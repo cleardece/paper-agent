@@ -119,6 +119,18 @@ class UploadQueueRepository:
         batch["jobs"] = list(self.jobs.find({"batch_id": batch_id}).sort([("sequence", ASCENDING)]))
         return batch
 
+    def list_recent_batches(self, days: int, limit: int) -> list[dict[str, Any]]:
+        """Return newest batches in a rolling time window with ordered jobs."""
+        cutoff = self._now() - timedelta(days=days)
+        batches = list(self.batches.find({"created_at": {"$gte": cutoff}}).sort([
+            ("created_at", DESCENDING),
+        ]).limit(limit))
+        for batch in batches:
+            batch["jobs"] = list(self.jobs.find({"batch_id": batch["batch_id"]}).sort([
+                ("sequence", ASCENDING),
+            ]))
+        return batches
+
     def get_next_job_in_batch(self, batch_id: str) -> dict[str, Any] | None:
         return self.jobs.find_one(
             {"batch_id": batch_id, "status": "queued"},

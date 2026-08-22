@@ -11,14 +11,25 @@
       <div class="brand"><span class="brand-mark">P</span><span>Paper Agent</span></div>
       <p class="sidebar-caption">可追溯的研究工作台</p>
       <button id="newChat" class="new-chat">+ 新建对话</button>
-      <button id="uploadBtn" class="upload-btn">上传本地 PDF</button>
-        <input type="file" id="fileInput" accept=".pdf" multiple style="display:none">
-        <div id="uploadStatus" class="upload-status" style="display:none"></div>
-        <details id="uploadBatchPanel" class="upload-batch-panel" style="display:none">
-          <summary>本批上传</summary>
-          <div id="uploadBatchSummary" class="upload-batch-summary"></div>
-          <div id="uploadBatchJobs" class="upload-batch-jobs"></div>
-        </details>
+      <button id="uploadBtn" class="upload-btn">选择本地 PDF</button>
+      <input type="file" id="fileInput" accept=".pdf" multiple style="display:none">
+      <div id="uploadStatus" class="upload-status" style="display:none"></div>
+      <details id="uploadDraftPanel" class="upload-batch-panel" style="display:none">
+        <summary>待上传清单</summary>
+        <div id="uploadDraftSummary" class="upload-batch-summary"></div>
+        <div id="uploadDraftFiles" class="upload-batch-jobs"></div>
+        <button id="startUploadBtn" class="start-upload-btn" type="button" disabled>开始上传（0 篇）</button>
+      </details>
+      <details id="uploadBatchPanel" class="upload-batch-panel" style="display:none">
+        <summary>本批上传</summary>
+        <div id="uploadBatchSummary" class="upload-batch-summary"></div>
+        <div id="uploadBatchJobs" class="upload-batch-jobs"></div>
+      </details>
+      <details id="recentUploadBatches" class="upload-batch-panel" style="display:none">
+        <summary>近 7 天批次</summary>
+        <div id="recentUploadBatchList" class="upload-batch-jobs"></div>
+      </details>
+      <div id="uploadRefreshWarning" class="upload-refresh-warning" style="display:none"></div>
       <a href="/papers" class="library-link">浏览论文库</a>
       <div id="sessions" class="sessions"></div>
     </aside>
