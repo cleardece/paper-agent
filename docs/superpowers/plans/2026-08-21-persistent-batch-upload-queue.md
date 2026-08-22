@@ -401,3 +401,98 @@ Expected: no output and exit 0.
 git add README.md .env.example
 git commit -m "docs: explain durable batch upload queue"
 ```
+
+### Task 7: Make queued-upload progress observable in logs
+
+**Files:**
+- Modify: `tools/upload_worker.py:48-110`
+- Create: `tests/tools/test_upload_worker_observability.py`
+
+- [ ] **Step 1: Write failing log-contract tests**
+
+Use a fake parser, embedder, MongoDB client and Milvus client that complete a two-chunk job. Capture the `paper-agent` logger with `caplog` and assert that successful indexing emits all phase-boundary messages in this order:
+
+```python
+def test_worker_logs_embedding_and_milvus_durations_for_completed_job(caplog, fake_worker):
+    with caplog.at_level(logging.INFO, logger="paper-agent"):
+        asyncio.run(fake_worker.process_job(queued_job()))
+
+    messages = [record.getMessage() for record in caplog.records]
+    expected = [
+        "开始生成 2 个向量",
+        "向量生成完成，耗时",
+        "开始写入 Milvus（2 条）",
+        "Milvus 写入完成，耗时",
+        "开始写入论文级向量",
+        "论文级向量写入完成，耗时",
+        "任务完成，总耗时",
+    ]
+    positions = [next(index for index, message in enumerate(messages) if phrase in message) for phrase in expected]
+    assert positions == sorted(positions)
+    assert all(messages[index].endswith("s") for index in positions if "耗时" in messages[index])
+```
+
+The fake `embed_texts` and `milvus.insert` methods must be synchronous, matching the production calls made through the executor and directly respectively. Do not assert exact elapsed milliseconds.
+
+- [ ] **Step 2: Run the focused test and confirm it fails**
+
+Run: `D:\conda\envs\paper-agent\python.exe -m pytest tests/tools/test_upload_worker_observability.py -q`
+
+Expected: FAIL because the current worker logs only failures, not successful embedding or Milvus phase boundaries.
+
+- [ ] **Step 3: Add monotonic, phase-level timing logs**
+
+Import `time` in `tools/upload_worker.py`.  In `_process_once`, retain the existing persisted status values (`parsing`, `chunking`, `indexing`, `completed`) and add only `logger.info` instrumentation:
+
+```python
+job_started = time.monotonic()
+# immediately before the executor call
+logger.info("[UploadQueue] %s：开始生成 %d 个向量", filename, len(texts))
+embedding_started = time.monotonic()
+vectors = await loop.run_in_executor(None, self.container.embedder.embed_texts, texts)
+logger.info(
+    "[UploadQueue] %s：向量生成完成，耗时 %.2fs",
+    filename,
+    time.monotonic() - embedding_started,
+)
+
+logger.info("[UploadQueue] %s：开始写入 Milvus（%d 条）", filename, len(records))
+milvus_started = time.monotonic()
+self.container.milvus.insert(records)
+logger.info(
+    "[UploadQueue] %s：Milvus 写入完成，耗时 %.2fs",
+    filename,
+    time.monotonic() - milvus_started,
+)
+```
+
+After the title vector has been written and immediately before the final `completed` update, log `任务完成，总耗时 %.2fs` using `time.monotonic() - job_started`.  Also log an explicit `开始写入论文级向量` and `论文级向量写入完成，耗时 %.2fs` around the title embedding plus paper-collection write so that a slow paper-level operation is not silently attributed to chunk indexing.  Do not log text content, vectors, absolute PDF paths, API keys, or stack traces.
+
+- [ ] **Step 4: Run focused and regression tests**
+
+Run: `D:\conda\envs\paper-agent\python.exe -m pytest tests/tools/test_upload_worker_observability.py tests/web/test_upload_parse_failure.py -q`
+
+Expected: all tests pass.  The existing failure-path test protects the fallback behavior while the new test protects successful phase visibility.
+
+- [ ] **Step 5: Perform one manual timing check**
+
+Upload one small PDF and verify the server terminal includes, in sequence:
+
+```text
+[UploadQueue] <filename>：开始生成 <N> 个向量
+[UploadQueue] <filename>：向量生成完成，耗时 <seconds>s
+[UploadQueue] <filename>：开始写入 Milvus（<N> 条）
+[UploadQueue] <filename>：Milvus 写入完成，耗时 <seconds>s
+[UploadQueue] <filename>：开始写入论文级向量
+[UploadQueue] <filename>：论文级向量写入完成，耗时 <seconds>s
+[UploadQueue] <filename>：任务完成，总耗时 <seconds>s
+```
+
+The browser batch row must still progress to `已完成`; logging must not alter retry count, cleanup behavior, queue ordering, or MinerU batch-lease behavior.
+
+- [ ] **Step 6: Commit the observability unit**
+
+```bash
+git add tools/upload_worker.py tests/tools/test_upload_worker_observability.py
+git commit -m "feat: log upload indexing phase timings"
+```
