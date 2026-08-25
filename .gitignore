@@ -20,6 +20,9 @@ htmlcov/
 .ruff_cache/
 *.log
 
+# Tests are local verification helpers and are intentionally not versioned.
+tests/
+
 # Credentials and local runtime data
 .env
 .local-data/
