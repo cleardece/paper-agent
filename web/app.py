@@ -117,6 +117,9 @@ upload_queue_repository = None
 upload_queue_worker = None
 upload_queue_task = None
 upload_queue_wakeup = None
+research_graph_worker = None
+research_graph_task = None
+research_graph_wakeup = None
 
 
 def get_upload_queue():
@@ -583,7 +586,9 @@ app.add_middleware(
 @app.on_event("startup")
 async def startup_event():
     global upload_queue_worker, upload_queue_task, upload_queue_wakeup
+    global research_graph_worker, research_graph_task, research_graph_wakeup
     from core.deps import get_container
+    from tools.research_graph_worker import ResearchGraphWorker
     from tools.upload_worker import UploadQueueWorker
     # 初始化服务容器（单例）
     container = get_container()
@@ -591,8 +596,18 @@ async def startup_event():
     repository.requeue_interrupted_jobs()
     repository.cleanup_terminal_jobs(UPLOAD_JOB_RETENTION_DAYS)
     upload_queue_wakeup = asyncio.Event()
-    upload_queue_worker = UploadQueueWorker(container, repository, upload_queue_wakeup)
+    research_graph_wakeup = asyncio.Event()
+    container.research_graph.enqueue_missing_indexed_papers(
+        container.mongodb.get_papers_by_status("indexed", limit=1000)
+    )
+    upload_queue_worker = UploadQueueWorker(
+        container, repository, upload_queue_wakeup, research_graph_wakeup
+    )
     upload_queue_task = asyncio.create_task(upload_queue_worker.run())
+    research_graph_worker = ResearchGraphWorker(
+        container, container.research_graph, repository, research_graph_wakeup
+    )
+    research_graph_task = asyncio.create_task(research_graph_worker.run())
     logger.info("=" * 60)
     logger.info("Paper Agent Web 启动成功!")
     logger.info("访问 http://localhost:8000 开始使用")
@@ -601,7 +616,7 @@ async def startup_event():
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    global upload_queue_task
+    global upload_queue_task, research_graph_task
     if upload_queue_worker:
         upload_queue_worker.stop()
     if upload_queue_task:
@@ -611,6 +626,15 @@ async def shutdown_event():
         except asyncio.CancelledError:
             pass
         upload_queue_task = None
+    if research_graph_worker:
+        research_graph_worker.stop()
+    if research_graph_task:
+        research_graph_task.cancel()
+        try:
+            await research_graph_task
+        except asyncio.CancelledError:
+            pass
+        research_graph_task = None
     from core.deps import close_container
     close_container()
     logger.info("Paper Agent Web 已关闭")
@@ -628,6 +652,11 @@ async def index() -> FileResponse:
 @app.get("/papers")
 async def papers_page() -> FileResponse:
     return FileResponse(static_dir / "papers.html")
+
+
+@app.get("/graph")
+async def research_graph_page() -> FileResponse:
+    return FileResponse(static_dir / "graph.html")
 
 
 @app.get("/api/test")
@@ -896,6 +925,8 @@ async def list_papers():
             "arxiv_id": p.get("arxiv_id", ""),
             "title": p.get("title", ""),
             "status": p.get("status", ""),
+            "graph_status": p.get("graph_status", ""),
+            "graph_edge_count": p.get("graph_edge_count", 0),
             "parse_error": p.get("parse_error", ""),
         }
         for p in papers
@@ -907,9 +938,51 @@ async def delete_paper(arxiv_id: str):
     """删除单篇论文（含 Milvus 向量）"""
     from core.deps import get_container
     container = get_container()
+    container.research_graph.delete_auto_data_for_paper(arxiv_id)
     container.mongodb.delete_paper(arxiv_id)
     container.milvus.delete_by_paper(arxiv_id)
     return {"message": "deleted"}
+
+
+# ==================== 研究图谱 API ====================
+
+@app.get("/api/research-graph")
+async def research_graph_search(
+    query: str = "", entity_type: str | None = None, relation: str | None = None,
+    review_status: str | None = None,
+):
+    """返回关系及其原文证据；图谱本身不充当回答依据。"""
+    from core.deps import get_container
+    container = get_container()
+    edges = container.research_graph.search(query, entity_type, relation, review_status)
+    for edge in edges:
+        paper = container.mongodb.get_paper(edge["source_paper_id"])
+        edge["paper_title"] = paper.get("title", edge["source_paper_id"]) if paper else edge["source_paper_id"]
+        edge["evidence"] = {
+            "chunk_index": edge.get("evidence_chunk_index"),
+            "section": edge.get("evidence_section", ""),
+            "page": edge.get("evidence_page", 0),
+            "content": edge.get("evidence", ""),
+        }
+        edge.pop("evidence_content_hash", None)
+    return {"edges": edges}
+
+
+@app.get("/api/research-graph/status")
+async def research_graph_status():
+    from core.deps import get_container
+    return get_container().research_graph.status_summary()
+
+
+@app.patch("/api/research-graph/edges/{edge_id}")
+async def review_research_graph_edge(edge_id: str, body: dict[str, Any]):
+    review_status = body.get("review_status")
+    if review_status not in {"confirmed", "rejected"}:
+        raise HTTPException(status_code=422, detail="review_status 必须是 confirmed 或 rejected")
+    from core.deps import get_container
+    if not get_container().research_graph.review_edge(edge_id, review_status):
+        raise HTTPException(status_code=404, detail="关系不存在")
+    return {"edge_id": edge_id, "review_status": review_status}
 
 
 @app.post("/api/compare")

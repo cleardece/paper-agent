@@ -28,12 +28,31 @@ class RetrieverAgent:
     """语义检索 Agent - Section-aware + MultiQuery + 两层检索 + 混合搜索 + 重排序"""
 
     def __init__(self, embedding_service, milvus_client, mongodb_client, llm=None,
-                 hybrid_search=None):
+                 hybrid_search=None, research_graph=None):
         self.embedder = embedding_service
         self.milvus = milvus_client
         self.mongo = mongodb_client
         self.llm = llm  # 用于 MultiQuery 生成
         self.hybrid_search = hybrid_search
+        self.research_graph = research_graph
+
+    @staticmethod
+    def _has_graph_intent(query: str) -> bool:
+        return any(token in query.lower() for token in (
+            "哪些论文", "共同", "比较", "对比", "关系", "关联", "使用", "uses", "compare",
+        ))
+
+    def _graph_paper_ids(self, query: str) -> list[str]:
+        """图谱只提供候选范围；事实仍由后续 chunk 检索提供。"""
+        if not self.research_graph or not self._has_graph_intent(query):
+            return []
+        phrases = re.findall(r"[A-Za-z][A-Za-z0-9_-]*(?:\\s+[A-Za-z][A-Za-z0-9_-]*){0,5}", query)
+        for phrase in sorted(phrases, key=len, reverse=True):
+            paper_ids = self.research_graph.find_related_paper_ids(phrase)
+            if paper_ids:
+                logger.info("[Retriever] 图谱定位到 %d 篇候选论文: %s", len(paper_ids), phrase[:40])
+                return paper_ids
+        return []
 
     def _detect_section_intent(self, query: str) -> Optional[list[str]]:
         """根据查询内容推断应该检索哪些 section"""
@@ -123,11 +142,21 @@ class RetrieverAgent:
 
         return expanded
 
-    def _two_level_retrieval(self, query: str, query_vector, session_id: str = None, target_paper: str = None) -> list[dict]:
+    def _two_level_retrieval(self, query: str, query_vector, session_id: str = None,
+                             target_paper: str = None, graph_paper_ids: list[str] | None = None) -> list[dict]:
         """两层检索：先找论文，再在论文内找 chunk"""
 
         # ===== Stage 1: 论文级检索（Milvus HNSW 向量搜索）=====
         logger.info("[Retriever] Stage 1: 论文级检索（Milvus）...")
+
+        # 图谱命中只限制候选论文，不绕过 chunk 检索和重排序。
+        top_papers = None
+        if graph_paper_ids:
+            top_papers = []
+            for paper_id in graph_paper_ids:
+                paper = self.mongo.get_paper(paper_id)
+                if paper:
+                    top_papers.append({"arxiv_id": paper_id, "title": paper.get("title", ""), "score": 1.0})
 
         # 优先用目标论文直接匹配
         if target_paper:
@@ -149,7 +178,8 @@ class RetrieverAgent:
                     return hits
 
         # Milvus 论文级向量搜索（HNSW 近似最近邻，替代 Python 逐篇计算）
-        top_papers = self.milvus.search_papers(query_embedding=query_vector, top_k=5)
+        if top_papers is None:
+            top_papers = self.milvus.search_papers(query_embedding=query_vector, top_k=5)
         if not top_papers:
             logger.info("[Retriever] Milvus 论文级搜索无结果，尝试 MongoDB 兜底...")
             # 兜底：如果 paper_embeddings collection 为空（旧数据未迁移），走 MongoDB
@@ -293,6 +323,7 @@ class RetrieverAgent:
         target_paper = self._extract_target_paper(query, context)
         if target_paper:
             logger.info(f"[Retriever] 识别到目标论文: {target_paper[:50]}")
+        graph_paper_ids = self._graph_paper_ids(query)
 
         # 获取用户兴趣
         user_interests = self.mongo.user_memory.get_interests(user_id, top_k=5)
@@ -335,7 +366,9 @@ class RetrieverAgent:
         # 逐个检索（embedding 已经批量完成）
         for eq, query_vector in zip(expanded_queries, query_vectors):
             # 两层检索
-            hits = self._two_level_retrieval(eq, query_vector, session_id, target_paper)
+            hits = self._two_level_retrieval(
+                eq, query_vector, session_id, target_paper, graph_paper_ids or None
+            )
 
             # 合并结果
             for h in hits:
@@ -402,6 +435,11 @@ class RetrieverAgent:
             return {
                 "retrieved_chunks": [],
                 "error": "知识库中未找到相关论文，请先使用fetcher入库论文。",
+                "graph_context": {"paper_ids": graph_paper_ids} if graph_paper_ids else None,
             }
 
-        return {"retrieved_chunks": retrieved, "error": None}
+        return {
+            "retrieved_chunks": retrieved,
+            "error": None,
+            "graph_context": {"paper_ids": graph_paper_ids} if graph_paper_ids else None,
+        }

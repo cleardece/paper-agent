@@ -17,10 +17,12 @@ logger = logging.getLogger("paper-agent")
 
 
 class UploadQueueWorker:
-    def __init__(self, container: Any, repository: Any, wakeup: asyncio.Event):
+    def __init__(self, container: Any, repository: Any, wakeup: asyncio.Event,
+                 graph_wakeup: asyncio.Event | None = None):
         self.container = container
         self.repository = repository
         self.wakeup = wakeup
+        self.graph_wakeup = graph_wakeup
         self.stopped = False
 
     async def process_job(self, job: dict[str, Any]) -> None:
@@ -125,6 +127,14 @@ class UploadQueueWorker:
             time.monotonic() - paper_embedding_started,
         )
         self.container.mongodb.update_paper_status(arxiv_id, "indexed", title_embedding=paper_embedding)
+        # 图谱是低优先级的后处理：论文此刻已经可被正常 RAG 使用。
+        if getattr(self.container, "research_graph", None):
+            self.container.research_graph.enqueue(arxiv_id)
+            self.container.mongodb.papers.update_one(
+                {"arxiv_id": arxiv_id}, {"$set": {"graph_status": "pending"}}
+            )
+            if self.graph_wakeup:
+                self.graph_wakeup.set()
 
         gc.collect()
         try:
@@ -145,6 +155,11 @@ class UploadQueueWorker:
         )
 
     def _cleanup_partial_paper(self, arxiv_id: str) -> None:
+        try:
+            if getattr(self.container, "research_graph", None):
+                self.container.research_graph.delete_auto_data_for_paper(arxiv_id)
+        except Exception as exc:
+            logger.warning("[UploadQueue] 清理图谱半成品失败 %s: %s", arxiv_id, exc)
         try:
             self.container.mongodb.delete_paper(arxiv_id)
         except Exception as exc:

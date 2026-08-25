@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>研究图谱 - Paper Agent</title>
+  <link rel="stylesheet" href="/static/style.css" />
+  <style>
+    body { display:block; min-height:100vh; }
+    .graph-page { max-width:1000px; margin:0 auto; padding:30px 20px 60px; }
+    .graph-head, .graph-toolbar, .relation-top { display:flex; gap:12px; align-items:center; justify-content:space-between; }
+    .graph-head { margin-bottom:22px; }
+    h1 { margin:3px 0; color:var(--text); } .muted { color:var(--muted); font-size:13px; }
+    .back-btn, .filter, .review { border:1px solid var(--border); border-radius:8px; background:var(--bubble); color:var(--text); padding:8px 12px; text-decoration:none; }
+    .graph-toolbar { flex-wrap:wrap; padding:12px; border:1px solid var(--border); border-radius:12px; background:var(--surface-raised); }
+    input, select { min-height:38px; box-sizing:border-box; background:var(--surface-subtle); color:var(--text); border:1px solid var(--border); border-radius:8px; padding:8px 10px; }
+    input { flex:1; min-width:220px; } .filter { min-width:120px; }
+    .relation-list { display:grid; gap:10px; margin-top:16px; }
+    .relation-card { padding:16px; border:1px solid var(--border); border-radius:12px; background:var(--bubble); }
+    .relation-path { color:var(--text); font-size:15px; font-weight:650; overflow-wrap:anywhere; }
+    .relation-arrow { color:var(--accent); padding:0 5px; } .tag { display:inline-block; margin:8px 6px 0 0; padding:3px 7px; border-radius:999px; background:var(--surface-subtle); color:var(--muted); font-size:12px; }
+    details { margin-top:11px; } details p { white-space:pre-wrap; color:var(--text); line-height:1.65; }
+    .review { cursor:pointer; font-size:12px; } .review.confirmed { color:var(--success); } .review.rejected { color:var(--danger); }
+    .empty { padding:60px 16px; text-align:center; color:var(--muted); }
+    @media(max-width:650px){ .graph-head{align-items:flex-start}.graph-toolbar{align-items:stretch}.graph-toolbar,input,.filter{width:100%}.graph-head{flex-direction:column}.relation-top{align-items:flex-start;flex-direction:column} }
+  </style>
+</head>
+<body>
+  <main class="graph-page">
+    <header class="graph-head">
+      <div><p class="eyebrow">可追溯关系</p><h1>研究图谱</h1><p id="summary" class="muted">正在读取图谱状态…</p></div>
+      <div style="display:flex;gap:8px"><button id="themeToggle" class="icon-button" type="button">◐</button><a class="back-btn" href="/papers">论文库</a><a class="back-btn" href="/">返回对话</a></div>
+    </header>
+    <section class="graph-toolbar" aria-label="图谱筛选">
+      <input id="query" placeholder="搜索方法、数据集或指标（例如 Dataset X）" />
+      <select id="entityType" class="filter"><option value="">所有实体</option><option value="method">方法</option><option value="dataset">数据集</option><option value="metric">指标</option></select>
+      <select id="reviewStatus" class="filter"><option value="">所有状态</option><option value="auto">自动提取</option><option value="confirmed">已确认</option><option value="rejected">已拒绝</option></select>
+    </section>
+    <section id="relations" class="relation-list"></section>
+  </main>
+<script>
+const $ = (selector) => document.querySelector(selector);
+const savedTheme = localStorage.getItem("paperAgentTheme");
+document.documentElement.dataset.theme = savedTheme || "dark";
+$("#themeToggle").onclick = () => { const theme = document.documentElement.dataset.theme === "dark" ? "light" : "dark"; document.documentElement.dataset.theme = theme; localStorage.setItem("paperAgentTheme", theme); };
+const relationText = { proposes:"提出", uses:"使用", compares_with:"比较" };
+const statusText = { auto:"自动提取", confirmed:"已确认", rejected:"已拒绝" };
+function escapeHtml(value) { const el=document.createElement("div"); el.textContent=value || ""; return el.innerHTML; }
+async function review(id, status) {
+  const response = await fetch("/api/research-graph/edges/" + encodeURIComponent(id), {method:"PATCH", headers:{"Content-Type":"application/json"}, body:JSON.stringify({review_status:status})});
+  if (!response.ok) return alert("更新失败，请稍后重试。");
+  loadEdges();
+}
+function edgeCard(edge) {
+  const evidence = edge.evidence || {};
+  return `<article class="relation-card"><div class="relation-top"><div><div class="relation-path">${escapeHtml(edge.paper_title)} <span class="relation-arrow">→ ${relationText[edge.relation] || edge.relation} →</span> ${escapeHtml(edge.target_name)}</div><span class="tag">${escapeHtml(edge.target_type)}</span><span class="tag">置信度 ${Math.round((edge.confidence || 0) * 100)}%</span><span class="tag">${statusText[edge.review_status] || edge.review_status}</span></div><div><button class="review confirmed" onclick="review('${edge._id}','confirmed')">确认</button><button class="review rejected" onclick="review('${edge._id}','rejected')">拒绝</button></div></div><details><summary>查看原文证据 · 片段 #${evidence.chunk_index ?? "-"} · ${escapeHtml(evidence.section || "未标记章节")}</summary><p>${escapeHtml(evidence.content)}</p></details></article>`;
+}
+async function loadStatus() {
+  const data = await fetch("/api/research-graph/status").then(r=>r.json());
+  $("#summary").textContent = `关系 ${data.edges} 条 · 待提取 ${data.pending} 篇 · 提取中 ${data.extracting} 篇 · 已完成 ${data.completed} 篇 · 失败 ${data.failed} 篇`;
+}
+async function loadEdges() {
+  const params = new URLSearchParams();
+  if ($("#query").value.trim()) params.set("query", $("#query").value.trim());
+  if ($("#entityType").value) params.set("entity_type", $("#entityType").value);
+  if ($("#reviewStatus").value) params.set("review_status", $("#reviewStatus").value);
+  const data = await fetch("/api/research-graph?" + params).then(r=>r.json());
+  $("#relations").innerHTML = data.edges.length ? data.edges.map(edgeCard).join("") : '<div class="empty">还没有满足条件的关系。论文完成索引后会在空闲时自动提取；每一条关系都必须带原文证据。</div>';
+  loadStatus();
+}
+$("#query").addEventListener("input", () => { clearTimeout(window.graphSearchTimer); window.graphSearchTimer=setTimeout(loadEdges,300); });
+$("#entityType").onchange = loadEdges; $("#reviewStatus").onchange = loadEdges;
+loadEdges(); loadStatus();
+</script>
+</body>
+</html>

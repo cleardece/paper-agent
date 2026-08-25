@@ -84,6 +84,9 @@ class ServiceContainer:
         self.mongodb = MongoDBClient()
         self.milvus = MilvusClient()
         self.embedder = EmbeddingService()
+        # 持久化研究图谱：不依赖可选 Neo4j，也不会替代已有 RAG。
+        from storage.research_graph import ResearchGraphRepository
+        self.research_graph = ResearchGraphRepository(self.mongodb.db)
 
         # 论文搜索（MCP 优先）
         self.paper_search = _create_paper_search()
@@ -154,7 +157,7 @@ class ServiceContainer:
             ),
             "retriever": RetrieverAgent(
                 self.embedder, self.milvus, self.mongodb, self.llm,
-                self.hybrid_search
+                self.hybrid_search, self.research_graph
             ),
             "direct_analyzer": DirectAnalyzerAgent(
                 self.llm, self.mongodb, self.embedder, self.milvus,
