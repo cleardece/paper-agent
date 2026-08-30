@@ -300,7 +300,7 @@ Section 过滤 (按意图: 实验/方法/背景/结论)
 | Embedding | BAAI/bge-m3 (SentenceTransformer) | dim=1024 |
 | 向量库 | Milvus | IVF_FLAT |
 | 文档数据库 | MongoDB | - |
-| PDF 解析 | MinerU (API) / pdfplumber (fallback) | - |
+| PDF 解析 | MinerU 官方精准 API（VLM） | - |
 | 论文搜索 | arXiv MCP / arXiv Direct API | - |
 | GPU | NVIDIA RTX 5070 Ti (16GB) | CUDA 12.8 |
 
@@ -335,8 +335,11 @@ MONGODB_DB=paper_agent
 MILVUS_HOST=localhost
 MILVUS_PORT=19530
 
-# MinerU (可选)
-MINERU_URL=http://localhost:8888
+# MinerU 官方精准 API（必填）
+MINERU_OFFICIAL_TOKEN=your_token
+MINERU_OFFICIAL_BASE_URL=https://mineru.net
+MINERU_OFFICIAL_POLL_SECONDS=5
+MINERU_OFFICIAL_TIMEOUT_SECONDS=900
 
 # MCP (可选)
 USE_MCP=true

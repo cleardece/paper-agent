@@ -58,7 +58,8 @@ python -m uvicorn web.app:app --host 0.0.0.0 --port 8000 --reload
 | `LLM_MODEL`、`LLM_BASE_URL`、`LLM_API_KEY` | 对话、路由、分析和审核模型配置 |
 | `MONGODB_URI`、`MONGODB_DB` | 论文、会话和记忆存储 |
 | `MILVUS_HOST`、`MILVUS_PORT` | 向量检索服务 |
-| `MINERU_URL`、`MINERU_BACKEND` | 可选的 MinerU 服务；无 GPU 时使用 `pipeline` |
+| `MINERU_OFFICIAL_TOKEN` | MinerU 官方精准 API Token；必填，缺失时应用拒绝启动 |
+| `MINERU_OFFICIAL_BASE_URL` | MinerU 官方 API 地址；解析固定使用 `vlm` |
 | `USE_MCP`、`MCP_ARXIV_URL` | arXiv MCP 搜索优先级 |
 | `SEMANTIC_SCHOLAR_API_KEY` | 可选的 Semantic Scholar 搜索 |
 | `PA_DATA_ROOT` | Docker Compose 数据卷根目录 |
@@ -110,26 +111,47 @@ python -B -c "import main; from web.app import app; print(len(app.routes))"
 
 本地 PDF、向量库、Mongo 数据、缓存、上传文件和 API 密钥均不应提交。删除论文会影响本地 MongoDB/Milvus 数据，执行前请确认该论文不再需要。
 
-## MinerU 资源策略
+## MinerU 论文解析
 
-本项目默认只在需要解析 PDF 时启动本机 MinerU；单次解析结束后立即停止它，避免模型持续占用内存。下一次上传会自动重新启动 MinerU，因此会有一次模型加载等待，但不会改变解析质量。
-
-若连续批量上传论文，可在 `.env` 中设置 `MINERU_IDLE_SHUTDOWN_SECONDS=300`，让 MinerU 空闲 5 分钟后再释放。该值默认是 `0`，优先保证普通设备在空闲时不被长期占用。
+Paper Agent 统一使用 MinerU 官方精准 API 解析论文，不再维护本地 MinerU 运行时或 pdfplumber 降级路径。先在 MinerU 平台创建 API Token，再填写本机 `.env`：
 
 ```dotenv
-MINERU_IDLE_SHUTDOWN_SECONDS=0
-MINERU_REQUIRE_ACCURATE_PARSE=true
-MINERU_MEMORY_LIMIT=
-MINERU_CPU_LIMIT=
+MINERU_OFFICIAL_TOKEN=
+MINERU_OFFICIAL_BASE_URL=https://mineru.net
+MINERU_OFFICIAL_POLL_SECONDS=5
+MINERU_OFFICIAL_TIMEOUT_SECONDS=900
 ```
 
-`MINERU_MEMORY_LIMIT` 与 `MINERU_CPU_LIMIT` 都是可选的本机设置，例如 `MINERU_MEMORY_LIMIT=8g`、`MINERU_CPU_LIMIT=2.0`。留空表示不施加固定限制，避免开源项目假设所有用户有相同硬件。限制触发或 MinerU 出错时，默认严格模式会把论文标记为 `parse_failed`，不会静默用 pdfplumber 的普通解析结果入库；修复环境后可直接重新上传。
+Token 只填写在本机 `.env`，不要写入 `.env.example` 或提交到 Git。没有配置 Token 时应用会在启动阶段给出明确错误，不会以低精度解析器继续运行。官方 API 失败时，上传队列会自动重试该论文一次；仍失败则清理半成品、记录原因并继续下一篇。上传面板和近 7 天历史批次会显示“官方 VLM · 解析 N.N 秒”，日志会记录上传、等待、下载和总耗时，但不会输出 Token、签名上传地址或结果下载地址。
+
+### MinerU 本地部署参考
+
+MinerU 本身也可以独立部署到本地。官方 Docker 方案适用于 Linux，以及启用了 WSL2 的 Windows；建议先确认 NVIDIA 驱动、CUDA 与显存满足 MinerU 当前版本要求。以下流程只用于部署 MinerU 服务，不是 Paper Agent 的解析模式切换入口。
+
+```bash
+# 1. 下载官方 Dockerfile 并构建镜像
+curl -L https://raw.githubusercontent.com/opendatalab/MinerU/master/docker/global/Dockerfile -o Dockerfile
+docker build -t mineru:latest -f Dockerfile .
+
+# 2. 下载官方 Compose 配置
+curl -L https://raw.githubusercontent.com/opendatalab/MinerU/master/docker/compose.yaml -o compose.yaml
+
+# 3. 启动 MinerU Web API
+docker compose -f compose.yaml --profile api up -d
+```
+
+启动后访问 `http://localhost:8000/docs` 查看接口文档，或请求 `http://localhost:8000/health` 检查服务状态。MinerU Web API 与 Paper Agent 默认都占用主机 `8000` 端口，同时运行时需要修改 `compose.yaml` 的主机端口映射。停止服务可运行：
+
+```bash
+docker compose -f compose.yaml --profile api down
+```
+
+MinerU 的镜像依赖和启动参数可能随版本变化，实际部署时以 [MinerU 官方 Docker 部署文档](https://github.com/opendatalab/MinerU/blob/master/docs/zh/quick_start/docker_deployment.md) 为准。
 
 ## 批量上传队列
 
 选择 PDF 后，文件会先进入可移除的“待上传清单”；可以多次选择后再点击一次“开始上传”，所有接受的文件会成为同一个 MongoDB 批次并严格串行执行。页面会显示“本批上传”的逐篇状态与成功/处理中/失败/跳过统计，并保留近 7 天批次供刷新后查看。论文库只展示已成功入库的论文，不能作为上传成功率的依据。
 
-- 单篇上传完成解析后立即释放 MinerU；同一批次有两篇及以上时，MinerU 在该批次内保持热启动，最后一篇结束后释放。
 - 每篇失败会自动重试一次；第二次失败会清理论文库中的元数据、chunks 和向量，仅保留原始 PDF 与失败任务记录，然后继续下一篇。
 - 服务异常重启后，未完成任务会重新进入队列；已完成任务不重复解析。
 - 默认限制可通过 `.env` 调整：`UPLOAD_BATCH_MAX_FILES=20`、`UPLOAD_MAX_FILE_MB=100`、`UPLOAD_QUEUE_MAX_PENDING=50`、`UPLOAD_JOB_RETENTION_DAYS=30`。队列不提供并发模式。

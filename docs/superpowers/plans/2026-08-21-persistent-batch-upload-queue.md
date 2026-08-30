@@ -1,5 +1,7 @@
 # Persistent Batch Upload Queue Implementation Plan
 
+> **状态说明：** 本计划已实施；其中本地 MinerU 租约与热启动设计已被官方 VLM API 单一运行时取代，批量队列仍保持全局串行、失败重试和半成品清理。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Accept multiple PDFs in one upload, process them through a restart-safe global serial queue, and render each batch's live result in the current page.

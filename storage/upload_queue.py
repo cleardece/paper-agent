@@ -53,6 +53,7 @@ class UploadQueueRepository:
             doc.setdefault("stage_detail", "等待处理")
             doc.setdefault("chunk_count", 0)
             doc.setdefault("parse_source", None)
+            doc.setdefault("parse_metrics", {})
             doc.setdefault("attempt_count", 0)
             doc.setdefault("max_attempts", 2)
             doc.setdefault("error", None)

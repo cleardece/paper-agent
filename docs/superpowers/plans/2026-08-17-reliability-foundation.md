@@ -1,5 +1,7 @@
 # Research Assistant Reliability Foundation Implementation Plan
 
+> **状态说明：** 本计划已实施；其中涉及本地 MinerU 地址和解析配置的内容已被官方 VLM API 单一运行时取代，当前配置与部署方式以 README 为准。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox syntax for tracking.
 
 **Goal:** Make Paper Agent reproducible, evidence-aware, measurable, and safe to maintain without changing its research workflow.

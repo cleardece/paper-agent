@@ -382,10 +382,22 @@ function uploadCounts(jobs) {
   }, { active: 0, completed: 0, failed: 0, skipped: 0 });
 }
 
+function formatUploadParseSummary(job) {
+  const metrics = job.parse_metrics || {};
+  const seconds = Number(metrics.total_seconds);
+  const provider = metrics.provider === "official" ? "官方" :
+    metrics.provider === "local" ? "本地" :
+    metrics.provider === "pdfplumber" ? "普通解析" : "";
+  if (!provider) return "";
+  const model = metrics.model ? ` ${String(metrics.model).toUpperCase()}` : "";
+  return Number.isFinite(seconds) ? `${provider}${model} · 解析 ${seconds.toFixed(1)} 秒` : `${provider}${model}`;
+}
+
 function renderUploadJobs(jobs) {
   return jobs.map((job) => `<div class="upload-job ${escapeHtml(job.status)}">
     <div class="upload-job-head"><strong>${escapeHtml(job.filename)}</strong><span>${escapeHtml(job.stage_detail || job.status)}</span></div>
     ${job.chunk_count ? `<small>${job.chunk_count} 个分块 · ${escapeHtml(job.parse_source || "")}</small>` : ""}
+    ${formatUploadParseSummary(job) ? `<small>${escapeHtml(formatUploadParseSummary(job))}</small>` : ""}
     ${job.error ? `<small class="error">${escapeHtml(job.error)}</small>` : ""}
   </div>`).join("");
 }

@@ -76,30 +76,6 @@ services:
       timeout: 10s
       retries: 5
 
-  # ==================== PDF 解析 ====================
-  mineru-api:
-    image: mineru:latest
-    container_name: mineru-api
-    profiles: ["parser"]
-    ports:
-      - "8888:8000"
-    entrypoint: ["mineru-api"]
-    command: ["--host", "0.0.0.0", "--port", "8000"]
-    # GPU 直通（已关闭，用 CPU 解析 PDF，省显存给 Embedding）
-    # deploy:
-    #   resources:
-    #     reservations:
-    #       devices:
-    #         - driver: nvidia
-    #           count: 1
-    #           capabilities: [gpu]
-    restart: "no"
-    healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
-      interval: 15s
-      timeout: 10s
-      retries: 5
-
   # ==================== ArXiv MCP ====================
   arxiv-mcp:
     image: mcp/arxiv

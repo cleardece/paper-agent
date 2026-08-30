@@ -6,11 +6,8 @@ import asyncio
 import gc
 import logging
 import time
-from contextlib import nullcontext
 from datetime import datetime, timezone
 from typing import Any
-
-from tools.pdf_parser import MinerUParseError
 
 
 logger = logging.getLogger("paper-agent")
@@ -54,12 +51,25 @@ class UploadQueueWorker:
         arxiv_id = job["arxiv_id"]
         filename = job["filename"]
 
-        self.repository.update_job(job_id, "parsing", detail="正在使用 MinerU 解析")
+        parser_label = getattr(self.container.pdf_parser, "provider_label", "论文解析器")
+        self.repository.update_job(
+            job_id, "parsing", detail=f"正在使用 {parser_label} 解析"
+        )
         result = await loop.run_in_executor(None, self.container.pdf_parser.parse, job["pdf_path"])
-        parse_source = str(result.get("source", "unknown"))
+        parse_source = str(
+            result.get("parse_source") or result.get("source", "unknown")
+        )
+        parse_metrics = dict(result.get("parse_metrics") or {})
+        logger.info(
+            "[UploadQueue] %s：解析完成，来源 %s，耗时 %.2fs",
+            filename,
+            parse_source,
+            float(parse_metrics.get("total_seconds", 0) or 0),
+        )
 
         self.repository.update_job(
-            job_id, "chunking", detail="正在生成论文片段", parse_source=parse_source
+            job_id, "chunking", detail="正在生成论文片段",
+            parse_source=parse_source, parse_metrics=parse_metrics,
         )
         chunks = self.container.pdf_parser.chunk(result["sections"])
 
@@ -151,6 +161,7 @@ class UploadQueueWorker:
             detail="已完成",
             chunk_count=len(chunks),
             parse_source=parse_source,
+            parse_metrics=parse_metrics,
             finished_at=datetime.now(timezone.utc),
         )
 
@@ -177,9 +188,7 @@ class UploadQueueWorker:
                 self.wakeup.clear()
                 continue
             if self.repository.is_multi_file_batch(job["batch_id"]):
-                manager = getattr(self.container.pdf_parser, "mineru_manager", None)
-                with (manager.batch_lease() if manager else nullcontext()):
-                    await self._process_batch(job)
+                await self._process_batch(job)
             else:
                 await self.process_job(job)
 

@@ -1,15 +1,12 @@
-"""
-Paper Agent - PDF解析工具 v3
-支持 MinerU（Markdown 输出）和 pdfplumber（fallback）
-"""
+"""MinerU 官方精准 API 解析与论文分块。"""
 
-import os
 import re
 import logging
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from tools.mineru_lifecycle import MinerUContainerManager
+    from tools.mineru_official import OfficialMinerUClient
 
 logger = logging.getLogger("paper-agent")
 
@@ -19,28 +16,16 @@ class MinerUParseError(RuntimeError):
 
 
 class PDFParser:
-    """PDF论文解析器 - 支持 MinerU 和 pdfplumber"""
+    """只使用 MinerU 官方精准 API 的 PDF 论文解析器。"""
 
-    def __init__(
-        self,
-        mineru_url: str = None,
-        mineru_backend: str = None,
-        mineru_manager: "MinerUContainerManager | None" = None,
-        require_accurate_parse: bool = True,
-    ):
-        """
-        Args:
-            mineru_url: MinerU API 地址，如 http://localhost:8888
-                       如果为 None，使用 pdfplumber fallback
-            mineru_backend: MinerU 后端；CPU 环境应使用 pipeline
-            mineru_manager: 本机 MinerU 的按需启动/释放管理器
-            require_accurate_parse: MinerU 失败时是否阻止低质量回退结果入库
-        """
-        self.mineru_url = mineru_url or os.getenv("MINERU_URL")
-        self.mineru_backend = mineru_backend or os.getenv("MINERU_BACKEND", "pipeline")
-        self.mineru_manager = mineru_manager
-        self.require_accurate_parse = require_accurate_parse
-        self._pdfplumber = None
+    def __init__(self, official_client: "OfficialMinerUClient"):
+        if official_client is None:
+            raise ValueError("PDFParser 需要 MinerU 官方 API 客户端")
+        self.official_client = official_client
+
+    @property
+    def provider_label(self) -> str:
+        return f"MinerU 官方 {self.official_client.model.upper()}"
 
     def parse(self, pdf_path: str) -> dict:
         """
@@ -51,60 +36,20 @@ class PDFParser:
             "markdown": str,        # MinerU 输出的 Markdown
             "sections": [{"heading": str, "content": str, "page": int, "level": int}],
             "page_count": int,
-            "source": "mineru" | "pdfplumber",
+            "source": "mineru",
         }
         """
-        if self.mineru_url:
-            try:
-                if self.mineru_manager:
-                    with self.mineru_manager.lease():
-                        return self._parse_with_mineru(pdf_path)
-                return self._parse_with_mineru(pdf_path)
-            except Exception as e:
-                if self.require_accurate_parse:
-                    raise MinerUParseError(f"MinerU 解析失败: {e}") from e
-                logger.warning(f"[PDFParser] MinerU 解析失败，明确降级到 pdfplumber: {e}")
+        try:
+            return self._parse_with_official_mineru(pdf_path)
+        except Exception as exc:
+            raise MinerUParseError(f"MinerU 官方 API 解析失败: {exc}") from exc
 
-        return self._parse_with_pdfplumber(pdf_path)
-
-    def _parse_with_mineru(self, pdf_path: str) -> dict:
-        """使用 MinerU API 解析 PDF"""
-        import httpx
-
-        logger.info(
-            f"[PDFParser] 使用 MinerU 解析: {pdf_path} "
-            f"(backend={self.mineru_backend})"
-        )
-
-        with open(pdf_path, "rb") as f:
-            files = {"files": (os.path.basename(pdf_path), f, "application/pdf")}
-            response = httpx.post(
-                f"{self.mineru_url}/file_parse",
-                files=files,
-                data={
-                    "backend": self.mineru_backend,
-                    "parse_method": "auto",
-                    "return_md": "true",
-                },
-                timeout=300,
-            )
-            response.raise_for_status()
-
-        data = response.json()
-        # MinerU 返回格式：{"results": {"filename": {"md_content": "..."}}}
-        markdown = ""
-        results = data.get("results", {})
-        for fname, result in results.items():
-            markdown = result.get("md_content", "")
-            if markdown:
-                break
-
-        # 从 Markdown 解析章节
+    def _result_from_markdown(
+        self, pdf_path: str, markdown: str, parse_source: str,
+        parse_metrics: dict,
+    ) -> dict:
         sections = self._markdown_to_sections(markdown)
-
-        # 提取标题
-        title = self._extract_title_from_markdown(markdown) or os.path.basename(pdf_path).replace(".pdf", "")
-
+        title = self._extract_title_from_markdown(markdown) or Path(pdf_path).stem
         return {
             "title": title,
             "text": markdown,
@@ -112,56 +57,22 @@ class PDFParser:
             "sections": sections,
             "page_count": len(sections),
             "source": "mineru",
+            "parse_source": parse_source,
+            "parse_metrics": parse_metrics,
         }
 
-    def _parse_with_pdfplumber(self, pdf_path: str) -> dict:
-        """使用 pdfplumber 解析 PDF（fallback）"""
-        logger.info(f"[PDFParser] 使用 pdfplumber 解析: {pdf_path}")
-
-        pdf = self._get_pdfplumber().open(pdf_path)
-        all_text = []
-        sections = []
-
-        for page_num, page in enumerate(pdf.pages):
-            text = page.extract_text() or ""
-            all_text.append(text)
-
-            current_section = {"heading": "", "content": "", "page": page_num + 1, "level": 0}
-            for line in text.split("\n"):
-                stripped = line.strip()
-                if not stripped:
-                    continue
-
-                heading_info = self._is_heading(stripped)
-                if heading_info:
-                    if current_section["content"].strip():
-                        sections.append(current_section)
-                    current_section = {
-                        "heading": heading_info["title"],
-                        "content": "",
-                        "page": page_num + 1,
-                        "level": heading_info["level"],
-                        "is_appendix": heading_info.get("is_appendix", False),
-                    }
-                else:
-                    current_section["content"] += stripped + " "
-
-            if current_section["content"].strip():
-                sections.append(current_section)
-
-        pdf.close()
-
-        full_text = "\n".join(all_text)
-        title = self._extract_title(full_text, pdf_path)
-
-        return {
-            "title": title,
-            "text": full_text,
-            "markdown": None,
-            "sections": sections,
-            "page_count": len(all_text),
-            "source": "pdfplumber",
-        }
+    def _parse_with_official_mineru(self, pdf_path: str) -> dict:
+        logger.info(
+            "[PDFParser] 使用 MinerU 官方精准 API 解析: %s (model=%s)",
+            pdf_path, self.official_client.model,
+        )
+        result = self.official_client.parse(pdf_path)
+        return self._result_from_markdown(
+            pdf_path,
+            result["markdown"],
+            f"mineru_official_{self.official_client.model}",
+            dict(result.get("metrics") or {}),
+        )
 
     def _markdown_to_sections(self, markdown: str) -> list[dict]:
         """将 Markdown 转换为 sections 列表"""
@@ -215,9 +126,7 @@ class PDFParser:
             min_chunk_size: int = 200,
     ) -> list[dict]:
         """
-        分块策略 v3：
-        - MinerU 输出：直接按 Markdown 标题分块
-        - pdfplumber 输出：使用 v2 策略
+        分块策略 v3：按 MinerU Markdown 标题分块。
         """
         chunks = []
         chunk_index = 0
@@ -315,52 +224,3 @@ class PDFParser:
                 merged.append(chunk)
 
         return merged
-
-    def _get_pdfplumber(self):
-        if self._pdfplumber is None:
-            import pdfplumber
-            self._pdfplumber = pdfplumber
-        return self._pdfplumber
-
-    def _is_heading(self, line: str) -> dict | None:
-        """增强标题识别"""
-        no_number_patterns = [
-            (r'^(Abstract)\s*$', 1, False),
-            (r'^(Introduction)\s*$', 1, False),
-            (r'^(Conclusion|Conclusions)\s*$', 1, False),
-            (r'^(References|Bibliography)\s*$', 1, False),
-            (r'^(Acknowledgment|Acknowledgement|Acknowledgments|Acknowledgements)\s*$', 1, False),
-        ]
-        for pattern, level, is_appendix in no_number_patterns:
-            if re.match(pattern, line, re.IGNORECASE):
-                return {"title": line.strip(), "level": level, "is_appendix": is_appendix}
-
-        appendix_match = re.match(r'^(Appendix)\s+([A-Z])(?:\.(\d+))?\s*(.*)', line, re.IGNORECASE)
-        if appendix_match:
-            sub = appendix_match.group(3)
-            level = 2 if sub else 1
-            return {"title": line.strip(), "level": level, "is_appendix": True}
-
-        number_match = re.match(r'^(\d+(?:\.\d+)*)\s+(.+)$', line)
-        if number_match:
-            num = number_match.group(1)
-            level = num.count('.') + 1
-            return {"title": line.strip(), "level": level, "is_appendix": False}
-
-        appendix_sub_match = re.match(r'^([A-Z]\.\d+(?:\.\d+)*)\s+(.+)', line)
-        if appendix_sub_match:
-            return {"title": line.strip(), "level": 2, "is_appendix": True}
-
-        return None
-
-    def _extract_title(self, text: str, pdf_path: str) -> str:
-        """从文本开头提取标题"""
-        lines = text.strip().split("\n")
-        candidates = []
-        for line in lines[:15]:
-            stripped = line.strip()
-            if stripped and len(stripped) > 5:
-                if re.match(r'^(Vol\.|ISSN|DOI|http|www\.)', stripped, re.IGNORECASE):
-                    continue
-                candidates.append(stripped)
-        return candidates[0] if candidates else os.path.basename(pdf_path).replace(".pdf", "")

@@ -128,15 +128,15 @@ NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
 RERANKER_MODEL = os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")
 
 # ==================== PDF 解析 ====================
-MINERU_URL = os.getenv("MINERU_URL")  # http://localhost:8888
-# CPU 环境使用 pipeline；hybrid-auto-engine 需要可用的 vLLM/GPU。
-MINERU_BACKEND = os.getenv("MINERU_BACKEND", "pipeline")
-MINERU_IDLE_SHUTDOWN_SECONDS = int(os.getenv("MINERU_IDLE_SHUTDOWN_SECONDS", "0"))
-MINERU_START_TIMEOUT_SECONDS = int(os.getenv("MINERU_START_TIMEOUT_SECONDS", "90"))
-MINERU_MEMORY_LIMIT = os.getenv("MINERU_MEMORY_LIMIT", "")
-MINERU_CPU_LIMIT = os.getenv("MINERU_CPU_LIMIT", "")
-MINERU_REQUIRE_ACCURATE_PARSE = (
-    os.getenv("MINERU_REQUIRE_ACCURATE_PARSE", "true").lower() == "true"
+MINERU_OFFICIAL_TOKEN = os.getenv("MINERU_OFFICIAL_TOKEN", "").strip()
+MINERU_OFFICIAL_BASE_URL = os.getenv(
+    "MINERU_OFFICIAL_BASE_URL", "https://mineru.net"
+).rstrip("/")
+MINERU_OFFICIAL_POLL_SECONDS = float(
+    os.getenv("MINERU_OFFICIAL_POLL_SECONDS", "5")
+)
+MINERU_OFFICIAL_TIMEOUT_SECONDS = float(
+    os.getenv("MINERU_OFFICIAL_TIMEOUT_SECONDS", "900")
 )
 
 # ==================== 搜索 API ====================

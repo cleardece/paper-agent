@@ -5,16 +5,12 @@ Paper Agent - 依赖注入模块
 
 import logging
 import os
-from urllib.parse import urlparse
 
 from config import (
-    MINERU_BACKEND,
-    MINERU_CPU_LIMIT,
-    MINERU_IDLE_SHUTDOWN_SECONDS,
-    MINERU_MEMORY_LIMIT,
-    MINERU_REQUIRE_ACCURATE_PARSE,
-    MINERU_START_TIMEOUT_SECONDS,
-    MINERU_URL,
+    MINERU_OFFICIAL_BASE_URL,
+    MINERU_OFFICIAL_POLL_SECONDS,
+    MINERU_OFFICIAL_TIMEOUT_SECONDS,
+    MINERU_OFFICIAL_TOKEN,
     SEMANTIC_SCHOLAR_API_KEY,
     get_llm,
 )
@@ -23,17 +19,23 @@ from storage.research_memory import ResearchMemoryService
 from storage.milvus import MilvusClient
 from tools.embeddings import EmbeddingService
 from tools.pdf_parser import PDFParser
-from tools.mineru_lifecycle import MinerUContainerManager
+from tools.mineru_official import OfficialMinerUClient
 from tools.code_generator import CodeGenerator
 
 logger = logging.getLogger("paper-agent")
 
 
-def _is_local_mineru_url(url: str | None) -> bool:
-    """仅管理本机 Docker；远程 MinerU 的生命周期属于其部署方。"""
-    if not url:
-        return False
-    return urlparse(url).hostname in {"localhost", "127.0.0.1", "::1"}
+def _create_pdf_parser() -> PDFParser:
+    """构造唯一的 MinerU 官方精准 API 解析器。"""
+    official_client = OfficialMinerUClient(
+        token=MINERU_OFFICIAL_TOKEN,
+        base_url=MINERU_OFFICIAL_BASE_URL,
+        poll_seconds=MINERU_OFFICIAL_POLL_SECONDS,
+        timeout_seconds=MINERU_OFFICIAL_TIMEOUT_SECONDS,
+    )
+    parser = PDFParser(official_client=official_client)
+    logger.info("[Container] 论文解析器: %s", parser.provider_label)
+    return parser
 
 
 def _create_paper_search():
@@ -79,6 +81,9 @@ class ServiceContainer:
     def __init__(self):
         logger.info("[Container] 正在初始化服务容器...")
 
+        # 先校验官方 MinerU 配置，缺少 Token 时不要继续连接其他基础设施。
+        self.pdf_parser = _create_pdf_parser()
+
         # 基础设施
         self.llm = get_llm()
         self.mongodb = MongoDBClient()
@@ -90,31 +95,6 @@ class ServiceContainer:
 
         # 论文搜索（MCP 优先）
         self.paper_search = _create_paper_search()
-
-        # PDF 解析：优先 MinerU（CPU 模式），fallback 到 pdfplumber
-        mineru_manager = None
-        if _is_local_mineru_url(MINERU_URL):
-            mineru_manager = MinerUContainerManager(
-                MINERU_URL,
-                idle_shutdown_seconds=MINERU_IDLE_SHUTDOWN_SECONDS,
-                start_timeout_seconds=MINERU_START_TIMEOUT_SECONDS,
-                memory_limit=MINERU_MEMORY_LIMIT,
-                cpu_limit=MINERU_CPU_LIMIT,
-            )
-
-        self.pdf_parser = PDFParser(
-            mineru_url=MINERU_URL,
-            mineru_backend=MINERU_BACKEND,
-            mineru_manager=mineru_manager,
-            require_accurate_parse=MINERU_REQUIRE_ACCURATE_PARSE,
-        )
-        if MINERU_URL:
-            logger.info(
-                f"[Container] 使用 MinerU: {MINERU_URL} "
-                f"(backend={MINERU_BACKEND}, local_managed={mineru_manager is not None})"
-            )
-        else:
-            logger.info("[Container] 使用 pdfplumber（未配置 MinerU）")
 
         # Hybrid Search
         from tools.hybrid_search import HybridSearch
