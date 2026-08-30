@@ -172,9 +172,20 @@ UPLOAD_MAX_FILE_MB = int(os.getenv("UPLOAD_MAX_FILE_MB", "100"))
 UPLOAD_QUEUE_MAX_PENDING = int(os.getenv("UPLOAD_QUEUE_MAX_PENDING", "50"))
 UPLOAD_JOB_RETENTION_DAYS = int(os.getenv("UPLOAD_JOB_RETENTION_DAYS", "30"))
 
+# ==================== 研究图谱后台任务 ====================
+# LLM 在独立子进程中运行；超过截止时间后父进程会强制终止子进程。
+GRAPH_EXTRACTION_TIMEOUT_SECONDS = int(os.getenv("GRAPH_EXTRACTION_TIMEOUT_SECONDS", "120"))
+GRAPH_LLM_REQUEST_TIMEOUT_SECONDS = int(
+    os.getenv("GRAPH_LLM_REQUEST_TIMEOUT_SECONDS", "90")
+)
+GRAPH_JOB_LEASE_SECONDS = int(os.getenv("GRAPH_JOB_LEASE_SECONDS", "150"))
+GRAPH_JOB_HEARTBEAT_SECONDS = int(os.getenv("GRAPH_JOB_HEARTBEAT_SECONDS", "10"))
+GRAPH_RETRY_DELAY_SECONDS = int(os.getenv("GRAPH_RETRY_DELAY_SECONDS", "60"))
+GRAPH_CIRCUIT_FAILURE_THRESHOLD = int(os.getenv("GRAPH_CIRCUIT_FAILURE_THRESHOLD", "3"))
+GRAPH_CIRCUIT_PAUSE_SECONDS = int(os.getenv("GRAPH_CIRCUIT_PAUSE_SECONDS", "300"))
 
-def get_llm():
-    """获取 LLM 实例"""
+
+def _create_llm(*, timeout: int, max_retries: int):
     if not LLM_MODEL:
         raise ValueError("LLM_MODEL 未配置，请在 .env 中设置 LLM_MODEL")
     if not LLM_BASE_URL:
@@ -185,8 +196,21 @@ def get_llm():
         base_url=LLM_BASE_URL,
         api_key=LLM_API_KEY,
         temperature=0.3,
-        timeout=30,
-        max_retries=2,
+        timeout=timeout,
+        max_retries=max_retries,
     )
     logger.info("[LLM] 初始化完成")
     return llm
+
+
+def get_llm():
+    """获取普通对话 LLM；保留原有的客户端重试策略。"""
+    return _create_llm(timeout=30, max_retries=2)
+
+
+def get_graph_llm():
+    """获取图谱提取 LLM；重试只由持久化任务队列负责。"""
+    return _create_llm(
+        timeout=GRAPH_LLM_REQUEST_TIMEOUT_SECONDS,
+        max_retries=0,
+    )

@@ -1,18 +1,115 @@
-"""Low-priority worker for evidence-backed research graph jobs."""
+"""Recoverable low-priority worker for research-graph extraction."""
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
-from typing import Any
+import os
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any, Callable
+from uuid import uuid4
 
-from agents.research_graph_extractor import ResearchGraphExtractor
+from config import (
+    GRAPH_CIRCUIT_FAILURE_THRESHOLD,
+    GRAPH_CIRCUIT_PAUSE_SECONDS,
+    GRAPH_EXTRACTION_TIMEOUT_SECONDS,
+    GRAPH_JOB_HEARTBEAT_SECONDS,
+    GRAPH_JOB_LEASE_SECONDS,
+    GRAPH_RETRY_DELAY_SECONDS,
+)
 
 logger = logging.getLogger("paper-agent")
 
 
+class GraphExtractionTimeout(TimeoutError):
+    pass
+
+
+class GraphProcessError(RuntimeError):
+    pass
+
+
+class GraphSubprocessRunner:
+    """Run one LLM attempt in a process that can be forcibly terminated."""
+
+    def __init__(self, timeout_seconds: int, heartbeat_seconds: int):
+        self.timeout_seconds = timeout_seconds
+        self.heartbeat_seconds = heartbeat_seconds
+        self.current_process: asyncio.subprocess.Process | None = None
+
+    @staticmethod
+    def _command() -> tuple[str, ...]:
+        return (sys.executable, "-m", "tools.research_graph_process")
+
+    async def run(self, payload: dict[str, Any],
+                  heartbeat: Callable[[], None]) -> dict[str, Any]:
+        environment = os.environ.copy()
+        environment["PYTHONIOENCODING"] = "utf-8"
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        process = await asyncio.create_subprocess_exec(
+            *self._command(),
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(Path(__file__).resolve().parents[1]),
+            env=environment,
+            creationflags=creationflags,
+        )
+        self.current_process = process
+        communicate_task = asyncio.create_task(
+            process.communicate(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+        )
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.timeout_seconds
+        try:
+            while not communicate_task.done():
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    process.kill()
+                    await process.wait()
+                    communicate_task.cancel()
+                    await asyncio.gather(communicate_task, return_exceptions=True)
+                    raise GraphExtractionTimeout(
+                        f"图谱提取超过 {self.timeout_seconds} 秒，子进程已终止"
+                    )
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(communicate_task),
+                        timeout=min(self.heartbeat_seconds, remaining),
+                    )
+                except asyncio.TimeoutError:
+                    heartbeat()
+            stdout, stderr = await communicate_task
+            try:
+                result = json.loads(stdout.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                detail = stderr.decode("utf-8", errors="replace")[-1000:]
+                raise GraphProcessError(f"提取子进程返回无效 JSON: {detail}") from exc
+            if process.returncode != 0 or not result.get("ok"):
+                message = result.get("error") or stderr.decode(
+                    "utf-8", errors="replace"
+                )[-1000:]
+                raise GraphProcessError(message or "提取子进程异常退出")
+            return result
+        except asyncio.CancelledError:
+            if process.returncode is None:
+                process.kill()
+                await process.wait()
+            communicate_task.cancel()
+            await asyncio.gather(communicate_task, return_exceptions=True)
+            raise
+        finally:
+            if process.returncode is None:
+                process.kill()
+                await process.wait()
+            self.current_process = None
+
+
 class ResearchGraphWorker:
-    """Runs one LLM extraction only when no PDF job is queued or processing."""
+    """Claim one leased job at a time only while the PDF queue is idle."""
 
     def __init__(self, container: Any, graph_repository: Any, upload_queue: Any,
                  wakeup: asyncio.Event):
@@ -21,39 +118,130 @@ class ResearchGraphWorker:
         self.upload_queue = upload_queue
         self.wakeup = wakeup
         self.stopped = False
-        self.extractor = ResearchGraphExtractor(container.llm)
-
-    def _set_status(self, paper_id: str, graph_status: str, **fields: Any) -> None:
-        self.container.mongodb.papers.update_one(
-            {"arxiv_id": paper_id}, {"$set": {"graph_status": graph_status, **fields}}
+        self.worker_id = f"graph-{uuid4().hex[:12]}"
+        self.lease_seconds = max(
+            GRAPH_JOB_LEASE_SECONDS,
+            GRAPH_EXTRACTION_TIMEOUT_SECONDS + 2 * GRAPH_JOB_HEARTBEAT_SECONDS,
         )
+        self.runner = GraphSubprocessRunner(
+            GRAPH_EXTRACTION_TIMEOUT_SECONDS,
+            GRAPH_JOB_HEARTBEAT_SECONDS,
+        )
+
+    @staticmethod
+    def _safe_paper(paper: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "arxiv_id": str(paper.get("arxiv_id", "")),
+            "title": str(paper.get("title", "")),
+        }
+
+    @staticmethod
+    def _safe_chunks(chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [
+            {
+                "chunk_index": int(chunk.get("chunk_index", index)),
+                "content": str(chunk.get("content", "")),
+                "metadata": {
+                    key: value
+                    for key, value in dict(chunk.get("metadata", {})).items()
+                    if key in {"heading", "section", "page", "is_appendix", "level", "merged"}
+                },
+            }
+            for index, chunk in enumerate(chunks)
+        ]
+
+    def _heartbeat(self, paper_id: str) -> None:
+        if not self.graph_repository.heartbeat(
+            paper_id, self.worker_id, self.lease_seconds
+        ):
+            logger.warning("[ResearchGraph] %s 的任务租约已丢失", paper_id)
 
     async def process_once(self) -> bool:
         if self.upload_queue.count_pending() > 0:
             return False
-        job = self.graph_repository.claim_next_job()
+        self.graph_repository.recover_expired_leases()
+        circuit = self.graph_repository.circuit_state()
+        if circuit["open"]:
+            return False
+        job = self.graph_repository.claim_next_job(
+            self.worker_id, self.lease_seconds
+        )
         if not job:
             return False
+
         paper_id = job["paper_id"]
-        self._set_status(paper_id, "extracting")
+        paper = self.container.mongodb.get_paper(paper_id)
+        if not paper or paper.get("status") != "indexed":
+            diagnostics = {
+                "result_reason": "paper_not_indexed",
+                "selected_chunk_count": 0,
+                "model_candidate_count": 0,
+                "extractor_rejected_count": 0,
+                "evidence_rejected_count": 0,
+            }
+            self.graph_repository.complete_job(
+                paper_id, self.worker_id, 0, diagnostics
+            )
+            return True
+
+        chunks = self.container.mongodb.get_chunks_by_paper(paper_id)
+        payload = {
+            "paper": self._safe_paper(paper),
+            "chunks": self._safe_chunks(chunks),
+        }
+        logger.info(
+            "[ResearchGraph] %s 开始第 %d/%d 次提取（版本 %s）",
+            paper_id, job.get("attempt_count", 1), job.get("max_attempts", 2),
+            job.get("graph_version"),
+        )
         try:
-            paper = self.container.mongodb.get_paper(paper_id)
-            if not paper or paper.get("status") != "indexed":
-                self.graph_repository.complete_job(paper_id, 0)
-                return True
-            chunks = self.container.mongodb.get_chunks_by_paper(paper_id)
-            loop = asyncio.get_running_loop()
-            candidates = await loop.run_in_executor(None, self.extractor.extract, paper, chunks)
-            edges = self.graph_repository.upsert_relations(paper, chunks, candidates)
-            self.graph_repository.complete_job(paper_id, len(edges))
-            self._set_status(paper_id, "ready", graph_edge_count=len(edges), graph_error=None)
-            logger.info("[ResearchGraph] %s 提取完成，关系数 %d", paper_id, len(edges))
+            result = await self.runner.run(
+                payload, lambda: self._heartbeat(paper_id)
+            )
+            candidates = result.get("candidates", [])
+            edges = self.graph_repository.upsert_relations(
+                payload["paper"], payload["chunks"], candidates
+            )
+            diagnostics = dict(result.get("diagnostics", {}))
+            diagnostics["evidence_rejected_count"] = max(
+                0, len(candidates) - len(edges)
+            )
+            if not edges and candidates:
+                diagnostics["result_reason"] = "all_candidates_rejected_by_evidence"
+            self.graph_repository.complete_job(
+                paper_id, self.worker_id, len(edges), diagnostics
+            )
+            self.graph_repository.record_infrastructure_success()
+            logger.info(
+                "[ResearchGraph] %s 提取完成，关系数 %d，原因 %s",
+                paper_id, len(edges), diagnostics.get("result_reason"),
+            )
+        except GraphExtractionTimeout as exc:
+            status = self.graph_repository.fail_attempt(
+                paper_id, self.worker_id, str(exc), "timeout",
+                GRAPH_RETRY_DELAY_SECONDS,
+            )
+            self.graph_repository.record_infrastructure_failure(
+                str(exc), threshold=GRAPH_CIRCUIT_FAILURE_THRESHOLD,
+                pause_seconds=GRAPH_CIRCUIT_PAUSE_SECONDS,
+            )
+            logger.warning("[ResearchGraph] %s 超时，状态 %s", paper_id, status)
+        except GraphProcessError as exc:
+            status = self.graph_repository.fail_attempt(
+                paper_id, self.worker_id, str(exc), "process_or_llm_error",
+                GRAPH_RETRY_DELAY_SECONDS,
+            )
+            self.graph_repository.record_infrastructure_failure(
+                str(exc), threshold=GRAPH_CIRCUIT_FAILURE_THRESHOLD,
+                pause_seconds=GRAPH_CIRCUIT_PAUSE_SECONDS,
+            )
+            logger.warning("[ResearchGraph] %s 子进程失败，状态 %s: %s", paper_id, status, exc)
         except Exception as exc:
-            retrying = self.graph_repository.fail_or_retry_job(paper_id, str(exc))
-            self._set_status(paper_id, "pending" if retrying else "failed",
-                             graph_error=str(exc))
-            logger.warning("[ResearchGraph] %s 提取失败%s: %s", paper_id,
-                           "，将重试一次" if retrying else "，已停止重试", exc)
+            status = self.graph_repository.fail_attempt(
+                paper_id, self.worker_id, str(exc), "worker_error",
+                GRAPH_RETRY_DELAY_SECONDS,
+            )
+            logger.exception("[ResearchGraph] %s 工作者失败，状态 %s", paper_id, status)
         return True
 
     async def run(self) -> None:
@@ -70,4 +258,3 @@ class ResearchGraphWorker:
     def stop(self) -> None:
         self.stopped = True
         self.wakeup.set()
-

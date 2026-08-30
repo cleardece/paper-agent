@@ -21,6 +21,17 @@
     .relation-arrow { color:var(--accent); padding:0 5px; } .tag { display:inline-block; margin:8px 6px 0 0; padding:3px 7px; border-radius:999px; background:var(--surface-subtle); color:var(--muted); font-size:12px; }
     details { margin-top:11px; } details p { white-space:pre-wrap; color:var(--text); line-height:1.65; }
     .review { cursor:pointer; font-size:12px; } .review.confirmed { color:var(--success); } .review.rejected { color:var(--danger); }
+    .graph-notice { margin:0 0 16px; padding:12px 14px; border:1px solid var(--border); border-radius:10px; background:var(--surface-raised); color:var(--muted); font-size:13px; line-height:1.6; }
+    .job-section { margin:16px 0 22px; }
+    .job-section h2 { margin:0 0 10px; color:var(--text); font-size:17px; }
+    .job-list { display:grid; gap:8px; }
+    .job-card { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:12px; align-items:center; padding:12px 14px; border:1px solid var(--border); border-radius:10px; background:var(--surface-raised); }
+    .job-title { color:var(--text); font-weight:650; overflow-wrap:anywhere; }
+    .job-detail { margin-top:4px; color:var(--muted); font-size:12px; line-height:1.5; }
+    .job-status { display:inline-block; margin-right:6px; padding:2px 7px; border-radius:999px; background:var(--surface-subtle); }
+    .job-status.failed { color:var(--danger); } .job-status.extracting { color:var(--accent); } .job-status.completed_empty { color:var(--warning); } .job-status.completed_with_edges { color:var(--success); }
+    .retry-button { border:1px solid var(--border); border-radius:8px; background:var(--bubble); color:var(--accent); padding:7px 10px; cursor:pointer; }
+    .circuit-warning { color:var(--danger); font-weight:650; }
     .empty { padding:60px 16px; text-align:center; color:var(--muted); }
     @media(max-width:650px){ .graph-head{align-items:flex-start}.graph-toolbar{align-items:stretch}.graph-toolbar,input,.filter{width:100%}.graph-head{flex-direction:column}.relation-top{align-items:flex-start;flex-direction:column} }
   </style>
@@ -31,6 +42,11 @@
       <div><p class="eyebrow">可追溯关系</p><h1>研究图谱</h1><p id="summary" class="muted">正在读取图谱状态…</p></div>
       <div style="display:flex;gap:8px"><button id="themeToggle" class="icon-button" type="button">◐</button><a class="back-btn" href="/papers">论文库</a><a class="back-btn" href="/">返回对话</a></div>
     </header>
+    <p class="graph-notice">论文完成索引后自动加入图谱任务；新论文优先，历史论文随后回填。任务只在 PDF 队列空闲时串行执行。聊天不会现场等待图谱，未覆盖论文继续使用普通 RAG。</p>
+    <section class="job-section">
+      <h2>论文图谱任务</h2>
+      <div id="jobs" class="job-list"><div class="muted">正在读取任务状态…</div></div>
+    </section>
     <section class="graph-toolbar" aria-label="图谱筛选">
       <input id="query" placeholder="搜索方法、数据集或指标（例如 Dataset X）" />
       <select id="entityType" class="filter"><option value="">所有实体</option><option value="method">方法</option><option value="dataset">数据集</option><option value="metric">指标</option></select>
@@ -45,11 +61,29 @@ document.documentElement.dataset.theme = savedTheme || "dark";
 $("#themeToggle").onclick = () => { const theme = document.documentElement.dataset.theme === "dark" ? "light" : "dark"; document.documentElement.dataset.theme = theme; localStorage.setItem("paperAgentTheme", theme); };
 const relationText = { proposes:"提出", uses:"使用", compares_with:"比较" };
 const statusText = { auto:"自动提取", confirmed:"已确认", rejected:"已拒绝" };
+const jobStatusText = { pending:"等待提取", retry_wait:"等待重试", extracting:"正在提取", completed_with_edges:"已生成关系", completed_empty:"未发现可证据化关系", failed:"提取失败" };
+const reasonText = { no_selected_chunks:"没有可用于提取的正文片段", model_returned_no_relations:"模型明确返回无关系", invalid_model_response:"模型输出无法解析", all_candidates_rejected_by_extractor:"候选关系字段不符合约束", all_candidates_rejected_by_evidence:"候选关系未通过原文证据校验", candidates_ready_for_evidence_validation:"已完成候选关系校验", paper_not_indexed:"论文当前不是已索引状态" };
 function escapeHtml(value) { const el=document.createElement("div"); el.textContent=value || ""; return el.innerHTML; }
 async function review(id, status) {
   const response = await fetch("/api/research-graph/edges/" + encodeURIComponent(id), {method:"PATCH", headers:{"Content-Type":"application/json"}, body:JSON.stringify({review_status:status})});
   if (!response.ok) return alert("更新失败，请稍后重试。");
   loadEdges();
+}
+async function retryJob(paperId) {
+  const response = await fetch("/api/research-graph/jobs/retry", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({paper_id:paperId})});
+  if (!response.ok) { const data=await response.json().catch(()=>({})); return alert(data.detail || "重试失败"); }
+  await loadDashboard();
+}
+function jobCard(job) {
+  const diagnostics = job.diagnostics || {};
+  const reason = reasonText[diagnostics.result_reason] || diagnostics.result_reason || job.error || "";
+  const counts = diagnostics.selected_chunk_count == null ? "" : `选中 ${diagnostics.selected_chunk_count} 个片段 · 模型候选 ${diagnostics.model_candidate_count || 0} 条 · 证据拒绝 ${diagnostics.evidence_rejected_count || 0} 条`;
+  const action = job.status === "failed" ? `<button class="retry-button" onclick='retryJob(${JSON.stringify(job.paper_id)})'>重新提取</button>` : "";
+  return `<article class="job-card"><div><div class="job-title">${escapeHtml(job.paper_title)}</div><div class="job-detail"><span class="job-status ${job.status}">${jobStatusText[job.status] || job.status}</span>版本 ${escapeHtml(job.graph_version || "未标记")} · 第 ${job.run_number || 1} 轮 · 尝试 ${job.attempt_count || 0}/${job.max_attempts || 2}</div>${reason ? `<div class="job-detail">${escapeHtml(reason)}</div>` : ""}${counts ? `<div class="job-detail">${escapeHtml(counts)}</div>` : ""}</div>${action}</article>`;
+}
+async function loadJobs() {
+  const data = await fetch("/api/research-graph/jobs?limit=100").then(r=>r.json());
+  $("#jobs").innerHTML = data.jobs.length ? data.jobs.map(jobCard).join("") : '<div class="muted">论文完成索引后会自动出现在这里。</div>';
 }
 function edgeCard(edge) {
   const evidence = edge.evidence || {};
@@ -57,7 +91,8 @@ function edgeCard(edge) {
 }
 async function loadStatus() {
   const data = await fetch("/api/research-graph/status").then(r=>r.json());
-  $("#summary").textContent = `关系 ${data.edges} 条 · 待提取 ${data.pending} 篇 · 提取中 ${data.extracting} 篇 · 已完成 ${data.completed} 篇 · 失败 ${data.failed} 篇`;
+  const circuit = data.circuit?.open ? ` · 图谱队列已暂停：${data.circuit.last_error || "LLM 服务异常"}` : "";
+  $("#summary").innerHTML = `论文库 ${data.indexed_papers} 篇 · 图谱覆盖 ${data.covered_papers} 篇 · 等待 ${(data.pending || 0) + (data.retry_wait || 0)} 篇 · 提取中 ${data.extracting} 篇 · 失败 ${data.failed} 篇 · 关系 ${data.edges} 条<span class="circuit-warning">${escapeHtml(circuit)}</span>`;
 }
 async function loadEdges() {
   const params = new URLSearchParams();
@@ -66,11 +101,12 @@ async function loadEdges() {
   if ($("#reviewStatus").value) params.set("review_status", $("#reviewStatus").value);
   const data = await fetch("/api/research-graph?" + params).then(r=>r.json());
   $("#relations").innerHTML = data.edges.length ? data.edges.map(edgeCard).join("") : '<div class="empty">还没有满足条件的关系。论文完成索引后会在空闲时自动提取；每一条关系都必须带原文证据。</div>';
-  loadStatus();
 }
+async function loadDashboard() { await Promise.all([loadStatus(), loadJobs(), loadEdges()]); }
 $("#query").addEventListener("input", () => { clearTimeout(window.graphSearchTimer); window.graphSearchTimer=setTimeout(loadEdges,300); });
 $("#entityType").onchange = loadEdges; $("#reviewStatus").onchange = loadEdges;
-loadEdges(); loadStatus();
+loadDashboard();
+setInterval(() => { if (!document.hidden) loadDashboard(); }, 5000);
 </script>
 </body>
 </html>

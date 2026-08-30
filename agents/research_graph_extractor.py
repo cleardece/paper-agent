@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import re
 from typing import Any
 
 from storage.research_graph import ENTITY_TYPES, RELATIONS
@@ -24,24 +23,26 @@ class ResearchGraphExtractor:
         for chunk in chunks:
             metadata = chunk.get("metadata", {})
             heading = " ".join(str(metadata.get(key, "")) for key in ("heading", "section")).lower()
+            if "reference" in heading or metadata.get("is_appendix"):
+                continue
             score = sum(1 for keyword in self.SIGNAL_HEADINGS if keyword in heading)
-            if score:
-                scored.append((score, chunk))
-        if not scored:
-            scored = [(0, chunk) for chunk in chunks[:self.max_chunks]]
+            scored.append((score, chunk))
         scored.sort(key=lambda item: (-item[0], int(item[1].get("chunk_index", 0))))
         return [chunk for _, chunk in scored[:self.max_chunks]]
 
     @staticmethod
-    def _load_json(content: str) -> list[dict[str, Any]]:
-        fenced = re.search(r"\[\s*\{.*?\}\s*\]", content, re.DOTALL)
-        if not fenced:
-            return []
+    def _load_json(content: str) -> tuple[list[dict[str, Any]], str]:
+        start = content.find("[")
+        end = content.rfind("]")
+        if start < 0 or end < start:
+            return [], "invalid_json"
         try:
-            value = json.loads(fenced.group(0))
+            value = json.loads(content[start:end + 1])
         except json.JSONDecodeError:
-            return []
-        return value if isinstance(value, list) else []
+            return [], "invalid_json"
+        if not isinstance(value, list):
+            return [], "invalid_json"
+        return value, "empty_array" if not value else "parsed"
 
     @staticmethod
     def _is_candidate_valid(candidate: dict[str, Any], chunk_ids: set[int]) -> bool:
@@ -59,10 +60,19 @@ class ResearchGraphExtractor:
             and 0 <= confidence <= 1
         )
 
-    def extract(self, paper: dict[str, Any], chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def extract_with_diagnostics(self, paper: dict[str, Any],
+                                 chunks: list[dict[str, Any]]) -> dict[str, Any]:
         selected = self.select_chunks(chunks)
         if not selected:
-            return []
+            return {
+                "candidates": [],
+                "diagnostics": {
+                    "result_reason": "no_selected_chunks",
+                    "selected_chunk_count": 0,
+                    "model_candidate_count": 0,
+                    "extractor_rejected_count": 0,
+                },
+            }
         source = []
         for chunk in selected:
             metadata = chunk.get("metadata", {})
@@ -84,7 +94,31 @@ class ResearchGraphExtractor:
         client = self.llm.bind(temperature=0) if hasattr(self.llm, "bind") else self.llm
         response = client.invoke(prompt)
         content = getattr(response, "content", str(response)).strip()
-        candidates = self._load_json(content)
+        candidates, parse_status = self._load_json(content)
         valid_indices = {int(chunk.get("chunk_index", -1)) for chunk in selected}
-        return [item for item in candidates if self._is_candidate_valid(item, valid_indices)]
+        valid = [
+            item for item in candidates
+            if self._is_candidate_valid(item, valid_indices)
+        ]
+        if parse_status == "invalid_json":
+            reason = "invalid_model_response"
+        elif not candidates:
+            reason = "model_returned_no_relations"
+        elif not valid:
+            reason = "all_candidates_rejected_by_extractor"
+        else:
+            reason = "candidates_ready_for_evidence_validation"
+        return {
+            "candidates": valid,
+            "diagnostics": {
+                "result_reason": reason,
+                "selected_chunk_count": len(selected),
+                "model_candidate_count": len(candidates),
+                "extractor_rejected_count": len(candidates) - len(valid),
+                "response_excerpt": content[:800],
+            },
+        }
 
+    def extract(self, paper: dict[str, Any],
+                chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return self.extract_with_diagnostics(paper, chunks)["candidates"]

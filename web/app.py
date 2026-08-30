@@ -597,8 +597,13 @@ async def startup_event():
     repository.cleanup_terminal_jobs(UPLOAD_JOB_RETENTION_DAYS)
     upload_queue_wakeup = asyncio.Event()
     research_graph_wakeup = asyncio.Event()
-    container.research_graph.enqueue_missing_indexed_papers(
-        container.mongodb.get_papers_by_status("indexed", limit=1000)
+    indexed_papers = container.mongodb.get_papers_by_status("indexed", limit=1000)
+    reconciliation = container.research_graph.reconcile_indexed_papers(indexed_papers)
+    lease_recovery = container.research_graph.recover_expired_leases()
+    logger.info(
+        "[ResearchGraph] 启动对账: 新建 %d，升级 %d，保持 %d；租约回收 %d，失败 %d",
+        reconciliation["created"], reconciliation["upgraded"], reconciliation["unchanged"],
+        lease_recovery["recovered"], lease_recovery["failed"],
     )
     upload_queue_worker = UploadQueueWorker(
         container, repository, upload_queue_wakeup, research_graph_wakeup
@@ -971,7 +976,51 @@ async def research_graph_search(
 @app.get("/api/research-graph/status")
 async def research_graph_status():
     from core.deps import get_container
-    return get_container().research_graph.status_summary()
+    container = get_container()
+    result = container.research_graph.status_summary()
+    result["indexed_papers"] = container.mongodb.count_papers("indexed")
+    result["covered_papers"] = (
+        result["completed_with_edges"] + result["completed_empty"]
+    )
+    return result
+
+
+@app.get("/api/research-graph/jobs")
+async def list_research_graph_jobs(limit: int = 100):
+    from core.deps import get_container
+    container = get_container()
+    jobs = container.research_graph.list_jobs(limit=max(1, min(limit, 200)))
+    public_jobs = []
+    for job in jobs:
+        paper = container.mongodb.get_paper(job["paper_id"])
+        item = {key: value for key, value in job.items() if key != "_id"}
+        item["paper_title"] = (
+            paper.get("title", job["paper_id"]) if paper else job["paper_id"]
+        )
+        public_jobs.append(item)
+    return {"jobs": public_jobs}
+
+
+@app.post("/api/research-graph/jobs/retry")
+async def retry_research_graph_job(body: dict[str, Any]):
+    paper_id = str(body.get("paper_id", "")).strip()
+    if not paper_id:
+        raise HTTPException(status_code=422, detail="paper_id 不能为空")
+    from core.deps import get_container
+    container = get_container()
+    current = container.research_graph.get_job(paper_id)
+    if not current:
+        raise HTTPException(status_code=404, detail="图谱任务不存在")
+    if current.get("status") != "failed":
+        raise HTTPException(status_code=409, detail="只有失败任务可以手动重试")
+    job = container.research_graph.manual_retry(paper_id)
+    if research_graph_wakeup:
+        research_graph_wakeup.set()
+    return {
+        "paper_id": paper_id,
+        "status": job.get("status"),
+        "run_number": job.get("run_number"),
+    }
 
 
 @app.patch("/api/research-graph/edges/{edge_id}")

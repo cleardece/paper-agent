@@ -129,7 +129,7 @@ class UploadQueueWorker:
         self.container.mongodb.update_paper_status(arxiv_id, "indexed", title_embedding=paper_embedding)
         # 图谱是低优先级的后处理：论文此刻已经可被正常 RAG 使用。
         if getattr(self.container, "research_graph", None):
-            self.container.research_graph.enqueue(arxiv_id)
+            self.container.research_graph.enqueue(arxiv_id, source="new")
             self.container.mongodb.papers.update_one(
                 {"arxiv_id": arxiv_id}, {"$set": {"graph_status": "pending"}}
             )
