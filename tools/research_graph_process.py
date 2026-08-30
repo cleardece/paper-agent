@@ -18,9 +18,18 @@ def main() -> int:
     try:
         payload = json.load(sys.stdin)
         extractor = ResearchGraphExtractor(get_graph_llm())
-        result = extractor.extract_with_diagnostics(
-            payload["paper"], payload.get("chunks", []),
-        )
+        mode = payload.get("mode", "extract")
+        if mode == "extract":
+            result = extractor.extract_batch(
+                payload["paper"], payload.get("batch", []),
+            )
+        elif mode == "validate":
+            result = extractor.validate_batch(
+                payload["paper"], payload.get("batch", []),
+                payload.get("candidates", []),
+            )
+        else:
+            raise ValueError(f"未知图谱子进程模式: {mode}")
         json.dump({"ok": True, **result}, sys.stdout, ensure_ascii=False)
         return 0
     except BaseException as exc:

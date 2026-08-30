@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Callable
 from uuid import uuid4
 
+from agents.research_graph_extractor import ResearchGraphExtractor
 from config import (
     GRAPH_CIRCUIT_FAILURE_THRESHOLD,
     GRAPH_CIRCUIT_PAUSE_SECONDS,
@@ -185,29 +186,73 @@ class ResearchGraphWorker:
             return True
 
         chunks = self.container.mongodb.get_chunks_by_paper(paper_id)
-        payload = {
-            "paper": self._safe_paper(paper),
-            "chunks": self._safe_chunks(chunks),
-        }
+        safe_paper = self._safe_paper(paper)
+        safe_chunks = self._safe_chunks(chunks)
+        batches = ResearchGraphExtractor(None).build_batches(safe_chunks)
         logger.info(
             "[ResearchGraph] %s 开始第 %d/%d 次提取（版本 %s）",
             paper_id, job.get("attempt_count", 1), job.get("max_attempts", 2),
             job.get("graph_version"),
         )
         try:
-            result = await self.runner.run(
-                payload, lambda: self._heartbeat(paper_id)
+            completed_batches = set(job.get("completed_batches", []))
+            for batch_index, batch in enumerate(batches):
+                if batch_index in completed_batches:
+                    continue
+                logger.info(
+                    "[ResearchGraph] %s 处理批次 %d/%d",
+                    paper_id, batch_index + 1, len(batches),
+                )
+                extracted = await self.runner.run(
+                    {"mode": "extract", "paper": safe_paper, "batch": batch},
+                    lambda: self._heartbeat(paper_id),
+                )
+                candidates = extracted.get("candidates", [])
+                if candidates:
+                    validated = await self.runner.run(
+                        {
+                            "mode": "validate", "paper": safe_paper,
+                            "batch": batch, "candidates": candidates,
+                        },
+                        lambda: self._heartbeat(paper_id),
+                    )
+                else:
+                    validated = {"relations": [], "diagnostics": {
+                        "validated_count": 0, "supported_count": 0,
+                        "uncertain_count": 0, "rejected_count": 0,
+                    }}
+                batch_diagnostics = {
+                    "extract": extracted.get("diagnostics", {}),
+                    "validate": validated.get("diagnostics", {}),
+                }
+                if not self.graph_repository.save_batch_result(
+                    paper_id, self.worker_id, batch_index, len(batches),
+                    validated.get("relations", []), batch_diagnostics,
+                ):
+                    raise RuntimeError("保存图谱批次检查点失败，任务租约可能已丢失")
+                self._heartbeat(paper_id)
+
+            staged = self.graph_repository.staged_relations(
+                paper_id, self.worker_id
             )
-            candidates = result.get("candidates", [])
             edges = self.graph_repository.upsert_relations(
-                payload["paper"], payload["chunks"], candidates
+                safe_paper, safe_chunks, staged
             )
-            diagnostics = dict(result.get("diagnostics", {}))
-            diagnostics["evidence_rejected_count"] = max(
-                0, len(candidates) - len(edges)
-            )
-            if not edges and candidates:
-                diagnostics["result_reason"] = "all_candidates_rejected_by_evidence"
+            diagnostics = {
+                "result_reason": (
+                    "relations_ready" if edges else "no_verified_relations"
+                ),
+                "batch_total": len(batches),
+                "batch_completed": len(batches),
+                "candidate_count": len(staged),
+                "auto_verified_count": sum(
+                    edge.get("review_status") == "auto_verified" for edge in edges
+                ),
+                "needs_review_count": sum(
+                    edge.get("review_status") == "needs_review" for edge in edges
+                ),
+                "evidence_rejected_count": max(0, len(staged) - len(edges)),
+            }
             self.graph_repository.complete_job(
                 paper_id, self.worker_id, len(edges), diagnostics
             )

@@ -10,10 +10,15 @@ from uuid import uuid4
 
 from pymongo import ASCENDING, DESCENDING, ReturnDocument
 
-GRAPH_VERSION = "evidence-graph-v2"
-RELATIONS = {"proposes", "uses", "compares_with"}
-ENTITY_TYPES = {"method", "dataset", "metric"}
-REVIEW_STATUSES = {"auto", "confirmed", "rejected"}
+GRAPH_VERSION = "evidence-graph-v3"
+RELATIONS = {
+    "proposes", "uses", "improves", "compares_with",
+    "evaluates_on", "measures_with", "studies",
+}
+ENTITY_TYPES = {"method", "dataset", "metric", "task"}
+REVIEW_STATUSES = {"auto_verified", "needs_review", "confirmed", "rejected"}
+USABLE_REVIEW_STATUSES = {"auto_verified", "confirmed"}
+SYSTEM_REVIEW_STATUSES = {"auto", "auto_verified", "needs_review"}
 RUNNABLE_STATUSES = {"pending", "retry_wait"}
 
 
@@ -72,6 +77,8 @@ class ResearchGraphRepository:
             "run_number": run_number, "attempt_count": 0, "max_attempts": 2,
             "next_attempt_at": now, "error": None, "error_kind": None,
             "edge_count": 0, "diagnostics": {}, "updated_at": now, "finished_at": None,
+            "batch_total": 0, "completed_batches": [],
+            "staged_relations": [], "batch_diagnostics": {},
         }
         update: dict[str, Any] = {
             "$set": values,
@@ -219,6 +226,40 @@ class ResearchGraphRepository:
         )
         return result.matched_count == 1
 
+    def save_batch_result(self, paper_id: str, worker_id: str, batch_index: int,
+                          batch_total: int, relations: list[dict[str, Any]],
+                          diagnostics: dict[str, Any]) -> bool:
+        job = self.jobs.find_one({
+            "paper_id": paper_id, "status": "extracting", "worker_id": worker_id,
+        })
+        if not job:
+            return False
+        if batch_index in job.get("completed_batches", []):
+            return True
+        now = _now()
+        result = self.jobs.update_one(
+            {
+                "_id": job["_id"], "status": "extracting", "worker_id": worker_id,
+                "completed_batches": {"$ne": batch_index},
+            },
+            {
+                "$set": {
+                    "batch_total": batch_total,
+                    f"batch_diagnostics.{batch_index}": diagnostics,
+                    "updated_at": now,
+                },
+                "$addToSet": {"completed_batches": batch_index},
+                "$push": {"staged_relations": {"$each": relations}},
+            },
+        )
+        return result.modified_count == 1
+
+    def staged_relations(self, paper_id: str, worker_id: str) -> list[dict[str, Any]]:
+        job = self.jobs.find_one({
+            "paper_id": paper_id, "status": "extracting", "worker_id": worker_id,
+        }) or {}
+        return list(job.get("staged_relations", []))
+
     def complete_job(self, paper_id: str, worker_id: str, edge_count: int,
                      diagnostics: dict[str, Any]) -> bool:
         now = _now()
@@ -244,6 +285,7 @@ class ResearchGraphRepository:
                 "$push": {"attempt_history": history},
                 "$unset": {
                     "worker_id": "", "lease_expires_at": "", "heartbeat_at": "",
+                    "staged_relations": "",
                 },
             },
         )
@@ -388,35 +430,42 @@ class ResearchGraphRepository:
     def _chunk_map(chunks: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
         return {int(chunk.get("chunk_index", -1)): chunk for chunk in chunks}
 
-    @staticmethod
-    def _has_evidence_overlap(evidence: str, content: str) -> bool:
-        evidence_tokens = set(re.findall(r"[\w-]{4,}", _normalized(evidence)))
-        content_tokens = set(re.findall(r"[\w-]{4,}", _normalized(content)))
-        return len(evidence_tokens & content_tokens) >= 2
-
     def _validated_relation(self, relation: dict[str, Any],
                             chunks: dict[int, dict[str, Any]]) -> dict[str, Any] | None:
-        relation_name = str(relation.get("relation", "")).strip()
+        extracted_relation = str(relation.get("relation", "")).strip()
+        relation_name = str(
+            relation.get("validated_relation") or extracted_relation
+        ).strip()
         entity_type = str(relation.get("target_type", "")).strip()
         target_name = str(relation.get("target_name", "")).strip()
         try:
             chunk_index = int(relation.get("evidence_chunk_index"))
-            confidence = float(relation.get("confidence", 0))
         except (TypeError, ValueError):
             return None
         evidence = str(relation.get("evidence", "")).strip()
         chunk = chunks.get(chunk_index)
+        verdict = str(relation.get("validation_verdict", "uncertain"))
         if (
             relation_name not in RELATIONS or entity_type not in ENTITY_TYPES
-            or len(target_name) < 2 or not 0 <= confidence <= 1
+            or extracted_relation not in RELATIONS or len(target_name) < 2
             or not chunk or len(evidence) < 12
-            or not self._has_evidence_overlap(evidence, chunk.get("content", ""))
+            or _normalized(evidence) not in _normalized(chunk.get("content", ""))
+            or verdict == "rejected"
         ):
             return None
+        review_status = (
+            "auto_verified"
+            if verdict == "supported" and relation_name == extracted_relation
+            else "needs_review"
+        )
         return {
             "relation": relation_name, "target_type": entity_type,
             "target_name": target_name, "evidence_chunk_index": chunk_index,
-            "evidence": evidence, "confidence": confidence, "chunk": chunk,
+            "evidence": evidence, "chunk": chunk,
+            "review_status": review_status,
+            "extracted_relation": extracted_relation,
+            "validation_verdict": verdict,
+            "validation_reason": str(relation.get("validation_reason", "")),
         }
 
     def upsert_relations(self, paper: dict[str, Any], chunks: list[dict[str, Any]],
@@ -426,7 +475,10 @@ class ResearchGraphRepository:
         valid = [self._validated_relation(item, chunk_map) for item in relations]
         valid = [item for item in valid if item]
         self._paper_node(paper)
-        self.edges.delete_many({"source_paper_id": paper_id, "review_status": "auto"})
+        self.edges.delete_many({
+            "source_paper_id": paper_id,
+            "review_status": {"$in": list(SYSTEM_REVIEW_STATUSES)},
+        })
         now = _now()
         saved: list[dict[str, Any]] = []
         for item in valid:
@@ -448,16 +500,27 @@ class ResearchGraphRepository:
                 "evidence_content_hash": hashlib.sha256(
                     item["chunk"].get("content", "").encode()
                 ).hexdigest(),
-                "evidence": item["evidence"], "confidence": item["confidence"],
-                "extractor_version": GRAPH_VERSION, "review_status": "auto",
+                "evidence": item["evidence"],
+                "evidence_context": item["chunk"].get("content", ""),
+                "extracted_relation": item["extracted_relation"],
+                "validation_verdict": item["validation_verdict"],
+                "validation_reason": item["validation_reason"],
+                "extractor_version": GRAPH_VERSION,
                 "updated_at": now,
             }
+            existing = self.edges.find_one({"_id": edge_id}, {"review_status": 1})
+            review_status = (
+                existing.get("review_status")
+                if existing and existing.get("review_status") in {"confirmed", "rejected"}
+                else item["review_status"]
+            )
             self.edges.update_one(
                 {"_id": edge_id},
-                {"$set": document, "$setOnInsert": {"created_at": now}},
+                {"$set": {**document, "review_status": review_status},
+                 "$setOnInsert": {"created_at": now}},
                 upsert=True,
             )
-            saved.append(document)
+            saved.append({**document, "review_status": review_status})
         return saved
 
     def get_edge(self, edge_id: str) -> dict[str, Any] | None:
@@ -472,7 +535,10 @@ class ResearchGraphRepository:
         ).matched_count == 1
 
     def delete_auto_data_for_paper(self, paper_id: str) -> None:
-        self.edges.delete_many({"source_paper_id": paper_id, "review_status": "auto"})
+        self.edges.delete_many({
+            "source_paper_id": paper_id,
+            "review_status": {"$in": list(SYSTEM_REVIEW_STATUSES)},
+        })
         self.jobs.delete_many({"paper_id": paper_id})
         self.nodes.delete_many({"_id": f"paper:{paper_id}"})
 
@@ -486,6 +552,8 @@ class ResearchGraphRepository:
             filters["relation"] = relation
         if review_status in REVIEW_STATUSES:
             filters["review_status"] = review_status
+        elif review_status is None:
+            filters["review_status"] = {"$in": list(USABLE_REVIEW_STATUSES)}
         if query.strip():
             escaped = re.escape(query.strip())
             filters["$or"] = [
@@ -500,7 +568,7 @@ class ResearchGraphRepository:
             return []
         edges = self.edges.find(
             {
-                "review_status": {"$ne": "rejected"},
+                "review_status": {"$in": list(USABLE_REVIEW_STATUSES)},
                 "$or": [
                     {"target_name": {"$regex": escaped, "$options": "i"}},
                     {"evidence": {"$regex": escaped, "$options": "i"}},
@@ -509,6 +577,52 @@ class ResearchGraphRepository:
             {"source_paper_id": 1},
         ).limit(limit)
         return list(dict.fromkeys(edge["source_paper_id"] for edge in edges))
+
+    def paper_links(self, limit: int = 100) -> list[dict[str, Any]]:
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for edge in self.edges.find({
+            "review_status": {"$in": list(USABLE_REVIEW_STATUSES)},
+        }).limit(5000):
+            grouped.setdefault(edge["target_node_id"], []).append(edge)
+
+        links: dict[tuple[str, str], dict[str, Any]] = {}
+        for edges in grouped.values():
+            by_paper = {edge["source_paper_id"]: edge for edge in edges}
+            paper_ids = sorted(by_paper)
+            for left_index, left_id in enumerate(paper_ids):
+                for right_id in paper_ids[left_index + 1:]:
+                    left = by_paper[left_id]
+                    right = by_paper[right_id]
+                    key = (left_id, right_id)
+                    item = links.setdefault(key, {
+                        "paper_a_id": left_id, "paper_b_id": right_id,
+                        "reasons": [],
+                    })
+                    item["reasons"].append({
+                        "entity_name": left["target_name"],
+                        "entity_type": left["target_type"],
+                        "paper_a_relation": left["relation"],
+                        "paper_b_relation": right["relation"],
+                        "paper_a_evidence": left.get("evidence", ""),
+                        "paper_b_evidence": right.get("evidence", ""),
+                    })
+
+        paper_ids = {paper_id for key in links for paper_id in key}
+        titles = {
+            paper["arxiv_id"]: paper.get("title", paper["arxiv_id"])
+            for paper in self.papers.find(
+                {"arxiv_id": {"$in": list(paper_ids)}}, {"arxiv_id": 1, "title": 1}
+            )
+        }
+        result = []
+        for item in sorted(
+            links.values(), key=lambda value: len(value["reasons"]), reverse=True
+        )[:limit]:
+            item["paper_a_title"] = titles.get(item["paper_a_id"], item["paper_a_id"])
+            item["paper_b_title"] = titles.get(item["paper_b_id"], item["paper_b_id"])
+            item["shared_evidence_count"] = len(item["reasons"])
+            result.append(item)
+        return result
 
     def status_summary(self) -> dict[str, Any]:
         counts = {
@@ -522,5 +636,11 @@ class ResearchGraphRepository:
             counts["completed_with_edges"] + counts["completed_empty"]
         )
         counts["edges"] = self.edges.count_documents({})
+        counts["usable_edges"] = self.edges.count_documents({
+            "review_status": {"$in": list(USABLE_REVIEW_STATUSES)},
+        })
+        counts["needs_review"] = self.edges.count_documents({
+            "review_status": "needs_review",
+        })
         counts["circuit"] = self.circuit_state()
         return counts

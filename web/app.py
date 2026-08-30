@@ -968,9 +968,17 @@ async def research_graph_search(
             "section": edge.get("evidence_section", ""),
             "page": edge.get("evidence_page", 0),
             "content": edge.get("evidence", ""),
+            "context": edge.get("evidence_context", ""),
         }
         edge.pop("evidence_content_hash", None)
     return {"edges": edges}
+
+
+@app.get("/api/research-graph/paper-links")
+async def research_graph_paper_links(limit: int = 100):
+    from core.deps import get_container
+    links = get_container().research_graph.paper_links(limit=max(1, min(limit, 200)))
+    return {"links": links}
 
 
 @app.get("/api/research-graph/status")
