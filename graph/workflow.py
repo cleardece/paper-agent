@@ -2,9 +2,10 @@
 LangGraph Workflow - Supervisor多Agent协作状态图
 
 流程：
-START → Supervisor → Fetcher → END
-        Supervisor → Retriever → Analyzer → Critic → Presenter → Reflector → END
-        Supervisor → DirectAnalyzer → Presenter → END
+START → PaperContextResolver → Supervisor → TurnContext
+      → Fetcher → Retriever → Analyzer → Critic → Presenter → Reflector → END
+      → Retriever → Analyzer → Critic → Presenter → Reflector → END
+      → DirectAnalyzer → Presenter → Reflector → END
 """
 
 from langgraph.graph import StateGraph, START, END
@@ -17,6 +18,8 @@ from agents.critic import CriticAgent
 from agents.presenter import PresenterAgent
 from agents.reflector import ReflectorAgent
 from agents.direct_analyzer import DirectAnalyzerAgent
+from core.paper_context import PaperContextResolver
+from core.turn_context import TurnContextBuilder
 
 
 # 路由函数
@@ -40,7 +43,9 @@ def critic_route(state: AgentState) -> str:
 
 
 def build_workflow(
+    paper_context_resolver: PaperContextResolver,
     supervisor: SupervisorAgent,
+    turn_context_builder: TurnContextBuilder,
     fetcher: FetcherAgent,
     retriever: RetrieverAgent,
     analyzer: AnalyzerAgent,
@@ -52,7 +57,9 @@ def build_workflow(
     graph = StateGraph(AgentState)
 
     # 节点
+    graph.add_node("paper_context_resolver", paper_context_resolver.invoke)
     graph.add_node("supervisor", supervisor.invoke)
+    graph.add_node("turn_context", turn_context_builder.invoke)
     graph.add_node("fetcher", fetcher.invoke)
     graph.add_node("retriever", retriever.invoke)
     graph.add_node("analyzer", analyzer.invoke)
@@ -68,7 +75,9 @@ def build_workflow(
         graph.add_node("direct", direct_analyzer.invoke)
 
     # 边
-    graph.add_edge(START, "supervisor")
+    graph.add_edge(START, "paper_context_resolver")
+    graph.add_edge("paper_context_resolver", "supervisor")
+    graph.add_edge("supervisor", "turn_context")
 
     # 构建 supervisor 路由映射
     supervisor_targets = {"fetcher": "fetcher", "retriever": "retriever", "END": "presenter"}
@@ -76,7 +85,7 @@ def build_workflow(
         supervisor_targets["direct"] = "direct"
 
     graph.add_conditional_edges(
-        "supervisor",
+        "turn_context",
         supervisor_route,
         supervisor_targets,
     )

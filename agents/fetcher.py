@@ -9,6 +9,13 @@ from langchain_core.messages import SystemMessage, HumanMessage
 
 from state.graph_state import AgentState
 from core.cache import cache
+from core.search_policy import (
+    ExternalSearchNotAllowed,
+    InvalidSearchRequest,
+    SearchRequest,
+    ensure_external_search_allowed,
+    guarded_arxiv_search,
+)
 
 logger = logging.getLogger("paper-agent")
 
@@ -32,8 +39,28 @@ class FetcherAgent:
         4. Embedding → 存Milvus
         5. 更新state
         """
-        # 优先使用 Supervisor 提取的 search_query，否则用 user_query
-        query = state.get("search_query") or state["user_query"]
+        turn_context = state.get("turn_context") or {}
+        try:
+            ensure_external_search_allowed(turn_context)
+            request = SearchRequest.from_dict(
+                turn_context.get("search_request") or {}
+            )
+        except ExternalSearchNotAllowed:
+            return {
+                "answer": "当前请求不允许执行外部论文搜索。",
+                "error": "EXTERNAL_SEARCH_NOT_ALLOWED",
+                "primary_paper_id": None,
+                "resolved_paper_ids": [],
+            }
+        except InvalidSearchRequest:
+            return {
+                "answer": "没有提取到有效的论文搜索条件。",
+                "error": "INVALID_SEARCH_REQUEST",
+                "primary_paper_id": None,
+                "resolved_paper_ids": [],
+            }
+
+        query = request.value
         logger.info(f"[Fetcher] 开始搜索论文: {query[:50]}...")
 
         # 1. 搜索（带缓存）
@@ -44,7 +71,13 @@ class FetcherAgent:
             papers = cached_papers
         else:
             logger.info("[Fetcher] 正在调用 arXiv API...")
-            papers = self.arxiv.search(query, max_results=5)
+            max_results = 1 if request.mode in {"arxiv_id", "title"} else 5
+            papers = guarded_arxiv_search(
+                self.arxiv,
+                turn_context,
+                request,
+                max_results=max_results,
+            )
             logger.info(f"[Fetcher] 找到 {len(papers)} 篇论文")
             # 缓存搜索结果
             if papers:
@@ -114,6 +147,16 @@ class FetcherAgent:
         summary = "\n".join(summary_parts)
         logger.info(f"[Fetcher] 结果汇总:\n{summary}")
 
+        resolved_ids = list(dict.fromkeys(
+            str(item.get("arxiv_id", ""))
+            for item in [*fetched, *already_exists]
+            if item.get("arxiv_id")
+        ))
+        primary_paper_id = resolved_ids[0] if len(resolved_ids) == 1 else None
+        resolved_turn_context = dict(turn_context)
+        resolved_turn_context["paper_ids"] = resolved_ids
+        resolved_turn_context["primary_paper_id"] = primary_paper_id
+
         # 返回结果
         if fetched:
             return {
@@ -121,6 +164,9 @@ class FetcherAgent:
                 "next_agent": "retriever",
                 "error": None,
                 "answer": summary,
+                "primary_paper_id": primary_paper_id,
+                "resolved_paper_ids": resolved_ids,
+                "turn_context": resolved_turn_context,
             }
         else:
             return {
@@ -128,6 +174,9 @@ class FetcherAgent:
                 "next_agent": "presenter",
                 "error": None,
                 "answer": summary + "\n\n建议：稍后重试，或手动从 arXiv 搜索。",
+                "primary_paper_id": primary_paper_id,
+                "resolved_paper_ids": resolved_ids,
+                "turn_context": resolved_turn_context,
             }
 
     def _process_paper(self, paper_meta: dict, session_id: str = None):

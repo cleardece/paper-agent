@@ -174,4 +174,18 @@ class AnalyzerAgent:
 
         logger.info(f"[Analyzer] 分析完成，输出长度: {len(answer)}")
 
-        return {"analysis": answer, "error": None}
+        paper_ids = list(dict.fromkeys(
+            chunk.get("paper_arxiv_id")
+            for chunk in chunks
+            if chunk.get("paper_arxiv_id")
+        ))
+        turn_context = state.get("turn_context") or {}
+        primary_id = turn_context.get("primary_paper_id")
+        if not primary_id and len(paper_ids) == 1:
+            primary_id = paper_ids[0]
+        return {
+            "analysis": answer,
+            "error": None,
+            "primary_paper_id": primary_id,
+            "resolved_paper_ids": paper_ids,
+        }

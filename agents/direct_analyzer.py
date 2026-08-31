@@ -1,9 +1,8 @@
 """
 Paper Agent - Direct Analyzer Agent
-单篇论文快速通道：下载 → 解析 → 动态提取核心章节 → 喂 LLM + 后台入库
+单篇论文安全分析通道：读取已解析本地论文 → 提取核心章节 → 喂 LLM
 """
 
-import json
 import logging
 import re
 from langchain_core.messages import SystemMessage, HumanMessage
@@ -38,100 +37,68 @@ SECTION_PATTERNS = {
 class DirectAnalyzerAgent:
     """单篇论文快速分析 Agent - 动态章节提取"""
 
-    def __init__(self, llm, mongodb_client, embedder, milvus_client, pdf_parser, arxiv_api):
+    def __init__(self, llm, mongodb_client, embedder, milvus_client, pdf_parser):
         self.llm = llm
         self.mongo = mongodb_client
         self.embedder = embedder
         self.milvus = milvus_client
         self.parser = pdf_parser
-        self.arxiv = arxiv_api
 
     def invoke(self, state: AgentState) -> dict:
         query = state["user_query"]
-        target_paper = state.get("target_paper")
-        target_paper_id = state.get("target_paper_id")
+        turn_context = state.get("turn_context") or {}
+        target_paper_id = (
+            turn_context.get("primary_paper_id")
+            or state.get("target_paper_id")
+        )
         logger.info(f"[DirectAnalyzer] 开始分析: {query[:50]}...")
 
-        # 1. 尝试从知识库找到论文
-        if target_paper_id:
-            paper_info = self.mongo.get_paper(target_paper_id)
-            if not paper_info:
-                logger.warning(f"[DirectAnalyzer] 论文库选择不存在: {target_paper_id}")
-                return {
-                    "answer": "所选论文已不存在，请从论文库重新选择。",
-                    "error": "selected_paper_not_found",
-                }
-            logger.info(
-                f"[DirectAnalyzer] 使用论文库显式选择: "
-                f"{paper_info.get('arxiv_id', target_paper_id)}"
-            )
-        else:
-            paper_info = self._find_paper(query, target_paper)
+        if not target_paper_id:
+            return {
+                "answer": "请先选择或明确指定要分析的论文。",
+                "error": "NEED_PAPER_CONTEXT",
+                "primary_paper_id": None,
+                "resolved_paper_ids": [],
+            }
 
-        if paper_info:
-            logger.info(f"[DirectAnalyzer] 知识库中找到论文: {paper_info['title'][:50]}")
-            full_text = paper_info.get("full_text", "")
-            chunks = list(self.mongo.get_chunks_by_paper(paper_info["arxiv_id"]))
-            if not full_text and chunks:
-                full_text = self._chunks_to_full_text(chunks)
-            if not full_text:
-                if target_paper_id:
-                    return {
-                        "answer": "所选论文没有可用正文片段，无法分析。",
-                        "error": "selected_paper_has_no_content",
-                    }
-                logger.info("[DirectAnalyzer] 论文全文缺失，尝试下载补全...")
-                return self._fetch_and_analyze(query)
+        paper_info = self.mongo.get_paper(target_paper_id)
+        if not paper_info:
+            logger.warning(f"[DirectAnalyzer] 论文库选择不存在: {target_paper_id}")
+            return {
+                "answer": "所选论文已不存在，请从论文库重新选择。",
+                "error": "selected_paper_not_found",
+                "primary_paper_id": None,
+                "resolved_paper_ids": [],
+            }
+        logger.info(
+            f"[DirectAnalyzer] 使用已解析论文: "
+            f"{paper_info.get('arxiv_id', target_paper_id)}"
+        )
 
-            # 复核并恢复 Milvus 索引。正文分析不依赖索引恢复成功。
-            if chunks and self.embedder is not None and self.milvus is not None:
-                self._ensure_indexed(paper_info, chunks)
+        logger.info(f"[DirectAnalyzer] 知识库中找到论文: {paper_info['title'][:50]}")
+        paper_id = paper_info.get("arxiv_id", target_paper_id)
+        full_text = paper_info.get("full_text", "")
+        chunks = list(self.mongo.get_chunks_by_paper(paper_id))
+        if not full_text and chunks:
+            full_text = self._chunks_to_full_text(chunks)
+        if not full_text:
+            return {
+                "answer": "所选论文没有可用正文片段，无法分析。",
+                "error": "selected_paper_has_no_content",
+                "primary_paper_id": None,
+                "resolved_paper_ids": [],
+            }
 
-            # 动态提取章节 + 分析
-            sections = self._parse_sections_from_text(full_text)
-            core_text = self._extract_relevant_sections(query, sections)
-            result = self._analyze(paper_info, core_text, query)
-            result.setdefault("resolved_paper_id", paper_info["arxiv_id"])
-            return result
+        if chunks and self.embedder is not None and self.milvus is not None:
+            self._ensure_indexed(paper_info, chunks)
 
-        # 2. 库中没有 → 下载 + 解析 + 分析 + 后台入库
-        logger.info("[DirectAnalyzer] 知识库中未找到，开始下载论文...")
-        return self._fetch_and_analyze(query)
-
-    def _find_paper(self, query: str, target_paper: str = None):
-        """从知识库中查找论文"""
-        try:
-            papers = self.mongo.list_papers(
-                limit=50,
-                projection={"arxiv_id": 1, "title": 1, "abstract": 1, "authors": 1, "full_text": 1, "status": 1},
-            )
-            if not papers:
-                return None
-
-            candidates = []
-            if target_paper:
-                candidates.append(target_paper)
-            candidates.extend(re.findall(r'["“]([^"”]{8,})["”]', query))
-
-            for candidate in candidates:
-                normalized = self._normalize_title(candidate)
-                if not normalized:
-                    continue
-                for paper in papers:
-                    if normalized == self._normalize_title(paper.get("title", "")):
-                        logger.info(
-                            f"[DirectAnalyzer] 通过精确标题匹配: "
-                            f"{paper.get('title', '')[:50]}"
-                        )
-                        return paper
-            return None
-        except Exception as e:
-            logger.warning(f"[DirectAnalyzer] 查找论文失败: {e}")
-            return None
-
-    @staticmethod
-    def _normalize_title(title: str) -> str:
-        return re.sub(r"[^a-z0-9]+", "", title.lower())
+        sections = self._parse_sections_from_text(full_text)
+        core_text = self._extract_relevant_sections(query, sections)
+        result = self._analyze(paper_info, core_text, query)
+        result.setdefault("resolved_paper_id", paper_id)
+        result.setdefault("primary_paper_id", paper_id)
+        result.setdefault("resolved_paper_ids", [paper_id])
+        return result
 
     @staticmethod
     def _chunks_to_full_text(chunks: list[dict]) -> str:
@@ -145,77 +112,6 @@ class DirectAnalyzerAgent:
             section = str(metadata.get("section") or "Content").strip()
             parts.append(f"# {section}\n{content}")
         return "\n\n".join(parts)
-
-    def _fetch_and_analyze(self, query: str):
-        """下载论文 → 解析 → 动态提取章节 → 分析 + 后台入库"""
-        try:
-            # 搜索 arXiv
-            papers = self.arxiv.search(query, max_results=1)
-            if not papers:
-                return {"answer": "未找到相关论文，请检查论文标题。", "error": None}
-
-            paper_meta = papers[0]
-            arxiv_id = paper_meta["arxiv_id"]
-            title = paper_meta.get("title", "未知")
-
-            # 检查是否已入库
-            if self.mongo.paper_exists(arxiv_id):
-                existing = self.mongo.get_paper(arxiv_id)
-                if existing and existing.get("full_text"):
-                    logger.info(f"[DirectAnalyzer] 论文已入库: {title[:50]}")
-                    sections = self._parse_sections_from_text(existing["full_text"])
-                    core_text = self._extract_relevant_sections(query, sections)
-                    return self._analyze(existing, core_text, query)
-
-            # 下载 PDF
-            if not paper_meta.get("pdf_url"):
-                return {"answer": f"论文 {title} 没有 PDF 链接。", "error": None}
-
-            pdf_path = self._download_pdf(paper_meta["pdf_url"], arxiv_id)
-
-            # MinerU 解析
-            logger.info(f"[DirectAnalyzer] 正在解析 PDF: {title[:50]}...")
-            parsed = self.parser.parse(pdf_path)
-            full_text = parsed.get("full_text") or parsed.get("text") or parsed.get("markdown") or ""
-            if not full_text and parsed.get("sections"):
-                full_text = "\n\n".join(
-                    f"## {s.get('heading', '')}\n{s.get('content', '')}"
-                    for s in parsed["sections"]
-                )
-            sections = parsed.get("sections", [])
-
-            if not full_text:
-                return {"answer": f"论文 {title} 解析失败，无法提取文本。", "error": None}
-
-            # 存 MongoDB（含全文）
-            self.mongo.upsert_paper({
-                "arxiv_id": arxiv_id,
-                "title": title,
-                "abstract": paper_meta.get("abstract", ""),
-                "authors": paper_meta.get("authors", []),
-                "pdf_url": paper_meta.get("pdf_url", ""),
-                "full_text": full_text,
-                "status": "parsed",
-            })
-
-            paper_info = {
-                "arxiv_id": arxiv_id,
-                "title": title,
-                "authors": paper_meta.get("authors", []),
-                "full_text": full_text,
-            }
-
-            # 同步分块入库
-            self._index_paper(arxiv_id, sections)
-
-            # 动态提取章节 + 分析
-            parsed_sections = self._parse_sections_from_text(full_text)
-            core_text = self._extract_relevant_sections(query, parsed_sections)
-            return self._analyze(paper_info, core_text, query)
-
-        except Exception as e:
-            logger.error(f"[DirectAnalyzer] 处理失败: {e}", exc_info=True)
-            return {"answer": f"处理论文时出错: {str(e)}", "error": str(e)}
 
     def _parse_sections_from_text(self, text: str) -> list[dict]:
         """从 Markdown 文本中解析章节结构"""
@@ -481,23 +377,3 @@ class DirectAnalyzerAgent:
 3. **实验设计**：用了什么数据集？怎么评估的？基线方法是什么？
 4. **主要结果**：关键实验数据和结论是什么？
 5. **局限性与未来工作**：论文自己提到了哪些不足？"""
-
-    def _download_pdf(self, url: str, arxiv_id: str) -> str:
-        """下载 PDF"""
-        import os
-        import httpx
-
-        tmp_dir = os.path.join(os.getcwd(), "tmp_pdfs")
-        os.makedirs(tmp_dir, exist_ok=True)
-        pdf_path = os.path.join(tmp_dir, f"{arxiv_id.replace('/', '_')}.pdf")
-
-        if not os.path.exists(pdf_path):
-            logger.info(f"[DirectAnalyzer] 下载 PDF: {url[:60]}...")
-            with httpx.Client(timeout=60, follow_redirects=True) as client:
-                response = client.get(url)
-                response.raise_for_status()
-                with open(pdf_path, "wb") as f:
-                    f.write(response.content)
-            logger.info("[DirectAnalyzer] PDF 下载完成")
-
-        return pdf_path

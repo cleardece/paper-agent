@@ -10,6 +10,7 @@ import re
 import sys
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 from uuid import uuid4
@@ -42,12 +43,14 @@ from core.conversation_context import (
     refresh_summary,
 )
 from state.graph_state import AgentState
+from core.paper_context import PaperContext, PaperFocusState
+from core.session_state import SessionStateReducer, normalize_agent_result
 
 
-AGENTS = ("supervisor", "fetcher", "retriever", "direct_analyzer", "analyzer", "critic", "presenter")
-QUESTION_FLOW = ("supervisor", "retriever", "analyzer", "critic", "presenter")
-FETCH_FLOW = ("supervisor", "fetcher")
-DIRECT_FLOW = ("supervisor", "direct_analyzer")
+AGENTS = ("paper_context_resolver", "supervisor", "turn_context", "fetcher", "retriever", "direct_analyzer", "analyzer", "critic", "presenter")
+QUESTION_FLOW = ("paper_context_resolver", "supervisor", "turn_context", "retriever", "analyzer", "critic", "presenter")
+FETCH_FLOW = ("paper_context_resolver", "supervisor", "turn_context", "fetcher")
+DIRECT_FLOW = ("paper_context_resolver", "supervisor", "turn_context", "direct_analyzer")
 
 
 class ChatRequest(BaseModel):
@@ -64,6 +67,7 @@ class ChatMessage:
     created_at: float = field(default_factory=time.time)
     timeline: list[dict[str, Any]] = field(default_factory=list)
     evidence_report: dict[str, Any] | None = None
+    paper_context: dict[str, Any] | None = None
 
 
 @dataclass
@@ -76,12 +80,23 @@ class Session:
     messages: list[ChatMessage] = field(default_factory=list)
     events: list[dict[str, Any]] = field(default_factory=list)
     active_paper_ids: list[str] = field(default_factory=list)
+    paper_focus: PaperFocusState = field(default_factory=PaperFocusState)
     active_section: str | None = None
     active_task: str | None = None
     open_questions: list[str] = field(default_factory=list)
     conversation_summary: str = ""
     summary_through_message_count: int = 0
     summary_refresh_inflight: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.paper_focus.primary_paper_id and self.active_paper_ids:
+            self.paper_focus = PaperFocusState(
+                primary_paper_id=self.active_paper_ids[0],
+                active_paper_ids=list(self.active_paper_ids),
+                source="session_focus",
+                confidence=0.9,
+            )
+        self.active_paper_ids = list(self.paper_focus.active_paper_ids)
 
 
 class ConnectionManager:
@@ -139,13 +154,26 @@ def load_session_from_db(session_id: str) -> Session | None:
     if not doc:
         return None
 
+    return session_from_document(doc)
+
+
+def session_from_document(doc: dict[str, Any]) -> Session:
+    """Build a Session from new or legacy persistence documents."""
+    legacy_ids = list(doc.get("active_paper_ids") or [])
+    focus_data = doc.get("paper_focus") or {
+        "primary_paper_id": legacy_ids[0] if legacy_ids else None,
+        "active_paper_ids": legacy_ids,
+        "source": "session_focus" if legacy_ids else None,
+        "confidence": 0.9 if legacy_ids else None,
+    }
     session = Session(
         id=doc["session_id"],
         title=doc.get("title", ""),
         user_id=doc.get("user_id", "local-user"),
         created_at=doc.get("created_at", time.time()),
         updated_at=doc.get("updated_at", time.time()),
-        active_paper_ids=doc.get("active_paper_ids", []),
+        active_paper_ids=legacy_ids,
+        paper_focus=PaperFocusState.from_dict(focus_data),
         active_section=doc.get("active_section"),
         active_task=doc.get("active_task"),
         open_questions=doc.get("open_questions", []),
@@ -163,6 +191,7 @@ def load_session_from_db(session_id: str) -> Session | None:
             created_at=msg.get("created_at", time.time()),
             timeline=msg.get("timeline", []),
             evidence_report=msg.get("evidence_report"),
+            paper_context=msg.get("paper_context"),
         ))
 
     return session
@@ -181,6 +210,7 @@ def save_session_to_db(session: Session):
                 "created_at": msg.created_at,
                 "timeline": msg.timeline,
                 "evidence_report": msg.evidence_report,
+                "paper_context": msg.paper_context,
             }
             for msg in session.messages
         ]
@@ -191,6 +221,7 @@ def save_session_to_db(session: Session):
             updated_at=session.updated_at,
             user_id=session.user_id,
             active_paper_ids=session.active_paper_ids,
+            paper_focus=session.paper_focus.to_dict(),
             active_section=session.active_section,
             active_task=session.active_task,
             open_questions=session.open_questions,
@@ -237,6 +268,7 @@ async def update_research_memory(session: Session, user_message: ChatMessage) ->
 
         research_memory = get_container().research_memory
         focus = {
+            "primary_paper_id": session.paper_focus.primary_paper_id,
             "active_paper_ids": session.active_paper_ids,
             "active_section": session.active_section,
             "active_task": session.active_task,
@@ -387,6 +419,10 @@ def agent_running_detail(name: str, retry_count: int = 0) -> str:
 
 def agent_done_detail(name: str, result: dict[str, Any]) -> str:
     if name == "supervisor":
+        return f"识别意图 {result.get('intent', 'general')}"
+    if name == "paper_context_resolver":
+        return f"论文上下文 {result.get('paper_context', {}).get('status', 'unresolved')}"
+    if name == "turn_context":
         return f"路由到 {result.get('next_agent', 'END')}"
     if name == "critic":
         score = result.get("critic_score", {}).get("score", "N/A")
@@ -434,6 +470,23 @@ def create_web_initial_state(
         "session_id": session.id if session else None,
         "user_id": session.user_id if session else "local-user",
         "active_paper_ids": list(session.active_paper_ids) if session else [],
+        "paper_focus": (
+            session.paper_focus.to_dict()
+            if session else PaperFocusState().to_dict()
+        ),
+        "paper_context": None,
+        "recent_paper_contexts": (
+            [
+                msg.paper_context
+                for msg in session.messages[:-1]
+                if msg.paper_context
+            ][-10:]
+            if session else []
+        ),
+        "intent": None,
+        "turn_context": None,
+        "primary_paper_id": None,
+        "resolved_paper_ids": [],
         "active_section": session.active_section if session else None,
         "active_task": session.active_task if session else None,
         "open_questions": list(session.open_questions) if session else [],
@@ -501,8 +554,10 @@ def build_traced_workflow(session: Session):
         graph.add_node(name, wrap_agent(name, agent.invoke, session))
 
     # 构建图结构
-    graph.add_edge(START, "supervisor")
-    graph.add_conditional_edges("supervisor", supervisor_route, {
+    graph.add_edge(START, "paper_context_resolver")
+    graph.add_edge("paper_context_resolver", "supervisor")
+    graph.add_edge("supervisor", "turn_context")
+    graph.add_conditional_edges("turn_context", supervisor_route, {
         "direct_analyzer": "direct_analyzer",
         "fetcher": "fetcher",
         "retriever": "retriever",
@@ -557,6 +612,8 @@ def serialize_session(session: Session, include_messages: bool = False) -> dict[
         "title": session.title,
         "created_at": session.created_at,
         "updated_at": session.updated_at,
+        "paper_focus": _serialize_paper_focus(session.paper_focus),
+        "active_paper_ids": list(session.active_paper_ids),
     }
     if include_messages:
         data["messages"] = [
@@ -567,10 +624,57 @@ def serialize_session(session: Session, include_messages: bool = False) -> dict[
                 "created_at": msg.created_at,
                 "timeline": msg.timeline,
                 "evidence_report": msg.evidence_report,
+                "paper_context": msg.paper_context,
             }
             for msg in session.messages
         ]
     return data
+
+
+def _serialize_paper_focus(focus: PaperFocusState) -> dict[str, Any]:
+    data = focus.to_dict()
+    if isinstance(data.get("last_resolved_at"), datetime):
+        data["last_resolved_at"] = data["last_resolved_at"].isoformat()
+    return data
+
+
+def paper_context_for_result(
+    resolved_context: dict[str, Any] | None,
+    agent_result: dict[str, Any],
+    turn_context: dict[str, Any] | None,
+    previous_primary_id: str | None,
+) -> dict[str, Any]:
+    """Attach a newly resolved search result to the structured context model."""
+    context = PaperContext.from_dict(resolved_context).to_dict()
+    primary_id = agent_result.get("primary_paper_id")
+    if not primary_id:
+        return context
+    paper_ids = list(agent_result.get("resolved_paper_ids") or [primary_id])
+    if context.get("primary_paper_id") == primary_id:
+        context["paper_ids"] = list(dict.fromkeys([primary_id, *paper_ids]))
+        return context
+
+    request = (turn_context or {}).get("search_request") or {}
+    mode = request.get("mode")
+    source = {
+        "arxiv_id": "arxiv_id",
+        "title": "title_match",
+        "keywords": "none",
+    }.get(mode, "none")
+    switched_from = (
+        previous_primary_id
+        if previous_primary_id and previous_primary_id != primary_id
+        else None
+    )
+    return {
+        "primary_paper_id": primary_id,
+        "paper_ids": list(dict.fromkeys([primary_id, *paper_ids])),
+        "status": "switch" if switched_from else "resolved",
+        "source": source,
+        "confidence": 1.0 if mode == "arxiv_id" else 0.9,
+        "inherited": False,
+        "switched_from_paper_id": switched_from,
+    }
 
 
 app = FastAPI(title="Paper Agent Web")
@@ -1221,7 +1325,8 @@ async def chat(request: ChatRequest) -> StreamingResponse:
         yield f"event: session\ndata: {json.dumps({'session_id': session.id}, ensure_ascii=False)}\n\n"
         answer = None
         evidence_report = None
-        resolved_paper_id = None
+        workflow_result: dict[str, Any] = {}
+        workflow_failed = False
         try:
             logger.info("[Chat] 开始构建 workflow...")
             workflow = build_traced_workflow(session)
@@ -1257,13 +1362,13 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                         for node_name, node_output in event.items():
                             if node_name == "__end__":
                                 final_result = node_output
+                            if isinstance(node_output, dict):
+                                workflow_result.update(node_output)
                             # 每个节点完成时，尝试提取 answer（兜底）
                             if isinstance(node_output, dict) and node_output.get("answer"):
                                 final_result = node_output
                             if isinstance(node_output, dict) and node_output.get("evidence_report"):
                                 evidence_report = node_output["evidence_report"]
-                            if isinstance(node_output, dict) and node_output.get("resolved_paper_id"):
-                                resolved_paper_id = node_output["resolved_paper_id"]
                             # Agent 状态已通过 wrap_agent → WebSocket 推送，无需重复
 
             if final_result:
@@ -1273,9 +1378,11 @@ async def chat(request: ChatRequest) -> StreamingResponse:
             logger.info(f"[Chat] Workflow 执行完成")
         except asyncio.TimeoutError:
             answer = "抱歉，处理时间较长，请稍后重试。"
+            workflow_failed = True
             logger.warning("[Chat] Workflow 执行超时")
         except Exception as exc:
             answer = f"抱歉，处理过程中出现问题，请稍后重试。"
+            workflow_failed = True
             logger.error(f"[Chat] Workflow 执行失败: {exc}", exc_info=True)
 
         if answer is None:
@@ -1286,25 +1393,39 @@ async def chat(request: ChatRequest) -> StreamingResponse:
             yield f"event: token\ndata: {json.dumps({'content': answer}, ensure_ascii=False)}\n\n"
 
         timeline = timeline_snapshot(session.events)
+        if workflow_failed:
+            workflow_result["error"] = "WORKFLOW_FAILED"
+        normalized_result = normalize_agent_result(workflow_result)
+        resolved_context = workflow_result.get("paper_context") or {}
+        user_message.paper_context = PaperContext.from_dict(
+            resolved_context
+        ).to_dict()
+        final_paper_context = paper_context_for_result(
+            resolved_context,
+            normalized_result,
+            workflow_result.get("turn_context"),
+            session.paper_focus.primary_paper_id,
+        )
+        session.paper_focus = SessionStateReducer().reduce(
+            session.paper_focus,
+            normalized_result,
+            final_paper_context,
+        )
+        session.active_paper_ids = list(session.paper_focus.active_paper_ids)
         session.messages.append(
             ChatMessage(
                 role="assistant",
                 content=answer,
                 timeline=timeline,
                 evidence_report=evidence_report,
+                paper_context=final_paper_context,
             )
         )
-        if resolved_paper_id:
-            session.active_paper_ids = [resolved_paper_id]
+        if normalized_result.get("primary_paper_id") and not normalized_result.get("error"):
             session.active_task = request.message[:500]
             if not session.open_questions or session.open_questions[-1] != request.message:
                 session.open_questions.append(request.message[:500])
                 session.open_questions = session.open_questions[-10:]
-        elif request.target_paper_id and "selected_paper_not_found" in str(answer):
-            session.active_paper_ids = [
-                paper_id for paper_id in session.active_paper_ids
-                if paper_id != request.target_paper_id
-            ]
         session.updated_at = time.time()
         save_session_to_db(session)
         asyncio.create_task(refresh_session_context(session))

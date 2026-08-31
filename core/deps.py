@@ -128,9 +128,15 @@ class ServiceContainer:
         from agents.critic import CriticAgent
         from agents.presenter import PresenterAgent
         from agents.reflector import ReflectorAgent
+        from core.paper_context import PaperContextResolver
+        from core.turn_context import TurnContextBuilder
 
         return {
+            "paper_context_resolver": PaperContextResolver(
+                self.mongodb, self.llm
+            ),
             "supervisor": SupervisorAgent(self.llm, self.mongodb),
+            "turn_context": TurnContextBuilder(self.mongodb),
             "fetcher": FetcherAgent(
                 self.paper_search, self.pdf_parser, self.mongodb,
                 self.embedder, self.milvus
@@ -141,7 +147,7 @@ class ServiceContainer:
             ),
             "direct_analyzer": DirectAnalyzerAgent(
                 self.llm, self.mongodb, self.embedder, self.milvus,
-                self.pdf_parser, self.paper_search
+                self.pdf_parser
             ),
             "analyzer": AnalyzerAgent(self.llm, self.mongodb),
             "critic": CriticAgent(self.llm),

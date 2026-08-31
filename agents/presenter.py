@@ -49,7 +49,11 @@ class PresenterAgent:
         # 如果上游 Agent 已经生成了 answer，直接返回
         if state.get("answer"):
             logger.info(f"[Presenter] 使用上游已生成的回答: {state['answer'][:50]}...")
-            return {"answer": state["answer"]}
+            return {
+                "answer": state["answer"],
+                "primary_paper_id": state.get("primary_paper_id"),
+                "resolved_paper_ids": list(state.get("resolved_paper_ids") or []),
+            }
 
         analysis = state.get("analysis")
         retrieved_chunks = state.get("retrieved_chunks", [])
@@ -94,7 +98,12 @@ class PresenterAgent:
             final += "\n\n---\n\n## 代码实现\n```python\n" + code_result["code"] + "\n```"
 
         logger.info(f"[Presenter] 回复生成完成，长度: {len(final)}")
-        return {"answer": final, "next_agent": "END"}
+        return {
+            "answer": final,
+            "next_agent": "END",
+            "primary_paper_id": state.get("primary_paper_id"),
+            "resolved_paper_ids": list(state.get("resolved_paper_ids") or []),
+        }
 
     def _extract_sources(self, chunks: list) -> str:
         seen = set()

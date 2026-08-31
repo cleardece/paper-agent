@@ -22,6 +22,12 @@ htmlcov/
 
 # Tests are local verification helpers and are intentionally not versioned.
 tests/
+# This issue's required end-to-end regression suite is versioned explicitly.
+!tests/
+tests/*
+!tests/web/
+tests/web/*
+!tests/web/test_paper_context_regressions.py
 
 # Credentials and local runtime data
 .env

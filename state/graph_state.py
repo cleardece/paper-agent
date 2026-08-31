@@ -66,6 +66,13 @@ class AgentState(TypedDict):
     target_paper_id: Optional[str]          # 论文库显式选择的稳定 arXiv/本地论文 ID
     resolved_paper_id: Optional[str]        # DirectAnalyzer 实际分析的论文 ID，供会话持久化
     active_paper_ids: list[str]             # 会话当前论文焦点，供追问消解使用
+    primary_paper_id: Optional[str]         # 当前轮已解析的主论文 ID
+    resolved_paper_ids: list[str]           # Agent 本轮成功定位的论文 ID
+    paper_focus: Optional[dict]             # 持久化的主论文及活动论文集合
+    paper_context: Optional[dict]           # PaperContextResolver 的结构化输出
+    recent_paper_contexts: list[dict]       # 最近消息中的结构化论文 metadata
+    intent: Optional[str]                   # Supervisor 仅负责解析出的意图
+    turn_context: Optional[dict]            # 下游 Agent 的统一执行契约
     active_section: Optional[str]           # 当前讨论章节
     active_task: Optional[str]              # 当前阅读/实验/写作任务
     open_questions: list[str]               # 会话尚未解决的问题

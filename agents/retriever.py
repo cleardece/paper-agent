@@ -143,39 +143,31 @@ class RetrieverAgent:
         return expanded
 
     def _two_level_retrieval(self, query: str, query_vector, session_id: str = None,
-                             target_paper: str = None, graph_paper_ids: list[str] | None = None) -> list[dict]:
+                             paper_ids: list[str] | None = None,
+                             graph_paper_ids: list[str] | None = None) -> list[dict]:
         """两层检索：先找论文，再在论文内找 chunk"""
 
         # ===== Stage 1: 论文级检索（Milvus HNSW 向量搜索）=====
         logger.info("[Retriever] Stage 1: 论文级检索（Milvus）...")
 
-        # 图谱命中只限制候选论文，不绕过 chunk 检索和重排序。
+        # 已解析论文 ID 优先限制候选范围；图谱只在没有显式范围时提供候选。
         top_papers = None
-        if graph_paper_ids:
+        if paper_ids:
+            top_papers = []
+            for paper_id in paper_ids:
+                paper = self.mongo.get_paper(paper_id)
+                if paper:
+                    top_papers.append({
+                        "arxiv_id": paper_id,
+                        "title": paper.get("title", ""),
+                        "score": 1.0,
+                    })
+        elif graph_paper_ids:
             top_papers = []
             for paper_id in graph_paper_ids:
                 paper = self.mongo.get_paper(paper_id)
                 if paper:
                     top_papers.append({"arxiv_id": paper_id, "title": paper.get("title", ""), "score": 1.0})
-
-        # 优先用目标论文直接匹配
-        if target_paper:
-            # 从 MongoDB 查论文 ID
-            all_papers = self.mongo.list_papers(
-                limit=50, projection={"arxiv_id": 1, "title": 1},
-            )
-            target_lower = target_paper.lower()
-            for paper in all_papers:
-                title = paper.get("title", "").lower()
-                if any(kw in title for kw in target_lower.split() if len(kw) > 3):
-                    logger.info(f"[Retriever] 直接匹配目标论文: {paper.get('title', '')[:50]}")
-                    hits = self.milvus.search(
-                        query_embedding=query_vector,
-                        top_k=15,
-                        paper_ids=[paper["arxiv_id"]],
-                        output_fields=["paper_arxiv_id", "chunk_index", "content", "section", "page", "heading"],
-                    )
-                    return hits
 
         # Milvus 论文级向量搜索（HNSW 近似最近邻，替代 Python 逐篇计算）
         if top_papers is None:
@@ -277,33 +269,6 @@ class RetrieverAgent:
 
         return vector_hits
 
-    def _extract_target_paper(self, query: str, context: str = "") -> str:
-        """从查询和对话上下文中提取用户指代的论文标题"""
-        # 检查是否包含跟随意图词
-        # 注意："它" 会误匹配 "它们"，用 "它的" / "这篇" 等更精确的模式
-        followup_patterns = ["这篇论文", "该论文", "它的", "上一篇", "刚才的", "之前"]
-        is_followup = any(p in query for p in followup_patterns)
-        if not is_followup:
-            return None
-
-        # 从对话上下文中提取最近讨论的论文标题
-        if context:
-            # 匹配 "助手: ..." 中提到的论文标题（英文标题）
-            titles = re.findall(r'[A-Z][a-zA-Z\s\-:]{5,80}', context)
-            if titles:
-                # 返回最后一个出现的英文标题（最近讨论的）
-                return titles[-1].strip()
-
-        # 从知识库中匹配最近的论文
-        try:
-            papers = self.mongo.list_papers(limit=5, projection={"title": 1})
-            if papers:
-                return papers[-1].get("title", "")
-        except Exception:
-            pass
-
-        return None
-
     def invoke(self, state: AgentState) -> dict:
         """
         检索流程：
@@ -316,13 +281,9 @@ class RetrieverAgent:
         query = state["user_query"]
         session_id = state.get("session_id")
         user_id = state.get("user_id", "default")
-        context = state.get("conversation_context", "")
+        turn_context = state.get("turn_context") or {}
+        resolved_paper_ids = list(turn_context.get("paper_ids") or [])
         logger.info(f"[Retriever] 开始检索: {query[:50]}...")
-
-        # 提取用户指代的论文
-        target_paper = self._extract_target_paper(query, context)
-        if target_paper:
-            logger.info(f"[Retriever] 识别到目标论文: {target_paper[:50]}")
         graph_paper_ids = self._graph_paper_ids(query)
 
         # 获取用户兴趣
@@ -367,7 +328,11 @@ class RetrieverAgent:
         for eq, query_vector in zip(expanded_queries, query_vectors):
             # 两层检索
             hits = self._two_level_retrieval(
-                eq, query_vector, session_id, target_paper, graph_paper_ids or None
+                eq,
+                query_vector,
+                session_id,
+                resolved_paper_ids or None,
+                graph_paper_ids or None,
             )
 
             # 合并结果
@@ -436,10 +401,20 @@ class RetrieverAgent:
                 "retrieved_chunks": [],
                 "error": "知识库中未找到相关论文，请先使用fetcher入库论文。",
                 "graph_context": {"paper_ids": graph_paper_ids} if graph_paper_ids else None,
+                "primary_paper_id": None,
+                "resolved_paper_ids": [],
             }
 
+        evidence_paper_ids = list(dict.fromkeys(
+            chunk["paper_arxiv_id"] for chunk in retrieved
+        ))
+        primary_id = turn_context.get("primary_paper_id")
+        if not primary_id and len(evidence_paper_ids) == 1:
+            primary_id = evidence_paper_ids[0]
         return {
             "retrieved_chunks": retrieved,
             "error": None,
             "graph_context": {"paper_ids": graph_paper_ids} if graph_paper_ids else None,
+            "primary_paper_id": primary_id,
+            "resolved_paper_ids": evidence_paper_ids,
         }

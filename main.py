@@ -20,6 +20,9 @@ from tools.arxiv_api import ArxivAPI
 from tools.embeddings import EmbeddingService
 from tools.pdf_parser import PDFParser
 from tools.code_generator import CodeGenerator
+from core.paper_context import PaperContextResolver, PaperFocusState
+from core.session_state import SessionStateReducer
+from core.turn_context import TurnContextBuilder
 def init_components():
     llm = get_llm()
     arxiv_api = ArxivAPI()
@@ -30,13 +33,15 @@ def init_components():
     code_generator = CodeGenerator(llm)  # 加这行
 
     agents = {
+        "paper_context_resolver": PaperContextResolver(mongodb_client, llm),
         "supervisor": SupervisorAgent(llm, mongodb_client),
+        "turn_context_builder": TurnContextBuilder(mongodb_client),
         "fetcher": FetcherAgent(arxiv_api, pdf_parser, mongodb_client, embedding_service, milvus_client),
         "retriever": RetrieverAgent(embedding_service, milvus_client, mongodb_client),
         "analyzer": AnalyzerAgent(llm, mongodb_client),
         "critic": CriticAgent(llm),
         "presenter": PresenterAgent(llm, code_generator),
-        "direct_analyzer": DirectAnalyzerAgent(llm, mongodb_client, embedding_service, milvus_client, pdf_parser, arxiv_api),
+        "direct_analyzer": DirectAnalyzerAgent(llm, mongodb_client, embedding_service, milvus_client, pdf_parser),
     }
 
     workflow = build_workflow(**agents)
@@ -59,6 +64,14 @@ def create_initial_state(query: str) -> AgentState:
         "max_iterations": 2,
         "error": None,
         "conversation_context": None,
+        "paper_focus": PaperFocusState().to_dict(),
+        "paper_context": None,
+        "recent_paper_contexts": [],
+        "intent": None,
+        "turn_context": None,
+        "primary_paper_id": None,
+        "resolved_paper_ids": [],
+        "active_paper_ids": [],
     }
 
 
@@ -74,6 +87,8 @@ def main():
 
     workflow = init_components()
     chat_history = []  # 保存最近对话用于上下文
+    paper_focus = PaperFocusState()
+    reducer = SessionStateReducer()
 
     while True:
         query = input("你: ").strip()
@@ -89,7 +104,14 @@ def main():
 
         state = create_initial_state(query)
         state["conversation_context"] = context
+        state["paper_focus"] = paper_focus.to_dict()
+        state["active_paper_ids"] = list(paper_focus.active_paper_ids)
         result = asyncio.run(workflow.ainvoke(state))
+        paper_focus = reducer.reduce(
+            paper_focus,
+            result,
+            result.get("paper_context") or {},
+        )
 
         # 记录对话历史
         chat_history.append(f"用户: {query[:100]}")
