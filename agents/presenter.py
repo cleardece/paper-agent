@@ -3,6 +3,7 @@
 import logging
 from langchain_core.messages import HumanMessage, SystemMessage
 
+from core.llm_errors import user_facing_llm_error
 from state.graph_state import AgentState
 
 logger = logging.getLogger("paper-agent")
@@ -51,6 +52,21 @@ class PresenterAgent:
             logger.info(f"[Presenter] 使用上游已生成的回答: {state['answer'][:50]}...")
             return {
                 "answer": state["answer"],
+                "primary_paper_id": state.get("primary_paper_id"),
+                "resolved_paper_ids": list(state.get("resolved_paper_ids") or []),
+            }
+
+        # 上游节点已失败时，不再调用同一 LLM 尝试“格式化”错误。
+        # 配额/限流错误返回针对性提示，其他异常返回稳定本地兜底。
+        if state.get("error"):
+            answer = user_facing_llm_error(state["error"]) or (
+                "本轮处理失败，系统已停止后续模型调用。"
+                "请查看 Agent 执行时间线中的失败原因后重试。"
+            )
+            logger.info("[Presenter] 上游已失败，使用本地错误回复")
+            return {
+                "answer": answer,
+                "next_agent": "END",
                 "primary_paper_id": state.get("primary_paper_id"),
                 "resolved_paper_ids": list(state.get("resolved_paper_ids") or []),
             }

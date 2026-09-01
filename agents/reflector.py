@@ -72,6 +72,10 @@ class ReflectorAgent:
         Returns:
             更新后的 state
         """
+        if state.get("error"):
+            logger.info("[Reflector] 上游已失败，跳过反思")
+            return {"reflection": None, "next_agent": "END"}
+
         # 从 state 提取信息
         analysis = state.get("analysis", "")
         retrieved_chunks = state.get("retrieved_chunks", [])

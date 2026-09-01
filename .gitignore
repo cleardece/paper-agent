@@ -28,6 +28,7 @@ tests/*
 !tests/web/
 tests/web/*
 !tests/web/test_paper_context_regressions.py
+!tests/web/test_llm_quota_fallback.py
 
 # Credentials and local runtime data
 .env

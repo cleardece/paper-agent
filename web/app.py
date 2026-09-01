@@ -42,6 +42,7 @@ from core.conversation_context import (
     needs_summary_refresh,
     refresh_summary,
 )
+from core.llm_errors import agent_failure_result
 from state.graph_state import AgentState
 from core.paper_context import PaperContext, PaperFocusState
 from core.session_state import SessionStateReducer, normalize_agent_result
@@ -387,19 +388,20 @@ def wrap_agent(name: str, invoke: Callable[[AgentState], Any], session: Session)
             return result
         except Exception as exc:
             logger.error(f"[{name}] 执行失败: {exc}", exc_info=True)
+            failure = agent_failure_result(name, exc)
             await push_status(
                 sess,
                 {
                     "agent": name,
                     "status": "error",
-                    "detail": f"{name} 执行失败：{exc}",
-                    "output_summary": summarize({"error": str(exc)}),
+                    "detail": f"{name} 执行失败：{failure['error']}",
+                    "output_summary": summarize(failure),
                 "retry_count": retry_count,
                 "duration_ms": round((time.perf_counter() - started_at) * 1000, 1),
                 },
             )
-            # 返回错误状态，不 raise，让 workflow 继续执行
-            return {"error": f"{name} 执行失败: {exc}"}
+            # 返回结构化错误，由 Presenter 本地短路，不再调用 LLM。
+            return failure
 
     return wrapped
 
