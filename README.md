@@ -190,11 +190,3 @@ MinerU 的镜像依赖和启动参数可能随版本变化，实际部署时以 
 - 页面与 Retriever 继续读取兼容关系投影；图谱用于关联与导航，最终回答的证据仍来自本次检索到的论文 chunks。
 
 图谱页面为 `GET /graph`；主要接口包括 `GET /api/research-graph`、`GET /api/research-graph/status`、`GET /api/research-graph/jobs`、`POST /api/research-graph/jobs/retry` 和 `PATCH /api/research-graph/edges/{edge_id}`。应用启动时会对已索引论文与当前图谱版本做增量对账。
-
-## Git 约定
-
-- 使用 Conventional Commit 前缀：`feat:`、`fix:`、`test:`、`docs:`、`chore:`；
-- 一个提交只覆盖一个可说明、可验证的主题；
-- 不重写已经推送的历史；
-- IDE 配置、缓存、下载论文、测试输出和个人评测结果始终留在本地；
-- 新功能提交前至少运行相关单元测试、导入 smoke test 和 `git diff --check`。
