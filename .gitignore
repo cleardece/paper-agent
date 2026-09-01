@@ -40,6 +40,10 @@ uploads/
 models/
 evaluation/cases.local.json
 evaluation/results/
+output/
+
+# Personal documents kept locally, not published with the project
+何兵兵_简历.html
 
 # Ad-hoc scripts used only with personal data
 test_local_paper.py

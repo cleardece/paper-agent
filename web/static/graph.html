@@ -77,6 +77,8 @@ const relationText = { proposes:"提出", uses:"使用", improves:"改进", comp
 const statusText = { auto_verified:"系统校验通过", needs_review:"待人工确认", confirmed:"人工已确认", rejected:"已拒绝" };
 const jobStatusText = { pending:"等待提取", retry_wait:"等待重试", extracting:"正在提取", completed_with_edges:"已生成关系", completed_empty:"未发现可证据化关系", failed:"提取失败" };
 const reasonText = { no_selected_chunks:"没有可用于提取的正文片段", model_returned_no_relations:"模型明确返回无关系", invalid_model_response:"模型输出无法解析", all_candidates_rejected_by_extractor:"候选关系字段不符合约束", all_candidates_rejected_by_evidence:"候选关系未通过原文证据校验", candidates_ready_for_evidence_validation:"已完成候选关系校验", paper_not_indexed:"论文当前不是已索引状态", relations_ready:"全文提取和独立核验已完成", no_verified_relations:"全文已处理，但未发现可证据化关系" };
+const errorKindText = { llm_quota_exhausted:"LLM 配额不足，已停止自动重试；补充配额后点击“重新提取”", llm_rate_limited:"LLM 的 TPM/速率额度暂时耗尽，任务将按队列策略重试", llm_empty_response:"LLM 服务返回空响应，已停止无意义的片段递归拆分" };
+let dashboardTimer = null;
 function escapeHtml(value) { const el=document.createElement("div"); el.textContent=value || ""; return el.innerHTML; }
 async function review(id, status) {
   const response = await fetch("/api/research-graph/edges/" + encodeURIComponent(id), {method:"PATCH", headers:{"Content-Type":"application/json"}, body:JSON.stringify({review_status:status})});
@@ -86,11 +88,11 @@ async function review(id, status) {
 async function retryJob(paperId) {
   const response = await fetch("/api/research-graph/jobs/retry", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({paper_id:paperId})});
   if (!response.ok) { const data=await response.json().catch(()=>({})); return alert(data.detail || "重试失败"); }
-  await loadDashboard();
+  await refreshDashboard();
 }
 function jobCard(job) {
   const diagnostics = job.diagnostics || {};
-  const reason = reasonText[diagnostics.result_reason] || diagnostics.result_reason || job.error || "";
+  const reason = reasonText[diagnostics.result_reason] || diagnostics.result_reason || errorKindText[job.error_kind] || job.error || "";
   const batchTotal = diagnostics.batch_total ?? job.batch_total;
   const batchCompleted = diagnostics.batch_completed ?? (job.completed_batches || []).length;
   const counts = batchTotal == null ? "" : `全文 ${batchCompleted || 0}/${batchTotal} 批 · 自动通过 ${diagnostics.auto_verified_count || 0} 条 · 待确认 ${diagnostics.needs_review_count || 0} 条 · 自动拒绝 ${diagnostics.evidence_rejected_count || 0} 条`;
@@ -116,6 +118,7 @@ async function loadStatus() {
   const data = await fetch("/api/research-graph/status").then(r=>r.json());
   const circuit = data.circuit?.open ? ` · 图谱队列已暂停：${data.circuit.last_error || "LLM 服务异常"}` : "";
   $("#summary").innerHTML = `论文库 ${data.indexed_papers} 篇 · 图谱覆盖 ${data.covered_papers} 篇 · 有效关系 ${data.usable_edges || 0} 条 · 待确认 ${data.needs_review || 0} 条 · 等待 ${(data.pending || 0) + (data.retry_wait || 0)} 篇 · 提取中 ${data.extracting} 篇 · 失败 ${data.failed} 篇<span class="circuit-warning">${escapeHtml(circuit)}</span>`;
+  return data;
 }
 async function loadEdges() {
   const params = new URLSearchParams();
@@ -133,11 +136,37 @@ async function loadPaperLinks() {
   const data = await fetch("/api/research-graph/paper-links?limit=100").then(r=>r.json());
   $("#paperLinks").innerHTML = data.links.length ? data.links.map(paperLinkCard).join("") : '<div class="muted">至少两篇论文共享已验证实体后，会在这里形成关联。</div>';
 }
-async function loadDashboard() { await Promise.all([loadStatus(), loadJobs(), loadEdges(), loadReviewRelations(), loadPaperLinks()]); }
+async function loadDashboard() {
+  const [status] = await Promise.all([loadStatus(), loadJobs(), loadEdges(), loadReviewRelations(), loadPaperLinks()]);
+  return status;
+}
+function scheduleDashboardRefresh(status) {
+  clearTimeout(dashboardTimer);
+  dashboardTimer = null;
+  if (document.hidden) return;
+  const active = (status.pending || 0) + (status.retry_wait || 0) + (status.extracting || 0) > 0;
+  if (!active) return;
+  let delay = 5000;
+  if (status.circuit?.open && status.circuit.paused_until) {
+    delay = Math.max(5000, new Date(status.circuit.paused_until).getTime() - Date.now() + 250);
+  }
+  dashboardTimer = setTimeout(refreshDashboard, delay);
+}
+async function refreshDashboard() {
+  const status = await loadDashboard();
+  scheduleDashboardRefresh(status);
+}
 $("#query").addEventListener("input", () => { clearTimeout(window.graphSearchTimer); window.graphSearchTimer=setTimeout(loadEdges,300); });
 $("#entityType").onchange = loadEdges;
-loadDashboard();
-setInterval(() => { if (!document.hidden) loadDashboard(); }, 5000);
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) {
+    clearTimeout(dashboardTimer);
+    dashboardTimer = null;
+  } else {
+    refreshDashboard();
+  }
+});
+refreshDashboard();
 </script>
 </body>
 </html>

@@ -3,6 +3,7 @@ Paper Agent - Direct Analyzer Agent
 单篇论文安全分析通道：读取已解析本地论文 → 提取核心章节 → 喂 LLM
 """
 
+import html
 import logging
 import re
 from langchain_core.messages import SystemMessage, HumanMessage
@@ -32,6 +33,27 @@ SECTION_PATTERNS = {
     "conclusion": r"(conclusion|summary|discussion|future work|结论|总结|讨论|未来)",
     "related": r"(related work|background|prior|相关工作|背景)",
 }
+
+# 物理/数值算例的具体参数通常位于 setup、experiment 或 results 章节。
+FLOW_SETUP_KEYWORDS = (
+    "reynolds",
+    "雷诺",
+    "入口",
+    "出口",
+    "流入",
+    "流出",
+    "边界条件",
+    "圆柱",
+    "尾流",
+    "涡脱落",
+    "涡街",
+    "inlet",
+    "outlet",
+    "boundary condition",
+    "cylinder",
+    "wake",
+    "vortex shedding",
+)
 
 
 class DirectAnalyzerAgent:
@@ -156,6 +178,9 @@ class DirectAnalyzerAgent:
                 if kw in query_lower:
                     needed.add(section_type)
                     break
+
+        if any(keyword in query_lower for keyword in FLOW_SETUP_KEYWORDS):
+            needed.add("experiment")
 
         logger.info(f"[DirectAnalyzer] 查询需要的章节: {needed}")
         return list(needed)
@@ -314,7 +339,10 @@ class DirectAnalyzerAgent:
         # 根据用户问题动态生成分析要求
         analysis_requirements = self._generate_analysis_requirements(query)
 
-        prompt = f"""你是一位资深的学术论文分析师。请基于以下论文的核心内容进行分析。
+        prompt = f"""你是一位资深的学术论文分析师。请基于以下论文的核心内容，严格回答用户的原始问题。
+
+## 用户原始问题（最高优先级）
+{query}
 
 ## 论文信息
 标题：{title}
@@ -326,7 +354,7 @@ class DirectAnalyzerAgent:
 ## 分析要求
 {analysis_requirements}
 
-请用清晰的结构输出分析结果，引用论文中的具体内容。"""
+不得把用户的具体问题替换成通用论文综述。请遵守用户要求的字段、顺序和输出结构；论文未提供的信息要明确标注“论文未说明”，不得猜测。"""
 
         logger.info(f"[DirectAnalyzer] 正在分析论文: {title[:50]}... (核心内容 {len(core_text)} 字符)")
         messages = [
@@ -336,6 +364,35 @@ class DirectAnalyzerAgent:
 
         response = self.llm.invoke(messages)
         analysis = response.content.strip()
+
+        requested_fields = self._extract_requested_fields(query)
+        missing_fields = self._missing_requested_fields(analysis, requested_fields)
+        if missing_fields:
+            logger.warning(
+                "[DirectAnalyzer] 首次回答遗漏字段，执行一次定向修复: %s",
+                missing_fields,
+            )
+            repair_prompt = f"""请修复下面的回答，使其严格满足用户的字段填写要求。
+
+## 用户原始问题
+{query}
+
+## 必须保留并逐项回答的字段
+{chr(10).join(f'- {field}' for field in requested_fields)}
+
+## 论文内容
+{core_text}
+
+## 待修复回答
+{analysis}
+
+只输出修复后的答案。字段名称和顺序必须与用户原文一致，每个字段单独一行；信息不足时填写“论文未说明”。不要添加通用论文综述。"""
+            repair_response = self.llm.invoke([
+                SystemMessage(content="你负责检查并修复论文问答的字段完整性。"),
+                HumanMessage(content=repair_prompt),
+            ])
+            analysis = repair_response.content.strip()
+
         logger.info(f"[DirectAnalyzer] 分析完成，长度: {len(analysis)}")
 
         return {
@@ -347,6 +404,17 @@ class DirectAnalyzerAgent:
     def _generate_analysis_requirements(self, query: str) -> str:
         """根据用户问题动态生成分析要求"""
         query_lower = query.lower()
+
+        requested_fields = self._extract_requested_fields(query)
+        if requested_fields:
+            fields = "\n".join(
+                f"{index}. {field}："
+                for index, field in enumerate(requested_fields, start=1)
+            )
+            return f"""只回答用户列出的字段，不要扩展成背景、贡献、实验、局限等通用综述。
+严格保留以下字段名称和顺序，每个字段单独一行：
+{fields}
+答案必须来自论文内容；找不到时写“论文未说明”。"""
 
         # 检测用户关注的方向
         if any(kw in query_lower for kw in ["实验", "评估", "结果", "experiment", "result", "accuracy"]):
@@ -370,10 +438,61 @@ class DirectAnalyzerAgent:
 3. **实验结果**：在哪些指标上表现好/差？
 4. **适用场景**：这个方法最适合什么类型的问题？"""
 
-        # 默认：全面分析
-        return """请从以下几个方面进行分析：
+        if self._is_general_analysis_request(query):
+            return """请从以下几个方面进行分析：
 1. **研究背景与动机**：为什么要做这个研究？解决什么问题？
 2. **核心方法/贡献**：提出了什么新方法？技术创新点是什么？
 3. **实验设计**：用了什么数据集？怎么评估的？基线方法是什么？
 4. **主要结果**：关键实验数据和结论是什么？
 5. **局限性与未来工作**：论文自己提到了哪些不足？"""
+
+        return """直接回答用户提出的具体问题。
+- 不要将具体问题改写成通用论文综述。
+- 保留用户要求的回答范围和结构。
+- 结论必须有论文内容支撑；信息不足时明确说明。"""
+
+    @staticmethod
+    def _extract_requested_fields(query: str) -> list[str]:
+        """提取“字段：”式问题，保留用户要求的回答结构。"""
+        fields = []
+        for raw_line in html.unescape(query or "").splitlines():
+            line = raw_line.strip()
+            match = re.match(
+                r"^(?:[-*•]\s*|\d+[.、)]\s*)?(.{1,80}?)[：:]\s*\\*\s*$",
+                line,
+            )
+            if not match:
+                continue
+            field = match.group(1).strip()
+            if field and field not in fields:
+                fields.append(field)
+        return fields if len(fields) >= 2 else []
+
+    @staticmethod
+    def _missing_requested_fields(answer: str, fields: list[str]) -> list[str]:
+        """检查结构化回答是否保留了每个字段名。"""
+        normalized_answer = re.sub(r"\s+", "", answer or "").lower()
+        return [
+            field
+            for field in fields
+            if re.sub(r"\s+", "", field).lower() not in normalized_answer
+        ]
+
+    @staticmethod
+    def _is_general_analysis_request(query: str) -> bool:
+        normalized = re.sub(r"[\s，。！？、,.!?：:]", "", query or "").lower()
+        if not normalized:
+            return True
+        return normalized in {
+            "分析",
+            "分析论文",
+            "分析这篇论文",
+            "分析一下",
+            "分析一下这篇论文",
+            "解读",
+            "解读论文",
+            "解读这篇论文",
+            "总结",
+            "总结论文",
+            "总结这篇论文",
+        }

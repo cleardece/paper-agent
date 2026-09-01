@@ -10,16 +10,23 @@ from uuid import uuid4
 
 from pymongo import ASCENDING, DESCENDING, ReturnDocument
 
-GRAPH_VERSION = "evidence-graph-v3"
+from knowledge_graph.graph.repository import CanonicalGraphRepository
+from knowledge_graph.schema.entity_types import ENTITY_TYPES
+from knowledge_graph.schema.predicates import LEGACY_RELATIONS
+
+GRAPH_VERSION = "evidence-graph-v4"
 RELATIONS = {
-    "proposes", "uses", "improves", "compares_with",
-    "evaluates_on", "measures_with", "studies",
+    *LEGACY_RELATIONS,
 }
-ENTITY_TYPES = {"method", "dataset", "metric", "task"}
 REVIEW_STATUSES = {"auto_verified", "needs_review", "confirmed", "rejected"}
 USABLE_REVIEW_STATUSES = {"auto_verified", "confirmed"}
 SYSTEM_REVIEW_STATUSES = {"auto", "auto_verified", "needs_review"}
 RUNNABLE_STATUSES = {"pending", "retry_wait"}
+NONRETRYABLE_QUOTA_PATTERN = re.compile(
+    r"insufficient[_\\]?quota|allocated quota exceeded|increase your quota limit|"
+    r"exceeded your current quota",
+    re.IGNORECASE,
+)
 
 
 def _now() -> datetime:
@@ -47,6 +54,7 @@ class ResearchGraphRepository:
         self.jobs = db["research_graph_jobs"]
         self.papers = db["papers"]
         self.control = db["research_graph_control"]
+        self.canonical = CanonicalGraphRepository(db)
         self._ensure_indexes()
 
     def _ensure_indexes(self) -> None:
@@ -191,6 +199,37 @@ class ResearchGraphRepository:
             failed += int(not retrying)
         return {"recovered": recovered, "failed": failed}
 
+    def finalize_nonretryable_retries(self) -> int:
+        """将旧版本误排队的配额错误转为终止失败，不消耗下一次尝试。"""
+        now = _now()
+        finalized = 0
+        jobs = list(self.jobs.find({
+            "status": "retry_wait",
+            "error": {"$regex": NONRETRYABLE_QUOTA_PATTERN},
+        }))
+        for job in jobs:
+            result = self.jobs.update_one(
+                {"_id": job["_id"], "status": "retry_wait"},
+                {"$set": {
+                    "status": "failed",
+                    "error_kind": "llm_quota_exhausted",
+                    "next_attempt_at": None,
+                    "finished_at": now,
+                    "updated_at": now,
+                }},
+            )
+            if result.modified_count != 1:
+                continue
+            self.papers.update_one(
+                {"arxiv_id": job["paper_id"]},
+                {"$set": {
+                    "graph_status": "failed",
+                    "graph_error": job.get("error"),
+                }},
+            )
+            finalized += 1
+        return finalized
+
     def claim_next_job(self, worker_id: str, lease_seconds: int) -> dict[str, Any] | None:
         now = _now()
         return self.jobs.find_one_and_update(
@@ -222,6 +261,21 @@ class ResearchGraphRepository:
                 "heartbeat_at": now,
                 "lease_expires_at": now + timedelta(seconds=lease_seconds),
                 "updated_at": now,
+            }},
+        )
+        return result.matched_count == 1
+
+    def set_batch_total(self, paper_id: str, worker_id: str, batch_total: int) -> bool:
+        """在首次模型调用前保存批次数，确保早期失败也有真实进度。"""
+        result = self.jobs.update_one(
+            {
+                "paper_id": paper_id,
+                "status": "extracting",
+                "worker_id": worker_id,
+            },
+            {"$set": {
+                "batch_total": max(0, int(batch_total)),
+                "updated_at": _now(),
             }},
         )
         return result.matched_count == 1
@@ -301,14 +355,18 @@ class ResearchGraphRepository:
         return True
 
     def fail_attempt(self, paper_id: str, worker_id: str, error: str,
-                     error_kind: str, retry_delay_seconds: int) -> str:
+                     error_kind: str, retry_delay_seconds: int, *,
+                     retryable: bool = True) -> str:
         now = _now()
         job = self.jobs.find_one({
             "paper_id": paper_id, "status": "extracting", "worker_id": worker_id,
         })
         if not job:
             return "ignored"
-        retrying = int(job.get("attempt_count", 0)) < int(job.get("max_attempts", 2))
+        retrying = (
+            retryable
+            and int(job.get("attempt_count", 0)) < int(job.get("max_attempts", 2))
+        )
         status = "retry_wait" if retrying else "failed"
         history = {
             "run_number": int(job.get("run_number", 1)),
@@ -523,16 +581,114 @@ class ResearchGraphRepository:
             saved.append({**document, "review_status": review_status})
         return saved
 
+    def upsert_canonical_claims(
+        self, paper: dict[str, Any], claims: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Materialize canonical claims into the legacy edge contract."""
+        paper_id = str(paper["arxiv_id"])
+        self._paper_node(paper)
+        now = _now()
+        saved: list[dict[str, Any]] = []
+        new_edge_ids: list[str] = []
+        for claim in claims:
+            normalized_target = _normalized(claim["object_canonical_name"])
+            existing_node = self.nodes.find_one({
+                "node_type": claim["target_type"],
+                "normalized_name": normalized_target,
+            })
+            target_node_id = (
+                existing_node["_id"] if existing_node
+                else f"entity:{claim['object_entity_id']}"
+            )
+            self.nodes.update_one(
+                {"_id": target_node_id},
+                {"$set": {
+                    "node_type": claim["target_type"],
+                    "name": claim["object_canonical_name"],
+                    "normalized_name": normalized_target,
+                    "canonical_entity_id": claim["object_entity_id"],
+                    "aliases": claim.get("object_aliases", []),
+                    "updated_at": now,
+                }, "$setOnInsert": {"created_at": now}}, upsert=True,
+            )
+            seed = (
+                f"{paper_id}|{claim['relation']}|{target_node_id}|"
+                f"{claim['chunk_index']}|{claim['claim_id']}"
+            )
+            edge_id = hashlib.sha256(seed.encode()).hexdigest()
+            previous = self.edges.find_one({
+                "source_paper_id": paper_id,
+                "relation": claim["relation"],
+                "evidence_chunk_index": claim["chunk_index"],
+                "target_name": {"$regex": f"^{re.escape(claim['object_name'])}$", "$options": "i"},
+                "review_status": {"$in": ["confirmed", "rejected"]},
+            })
+            if previous:
+                edge_id = previous["_id"]
+            review_status = previous.get("review_status") if previous else claim["review_status"]
+            if previous:
+                self.canonical.review_claim(claim["claim_id"], review_status)
+            document = {
+                "_id": edge_id, "source_paper_id": paper_id,
+                "source_node_id": f"paper:{paper_id}", "target_node_id": target_node_id,
+                "relation": claim["relation"], "target_type": claim["target_type"],
+                "target_name": claim["object_canonical_name"],
+                "evidence_chunk_index": claim["chunk_index"],
+                "evidence_section": claim.get("section", ""),
+                "evidence_page": claim.get("page", 0),
+                "evidence_content_hash": claim["evidence_content_hash"],
+                "evidence": claim["evidence"],
+                "evidence_context": claim["evidence_context"],
+                "extracted_relation": claim.get("predicate_raw", ""),
+                "validation_verdict": claim["validation_verdict"],
+                "validation_reason": claim["validation_reason"],
+                "extractor_version": GRAPH_VERSION, "review_status": review_status,
+                "claim_id": claim["claim_id"], "fact_id": claim["fact_id"],
+                "canonical_predicate": claim["predicate"],
+                "subject_entity_id": claim["subject_entity_id"],
+                "subject_name": claim["subject_canonical_name"],
+                "object_entity_id": claim["object_entity_id"],
+                "object_name": claim["object_canonical_name"],
+                "qualifiers": claim.get("qualifiers", {}),
+                "stance": claim.get("stance", "support"),
+                "provenance": {
+                    "paper_id": paper_id, "chunk_id": claim["chunk_id"],
+                    "chunk_index": claim["chunk_index"], "section": claim.get("section", ""),
+                    "page": claim.get("page", 0), "evidence": claim["evidence"],
+                    "confidence": claim.get("confidence", 0.5),
+                    "graph_version": GRAPH_VERSION,
+                },
+                "updated_at": now,
+            }
+            self.edges.update_one(
+                {"_id": edge_id},
+                {"$set": document, "$setOnInsert": {"created_at": now}}, upsert=True,
+            )
+            saved.append(document)
+            new_edge_ids.append(edge_id)
+        stale_query: dict[str, Any] = {
+            "source_paper_id": paper_id,
+            "review_status": {"$in": list(SYSTEM_REVIEW_STATUSES)},
+        }
+        if new_edge_ids:
+            stale_query["_id"] = {"$nin": new_edge_ids}
+        self.edges.delete_many(stale_query)
+        return saved
+
     def get_edge(self, edge_id: str) -> dict[str, Any] | None:
         return self.edges.find_one({"_id": edge_id})
 
     def review_edge(self, edge_id: str, review_status: str) -> bool:
         if review_status not in {"confirmed", "rejected"}:
             return False
-        return self.edges.update_one(
+        edge = self.edges.find_one({"_id": edge_id})
+        matched = self.edges.update_one(
             {"_id": edge_id},
             {"$set": {"review_status": review_status, "updated_at": _now()}},
         ).matched_count == 1
+        if matched and edge and edge.get("claim_id"):
+            self.canonical.review_claim(edge["claim_id"], review_status)
+        return matched
 
     def delete_auto_data_for_paper(self, paper_id: str) -> None:
         self.edges.delete_many({
@@ -541,6 +697,7 @@ class ResearchGraphRepository:
         })
         self.jobs.delete_many({"paper_id": paper_id})
         self.nodes.delete_many({"_id": f"paper:{paper_id}"})
+        self.canonical.delete_paper(paper_id)
 
     def search(self, query: str = "", entity_type: str | None = None,
                relation: str | None = None, review_status: str | None = None,
@@ -642,5 +799,6 @@ class ResearchGraphRepository:
         counts["needs_review"] = self.edges.count_documents({
             "review_status": "needs_review",
         })
+        counts["canonical"] = self.canonical.evaluation()
         counts["circuit"] = self.circuit_state()
         return counts

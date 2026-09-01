@@ -3,9 +3,18 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import re
 from typing import Any
 
-from storage.research_graph import ENTITY_TYPES, RELATIONS
+from knowledge_graph.models import apply_verification, claim_from_candidate
+from knowledge_graph.schema.entity_types import ENTITY_TYPES
+from knowledge_graph.schema.predicates import LEGACY_RELATIONS, PREDICATES
+
+# Compatibility exports for older callers. Canonical predicates live in
+# knowledge_graph.schema.predicates; the UI-facing relation vocabulary remains
+# accepted while V3 jobs are being upgraded.
+RELATIONS = LEGACY_RELATIONS
 
 
 class ResearchGraphExtractor:
@@ -92,21 +101,88 @@ class ResearchGraphExtractor:
 
     @staticmethod
     def _load_json(content: str) -> tuple[list[dict[str, Any]], str]:
-        start = content.find("[")
-        end = content.rfind("]")
-        if start < 0 or end < start:
-            return [], "invalid_json"
+        """Parse strict JSON while salvaging only independently valid objects."""
+        text = str(content or "").strip()
+        fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", text, flags=re.DOTALL | re.IGNORECASE)
+        if fenced:
+            text = fenced.group(1).strip()
+
+        def normalized(value: Any) -> tuple[list[dict[str, Any]], str] | None:
+            if isinstance(value, list):
+                rows = [item for item in value if isinstance(item, dict)]
+                return rows, "empty_array" if not value else "parsed"
+            if isinstance(value, dict):
+                for key in ("candidates", "claims", "relations", "items", "decisions"):
+                    if isinstance(value.get(key), list):
+                        rows = [item for item in value[key] if isinstance(item, dict)]
+                        return rows, "empty_array" if not value[key] else "parsed"
+                return [value], "parsed_single_object"
+            return None
+
         try:
-            value = json.loads(content[start:end + 1])
+            direct = normalized(json.loads(text))
         except json.JSONDecodeError:
-            return [], "invalid_json"
-        if not isinstance(value, list):
-            return [], "invalid_json"
-        return value, "empty_array" if not value else "parsed"
+            direct = None
+        if direct is not None:
+            return direct
+
+        decoder = json.JSONDecoder()
+        for start, marker in enumerate(text):
+            if marker != "[":
+                continue
+            try:
+                value, _ = decoder.raw_decode(text[start:])
+            except json.JSONDecodeError:
+                continue
+            parsed = normalized(value)
+            if parsed is not None:
+                return parsed
+
+        # A response cut off at the output-token boundary can still contain
+        # complete leading objects. Decode each object independently and never
+        # synthesize the incomplete tail.
+        start = text.find("[")
+        if start >= 0:
+            cursor = start + 1
+            recovered: list[dict[str, Any]] = []
+            while cursor < len(text):
+                while cursor < len(text) and text[cursor] in " \r\n\t,":
+                    cursor += 1
+                if cursor >= len(text) or text[cursor] == "]":
+                    break
+                try:
+                    value, consumed = decoder.raw_decode(text[cursor:])
+                except json.JSONDecodeError:
+                    break
+                if not isinstance(value, dict):
+                    break
+                recovered.append(value)
+                cursor += consumed
+            if recovered:
+                return recovered, "recovered_truncated"
+        return [], "invalid_json"
 
     @staticmethod
     def _response_text(response: Any) -> str:
-        return str(getattr(response, "content", response) or "").strip()
+        content = getattr(response, "content", response)
+
+        def text_parts(value: Any) -> list[str]:
+            if isinstance(value, str):
+                return [value]
+            if isinstance(value, dict):
+                if isinstance(value.get("text"), str):
+                    return [value["text"]]
+                if "content" in value:
+                    return text_parts(value["content"])
+                return []
+            if isinstance(value, list):
+                parts: list[str] = []
+                for item in value:
+                    parts.extend(text_parts(item))
+                return parts
+            return [str(value)] if value is not None else []
+
+        return "\n".join(text_parts(content)).strip()
 
     def _invoke(self, prompt: str) -> str:
         client = self.llm.bind(temperature=0) if hasattr(self.llm, "bind") else self.llm
@@ -118,10 +194,17 @@ class ResearchGraphExtractor:
             chunk_index = int(candidate.get("evidence_chunk_index"))
         except (TypeError, ValueError):
             return False
+        raw_predicate = (
+            candidate.get("predicate_raw") or candidate.get("predicate")
+            or candidate.get("relation")
+        )
+        object_name = candidate.get("object_name") or candidate.get("object") or candidate.get("target_name")
+        subject_name = candidate.get("subject_name") or candidate.get("subject")
+        legacy = candidate.get("relation") in LEGACY_RELATIONS
         return (
-            candidate.get("relation") in RELATIONS
-            and candidate.get("target_type") in ENTITY_TYPES
-            and len(str(candidate.get("target_name", "")).strip()) >= 2
+            bool(raw_predicate)
+            and len(str(object_name or "").strip()) >= 2
+            and (legacy or len(str(subject_name or "").strip()) >= 2)
             and len(str(candidate.get("evidence", "")).strip()) >= 12
             and chunk_index in chunk_ids
         )
@@ -134,21 +217,27 @@ class ResearchGraphExtractor:
                 "model_candidate_count": 0, "extractor_rejected_count": 0,
             }}
         prompt = (
-            "你是严谨的学术关系抽取器。主语始终是当前论文。只依据给定正文，"
-            "不要把相关工作、引用论文或单纯提及误判为当前论文的贡献。\n"
+            "你是严谨的学术事实抽取器。只依据给定正文抽取实体之间明确陈述的事实，"
+            "不要把相关工作、引用论文或单纯提及误判为当前论文结论。\n"
             f"当前论文：{paper.get('title', '')}\n"
             f"正文片段：{json.dumps(batch, ensure_ascii=False)}\n\n"
-            "仅输出 JSON 数组。关系可选：proposes、uses、improves、compares_with、"
-            "evaluates_on、measures_with、studies；实体类型可选：method、dataset、"
-            "metric、task。每项格式为："
-            '{"relation":"...","target_type":"...","target_name":"实体原名",'
+            "仅输出单行 JSON 数组，不要 Markdown、解释或代码围栏。不要自行归一化"
+            "实体类型、qualifier、stance 或 predicate；这些由下一阶段统一完成。"
+            "若同一事实重复出现只保留证据最完整的一项。"
+            "每项格式为："
+            '{"subject_name":"实体原名","predicate_raw":"原文关系短语",'
+            '"object_name":"实体原名",'
             '"evidence_chunk_index":整数,"evidence":"原文中连续的1到3个完整句子"}。'
             "evidence 必须逐字来自给定正文；证据不足时不要输出。"
         )
         content = self._invoke(prompt)
         candidates, parse_status = self._load_json(content)
         if parse_status == "invalid_json":
-            raise ValueError("图谱抽取器返回的不是有效 JSON 数组")
+            digest = hashlib.sha256(content.encode("utf-8")).hexdigest()[:12]
+            raise ValueError(
+                "图谱抽取器返回的不是可恢复 JSON "
+                f"(response_length={len(content)}, response_digest={digest})"
+            )
         chunk_ids = {int(item["chunk_index"]) for item in batch}
         valid = [item for item in candidates if self._candidate_valid(item, chunk_ids)]
         if not candidates:
@@ -162,6 +251,7 @@ class ResearchGraphExtractor:
             "selected_chunk_count": len(batch),
             "model_candidate_count": len(candidates),
             "extractor_rejected_count": len(candidates) - len(valid),
+            "parse_status": parse_status,
             "response_excerpt": content[:800],
         }}
 
@@ -175,15 +265,21 @@ class ResearchGraphExtractor:
         numbered = [{"candidate_index": index, **candidate}
                     for index, candidate in enumerate(candidates)]
         prompt = (
-            "你是独立的学术关系核验器。请结合当前论文、原文上下文和候选关系判断"
-            "证据是否真的支持‘当前论文’与实体之间的关系。特别区分：本文提出、本文"
-            "使用、相关工作提出、引用、附录复述和单纯提及。\n"
+            "你是独立的学术事实核验和 schema 归一化器。请逐项判断证据是否支持候选"
+            "事实，并把实体类型、predicate、qualifier、stance 和 confidence 一次完成"
+            "归一化。不要增加第三次 normalization 调用。特别区分本文结论、相关工作、"
+            "引用、附录复述和单纯提及。\n"
             f"当前论文：{paper.get('title', '')}\n"
             f"原文片段：{json.dumps(batch, ensure_ascii=False)}\n"
             f"候选关系：{json.dumps(numbered, ensure_ascii=False)}\n\n"
-            "仅输出 JSON 数组，每个候选必须返回一项："
+            f"实体类型只能是：{','.join(sorted(ENTITY_TYPES))}。"
+            f"predicate 只能是：{','.join(sorted(PREDICATES))}；无法判断必须返回 UNKNOWN。"
+            "仅输出 JSON 数组，每个候选返回一项："
             '{"candidate_index":整数,"verdict":"supported|uncertain|rejected",'
-            '"relation":"核验后的关系类型","reason":"简短原因"}。'
+            '"valid":布尔值,"subject_name":"标准原名","subject_type":"固定类型",'
+            '"predicate":"固定 predicate","object_name":"标准原名",'
+            '"object_type":"固定类型","qualifiers":{},"stance":"support|contradict",'
+            '"confidence":0到1,"reason":"简短原因"}。'
             "只有原文明确定义当前论文主体和关系时才 supported；需要跨片段推断、主体"
             "不清或关系类型可能不同则 uncertain；证据不支持则 rejected。"
         )
@@ -192,40 +288,56 @@ class ResearchGraphExtractor:
         if parse_status == "invalid_json":
             raise ValueError("图谱核验器返回的不是有效 JSON 数组")
         decision_map: dict[int, dict[str, Any]] = {}
+        invalid_decision_count = 0
+        duplicate_decision_count = 0
         for decision in decisions:
             try:
                 index = int(decision.get("candidate_index"))
             except (TypeError, ValueError):
+                invalid_decision_count += 1
                 continue
             verdict = str(decision.get("verdict", ""))
-            relation = str(decision.get("relation", ""))
-            if verdict == "rejected" and relation not in RELATIONS:
-                relation = str(candidates[index].get("relation", "")) \
-                    if 0 <= index < len(candidates) else ""
-                decision = {**decision, "relation": relation}
-            if (
-                0 <= index < len(candidates)
-                and verdict in self.VERDICTS and relation in RELATIONS
-            ):
-                decision_map[index] = decision
-        if len(decision_map) != len(candidates):
-            raise ValueError("图谱核验器没有完整返回每个候选的判断")
+            if not 0 <= index < len(candidates) or verdict not in self.VERDICTS:
+                invalid_decision_count += 1
+                continue
+            if index in decision_map:
+                duplicate_decision_count += 1
+                # Conflicting duplicates are unsafe. Leave the candidate for the
+                # conservative synthesized uncertain decision below.
+                if decision_map[index] != decision:
+                    decision_map.pop(index, None)
+                continue
+            decision_map[index] = decision
         relations = []
         for index, candidate in enumerate(candidates):
-            decision = decision_map[index]
-            verdict = decision["verdict"]
-            validated_relation = decision["relation"]
-            relations.append({
-                **candidate,
-                "validation_verdict": verdict,
-                "validated_relation": validated_relation,
-                "validation_reason": str(decision.get("reason") or "未提供核验说明"),
-            })
+            decision = decision_map.get(index)
+            if decision is None:
+                base = claim_from_candidate(candidate, paper)
+                decision = {
+                    "verdict": "uncertain",
+                    "valid": base.get("predicate") != "UNKNOWN",
+                    "subject_name": base.get("subject_name"),
+                    "subject_type": base.get("subject_type"),
+                    "predicate": base.get("predicate"),
+                    "object_name": base.get("object_name"),
+                    "object_type": base.get("object_type"),
+                    "qualifiers": base.get("qualifiers", {}),
+                    "stance": base.get("stance", "support"),
+                    "confidence": min(float(base.get("confidence", 0.5)), 0.49),
+                    "reason": "missing_or_invalid_decision",
+                }
+            relations.append(apply_verification(candidate, decision, paper))
+        missing_count = len(candidates) - len(decision_map)
         return {"relations": relations, "diagnostics": {
             "validated_count": len(relations),
             "supported_count": sum(item["validation_verdict"] == "supported" for item in relations),
             "uncertain_count": sum(item["validation_verdict"] == "uncertain" for item in relations),
             "rejected_count": sum(item["validation_verdict"] == "rejected" for item in relations),
+            "returned_decision_count": len(decisions),
+            "missing_or_invalid_decision_count": missing_count,
+            "invalid_decision_count": invalid_decision_count,
+            "duplicate_decision_count": duplicate_decision_count,
+            "parse_status": parse_status,
             "response_excerpt": content[:800],
         }}
 
