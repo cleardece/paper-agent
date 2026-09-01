@@ -1,12 +1,14 @@
 # Paper Agent
 
-面向研究生论文阅读与小论文写作的研究助手。它将论文搜索、PDF 解析、混合检索和多 Agent 分析串成一条可追溯的研究工作流：当答案缺少本次检索到的论文证据时，系统会要求重检索或明确提示证据不足。
+面向研究生论文阅读与小论文写作的研究助手。它将论文搜索、PDF 解析、混合检索、多 Agent 分析、多轮论文上下文和可审核研究图谱串成一条可追溯的研究工作流：当答案缺少本次检索到的论文证据时，系统会要求重检索或明确提示证据不足。
 
 ## 项目目标
 
 - 搜索、导入并解析学术论文；
 - 结合 MongoDB、Milvus 和 Hybrid Search 检索已入库论文；
 - 用 LangGraph 编排路由、检索、分析、质量审核、呈现和反思；
+- 用稳定论文 ID 维护会话焦点，支持“这篇论文的实验呢”等无标题追问；
+- 将论文主张规范化为 Entity、Claim、Fact 和 Provenance，并保留人工复核入口；
 - 为回答提供可核验的引用来源、质量状态和 Agent 执行时间；
 - 作为长期个人研究工具，而非一次性的演示项目。
 
@@ -14,12 +16,15 @@
 
 ```text
 用户问题
-  -> Supervisor
+  -> PaperContextResolver（解析当前论文）
+  -> Supervisor（只判断动作意图）
+  -> TurnContext / SearchAdmissionGate
   -> Fetcher（搜索/入库）
      或 Retriever -> Analyzer -> Critic -> Presenter -> Reflector
 
 PDF -> 解析 -> Chunk -> Embedding -> Milvus
 论文与会话元数据 -> MongoDB
+已索引论文 -> 可恢复图谱 Worker -> Entity / Claim / Fact / Provenance
 ```
 
 `Critic` 在 LLM 语义审核前先执行确定性规则：回答中的论文引用必须来自当前 `retrieved_chunks`。这项规则验证来源归属；它不替代对具体事实是否被原文蕴含的人工或 LLM 审核。
@@ -62,6 +67,7 @@ python -m uvicorn web.app:app --host 0.0.0.0 --port 8000 --reload
 | `MINERU_OFFICIAL_BASE_URL` | MinerU 官方 API 地址；解析固定使用 `vlm` |
 | `USE_MCP`、`MCP_ARXIV_URL` | arXiv MCP 搜索优先级 |
 | `SEMANTIC_SCHOLAR_API_KEY` | 可选的 Semantic Scholar 搜索 |
+| `GRAPH_*` | 研究图谱 LLM 请求、子进程超时、任务租约、重试与熔断参数 |
 | `PA_DATA_ROOT` | Docker Compose 数据卷根目录 |
 
 ## 日常研究工作流
@@ -70,7 +76,8 @@ python -m uvicorn web.app:app --host 0.0.0.0 --port 8000 --reload
 2. 在论文库确认论文状态，点击“提问”回到会话中做单篇分析。
 3. 对多篇已入库论文提问或比较，阅读回答下方的 Agent 时间线与证据面板。
 4. 对用于写作的结论，打开论文原文核对上下文；系统提供的是来源约束和检索证据，不替代学术责任。
-5. 将经人工核对的高价值问题加入本地评测集，持续观察检索和引用质量。
+5. 打开 `/graph` 查看图谱覆盖率、后台任务和待复核关系，必要时确认、拒绝或手动重试失败论文。
+6. 将经人工核对的高价值问题加入本地评测集，持续观察检索和引用质量。
 
 ## 准确性边界
 
@@ -172,6 +179,17 @@ MinerU 的镜像依赖和启动参数可能随版本变化，实际部署时以 
 - **研究者档案**：学习情况、研究方向、研究项目和长期偏好。回答完成后，系统会从用户本人消息中静默提炼档案更新；每次变更保留来源会话、消息 ID、置信度、时间和前后版本。
 
 可在 `GET /api/research-profile/local-user` 查看本地档案。对话中可直接说“研究方向改为……”“不是这样，……”来覆盖旧记录。研究者档案只用于理解用户意图，绝不会作为论文事实、检索 chunk 或引用来源。
+
+## 研究图谱（Evidence Graph V4）
+
+论文进入 `indexed` 状态后会自动进入持久化图谱队列。工作者从原文 chunks 分批抽取主张，执行 Schema 核验、原文证据定位、Entity Resolution 和 Fact Resolution，最终保存规范实体、主张、事实及其来源。
+
+- 实体别名、缩写和相近表述优先走确定性规则；只有歧义候选才调用 Resolution LLM。
+- 同一 Fact 可聚合多篇论文的支持或反对 Claim，每条 Claim 保留 paper、chunk、section/page、原文 evidence 和版本信息。
+- 后台任务带租约、心跳、硬超时、一次可恢复重试和熔断；配额耗尽会被标记为不可重试失败，不会无限循环。
+- 页面与 Retriever 继续读取兼容关系投影；图谱用于关联与导航，最终回答的证据仍来自本次检索到的论文 chunks。
+
+图谱页面为 `GET /graph`；主要接口包括 `GET /api/research-graph`、`GET /api/research-graph/status`、`GET /api/research-graph/jobs`、`POST /api/research-graph/jobs/retry` 和 `PATCH /api/research-graph/edges/{edge_id}`。应用启动时会对已索引论文与当前图谱版本做增量对账。
 
 ## Git 约定
 

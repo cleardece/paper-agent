@@ -1,347 +1,160 @@
-# Paper Agent 技术架构文档
+# Paper Agent 技术架构
 
 ## 1. 系统概览
 
-Paper Agent 是一个基于 LangGraph 的多 Agent 学术论文助手，支持论文搜索、入库、分析和问答。
+Paper Agent 是一个基于 FastAPI 和 LangGraph 的学术论文助手。系统将论文搜索与入库、基于证据的问答、多轮论文上下文和可审核研究图谱分成独立链路，通过 MongoDB 与 Milvus 共享稳定的论文 ID。
 
-```
-┌─────────────────────────────────────────────────────────┐
-│                    Web 前端 (HTML/JS)                    │
-│              http://localhost:8000                       │
-└──────────────────────┬──────────────────────────────────┘
-                       │ SSE / WebSocket
-┌──────────────────────▼──────────────────────────────────┐
-│                 FastAPI 后端 (web/app.py)                │
-│              Session 管理 + Workflow 编排                │
-└──────────────────────┬──────────────────────────────────┘
-                       │
-┌──────────────────────▼──────────────────────────────────┐
-│              LangGraph Workflow (状态图)                 │
-│                                                         │
-│  ┌──────────┐                                           │
-│  │ Supervisor │ ← 路由中枢                              │
-│  └─────┬────┘                                           │
-│        ├──── direct ──→ DirectAnalyzer ──→ Presenter    │
-│        ├──── fetcher ─→ Translator → Fetcher → Presenter│
-│        └──── retriever → Retriever → Analyzer → Critic  │
-│                                    → Presenter          │
-└──────────────────────┬──────────────────────────────────┘
-                       │
-┌──────────────────────▼──────────────────────────────────┐
-│                    基础设施层                             │
-│  ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌──────────────┐ │
-│  │ MongoDB  │ │ Milvus  │ │ MinerU  │ │ arXiv API    │ │
-│  │ 元数据   │ │ 向量库  │ │ PDF解析 │ │ 论文搜索     │ │
-│  └─────────┘ └─────────┘ └─────────┘ └──────────────┘ │
-└─────────────────────────────────────────────────────────┘
+```text
+浏览器（对话 / 论文库 / 研究图谱）
+        |
+        | HTTP + SSE / WebSocket
+        v
+FastAPI (web/app.py)
+        |
+        +-- LangGraph 问答工作流
+        |     PaperContextResolver -> Supervisor -> TurnContext
+        |       +-- Fetcher
+        |       +-- DirectAnalyzer
+        |       +-- Retriever -> Analyzer -> Critic -> Presenter
+        |
+        +-- 持久化上传队列 -> MinerU -> Chunk -> MongoDB / Milvus
+        |
+        +-- 可恢复图谱队列 -> Evidence Graph V4
+              -> Entity / Claim / Fact / Provenance
 ```
 
-## 2. Agent 定义
+## 2. 对话工作流
 
-| Agent | 职责 | 输入 | 输出 |
-|-------|------|------|------|
-| **Supervisor** | 路由调度，判断用户意图 | user_query + 对话上下文 | next_agent, search_query, target_paper |
-| **Translator** | 中文查询翻译为英文搜索词 | user_query | search_query |
-| **Fetcher** | 搜索 arXiv，下载 PDF，解析，分块，向量化，入库 | search_query | target_papers, answer |
-| **DirectAnalyzer** | 单篇论文快速分析：下载→解析→全文喂LLM | user_query, target_paper | analysis, answer |
-| **Retriever** | 从 Milvus 检索相关 chunks（HybridSearch） | user_query | retrieved_chunks |
-| **Analyzer** | 基于检索结果综合分析 | retrieved_chunks, user_query | analysis |
-| **Critic** | 评估分析质量，决定是否重试 | analysis, retrieved_chunks | critic_score, next_agent |
-| **Presenter** | 格式化最终回复 | analysis/answer | answer |
+| 节点 | 职责 |
+| --- | --- |
+| `PaperContextResolver` | 在路由前用显式目标、arXiv ID/DOI、本地标题、会话焦点和结构化历史解析论文 ID |
+| `Supervisor` | 只判断 `analyze` / `rag` / `compare` / `search` / `general` 动作，不再猜论文标题 |
+| `TurnContext` | 将查询、意图、主论文、参与论文和外部搜索权限投影给下游 Agent |
+| `Fetcher` | 唯一允许执行外部论文发现的 Agent；只接收经验证的 `SearchRequest` |
+| `DirectAnalyzer` | 分析已解析的本地单篇论文；失败时不把原问题转发给 arXiv |
+| `Retriever` | 在已入库论文中执行论文级筛选、BM25 + 向量检索、RRF 融合和重排 |
+| `Analyzer` | 仅基于本次 `retrieved_chunks` 组织分析 |
+| `Critic` | 检查证据归属、回答质量和是否需要重检索/修订 |
+| `Presenter` | 输出面向用户的答案、状态和引用 |
 
-## 3. 路由逻辑
-
-### 3.1 Supervisor 路由规则
-
-```
-用户输入
-  │
-  ├─ 单篇论文分析 ──────→ direct (DirectAnalyzer)
-  │  · 指定了具体论文标题
-  │  · "这篇论文"/"它的..." (跟随意图 + 有上下文)
-  │
-  ├─ 多篇论文入库 ──────→ fetcher (Translator → Fetcher)
-  │  · "搜索/找论文/下载"
-  │
-  ├─ 知识库问答 ────────→ retriever (Retriever → Analyzer)
-  │  · "对比/区别/哪些论文"
-  │  · 跟随意图但无上下文 (新对话)
-  │
-  └─ 闲聊/无关 ────────→ END (Presenter)
+```text
+用户消息
+  -> 解析 PaperContext
+  -> 判断动作意图
+       analyze + primary_paper_id -> DirectAnalyzer
+       compare/rag                -> Retriever -> Analyzer
+       search                     -> SearchAdmissionGate -> Fetcher
+       general                    -> Presenter
 ```
 
-### 3.2 跟随意图检测
+外部搜索只对明确的 `search` 意图开放。`SearchQueryBuilder` 只构建 arXiv ID、标题或简短关键词请求，不把整段分析问题原样发给 arXiv。没有唯一论文上下文的分析请求返回稳定业务错误，不会隐式搜索。
 
-```python
-# 检测关键词
-followup_patterns = ["这篇论文", "该论文", "上一篇", "它的", ...]
+## 3. 多轮论文上下文
 
-# 跟随意图时：
-if 有对话上下文 → 提取目标论文标题 → 走 direct
-if 无对话上下文 → 走 retriever (让它自己找)
+`PaperContextResolver` 按以下顺序决定论文身份：
+
+1. 前端显式传入的 `target_paper_id`；
+2. 当前消息中的本地 ID、arXiv ID 或 DOI；
+3. 本地论文库的标题匹配或明确切换表达；
+4. 会话中的唯一 `primary_paper_id`；
+5. 近期消息保存的结构化 `paper_context`；
+6. 返回 unresolved / ambiguous，不从助手文本里猜标题。
+
+只要当前会话有唯一主论文，“总结实验结果”这类不带代词的追问也会继承该论文。Session 保存 `paper_focus`，每条消息可保存当轮 `paper_context`。`SessionStateReducer` 是唯一更新会话焦点的组件；失败或未解析轮次不覆盖已有焦点。
+
+## 4. 论文入库与检索
+
+```text
+上传 PDF / Fetcher 获取论文
+  -> 持久化串行队列
+  -> MinerU 官方 VLM 解析
+  -> 分块 -> MongoDB
+  -> BGE-M3 Embedding -> Milvus
+  -> 论文状态 indexed
 ```
 
-## 4. 数据流
+上传批次和单篇任务持久化到 MongoDB，服务重启后恢复未完成工作。检索链路先缩小论文范围，再在目标 chunks 中执行 BM25 与向量检索，通过 RRF 融合和 Cross-Encoder 重排返回证据。论文特定问答使用 `TurnContext.paper_ids` 限定范围。
 
-### 4.1 单篇论文分析 (DirectAnalyzer)
+## 5. Evidence Graph V4
 
-```
-用户: "分析这篇论文 XXX"
-  │
-  ▼
-Supervisor → direct
-  │
-  ▼
-DirectAnalyzer
-  │
-  ├─ 检查 MongoDB 是否已有
-  │   ├─ 有 → 读取 full_text
-  │   └─ 无 → arXiv 搜索 → 下载 PDF → MinerU 解析
-  │
-  ├─ 动态章节提取 (根据用户问题)
-  │   · 实验相关 → 提取 method + experiment
-  │   · 方法相关 → 提取 method + experiment
-  │   · 全面分析 → 提取所有核心章节
-  │
-  ├─ 全文存 MongoDB (供后续查询)
-  │
-  ├─ 分块 + Embedding → 存 Milvus (后台入库)
-  │
-  └─ 核心章节喂 LLM → 分析结果
-  │
-  ▼
-Presenter → 输出
+论文进入 `indexed` 后由上传 Worker 唤醒图谱 Worker。应用启动时还会对已索引论文和当前 `evidence-graph-v4` 版本做增量对账。
+
+```text
+Paper chunks
+  -> 分批 Claim 抽取
+  -> 分批核验 + 固定 Schema 映射
+  -> 原文 evidence 定位
+  -> Entity Resolution
+       exact canonical -> exact alias -> vector Top-K -> rule score
+       -> merge / new / 歧义批量 LLM
+  -> Fact Resolution
+       exact signature -> vector Top-K -> structural score
+       -> existing / new / 歧义批量 LLM
+  -> 按论文原子替换系统生成 Claim
+  -> 生成兼容 research_graph_edges 投影
 ```
 
-### 4.2 多篇论文入库 (Fetcher)
+核心 Schema 使用有限 Entity Type 和 Canonical Predicate。无法可靠映射的关系不进入可用 Fact。同一 Fact 可聚合多条 `support` / `contradict` Claim，每条 Claim 保留评审状态和完整 Provenance。
 
-```
-用户: "搜索 XXX 论文"
-  │
-  ▼
-Supervisor → fetcher
-  │
-  ▼
-Translator → 英文搜索词
-  │
-  ▼
-Fetcher
-  │
-  ├─ arXiv 搜索 (MCP 优先，降级直接 API)
-  │
-  ├─ 逐篇处理 (串行，避免资源爆炸)
-  │   ├─ 下载 PDF
-  │   ├─ MinerU 解析
-  │   ├─ 分块 (2000字符/块，300重叠)
-  │   ├─ Embedding (batch=4，清理显存)
-  │   └─ 存 MongoDB + Milvus
-  │
-  └─ 入库结果反馈
-  │
-  ▼
-Presenter → 输出
-```
+图谱任务使用租约、心跳、独立子进程硬超时、一次可恢复重试和熔断。LLM 配额耗尽会标记为 `llm_quota_exhausted` 并终止自动重试；配额恢复后可在图谱页面手动重试。
 
-### 4.3 知识库问答 (Retriever)
+`research_graph_edges` 是页面和 Retriever 的兼容投影，用于论文关联、导航和候选扩展，不代替问答证据。最终回答仍必须基于当前检索到的原文 chunks。
 
-```
-用户: "对比 X 和 Y"
-  │
-  ▼
-Supervisor → retriever
-  │
-  ▼
-Retriever
-  │
-  ├─ MultiQuery → 生成 3-4 个查询变体
-  │
-  ├─ 论文级检索 (每个变体)
-  │   · Embedding 查询
-  │   · 与所有论文的 title+abstract 向量计算余弦相似度
-  │   · 取 top-5 论文
-  │
-  ├─ Chunk 级检索 (限定 top-5 论文)
-  │   · Milvus 向量搜索 → top-10 chunks
-  │   · BM25 关键词搜索 → top-10 chunks
-  │   · RRF 融合 → 最终排序
-  │
-  ├─ 合并去重所有变体结果
-  │
-  ├─ Section 过滤 (按意图)
-  │
-  └─ 返回 top-15 chunks
-  │
-  ▼
-Analyzer → LLM 分析
-  │
-  ▼
-Critic → 评估 (60分+无严重幻觉=pass)
-  │
-  ▼
-Presenter → 输出
-```
+## 6. 存储模型
 
-## 5. 存储架构
+### MongoDB
 
-### 5.1 MongoDB
+| 数据 | 主要内容 |
+| --- | --- |
+| `papers` / `chunks` | 论文元数据、MinerU 全文、分块、入库与图谱状态 |
+| sessions / messages | 对话、Agent 时间线、`paper_focus`、每轮 `paper_context` |
+| upload batches / jobs | 持久化上传批次和单篇任务 |
+| `research_graph_jobs` | 图谱版本、运行次数、尝试历史、租约、分批进度和诊断 |
+| `research_graph_entities` / `research_graph_aliases` | 规范实体、别名与阻断键 |
+| `research_graph_claims` / `research_graph_facts` | 带 Provenance 的论文主张与跨论文事实 |
+| `research_graph_resolution_cache` | Entity/Fact Resolution 的稳定决策缓存 |
+| `research_graph_nodes` / `research_graph_edges` | 页面和旧调用方的兼容投影 |
 
-```
-paper_agent 数据库
-  │
-  ├── papers 集合
-  │   ├── arxiv_id: string (主键)
-  │   ├── title: string
-  │   ├── abstract: string
-  │   ├── authors: list[string]
-  │   ├── pdf_url: string
-  │   ├── full_text: string (MinerU 解析的全文)
-  │   ├── status: "pending" | "parsed" | "chunked" | "indexed"
-  │   ├── created_at: datetime
-  │   └── updated_at: datetime
-  │
-  ├── chunks 集合
-  │   ├── paper_arxiv_id: string (外键)
-  │   ├── chunk_index: int
-  │   ├── content: string (分块文本)
-  │   └── metadata: {section, page, level, ...}
-  │
-  ├── sessions 集合
-  │   ├── session_id: string
-  │   ├── title: string
-  │   ├── messages: [{role, content, created_at, timeline}]
-  │   ├── created_at: datetime
-  │   └── updated_at: datetime
-  │
-  └── user_memory 集合
-      ├── user_id: string
-      └── interests: list[string]
-```
+### Milvus
 
-### 5.2 Milvus
+- 论文/chunk 向量服务于 RAG 论文级与片段级检索。
+- `kg_entity_embeddings` 按 Entity Type 检索规范实体 Top-K 候选。
+- `kg_fact_embeddings` 按 Predicate 检索规范 Fact Top-K 候选。
 
-```
-paper_chunks Collection
-  │
-  ├── id: INT64 (主键, auto_id)
-  ├── paper_arxiv_id: VARCHAR (论文ID)
-  ├── chunk_index: INT64 (分块序号)
-  ├── content: VARCHAR(8192) (分块文本)
-  ├── embedding: FLOAT_VECTOR(1024) (BGE-m3 向量)
-  └── metadata_json: VARCHAR(4096) (元数据JSON)
+KG 向量仅用于候选召回，不单独决定合并。Milvus KG collection 不可用时，解析器使用有界 MongoDB 候选继续工作。
 
-索引: IVF_FLAT, nlist=128, COSINE 相似度
-```
-
-## 6. 检索链路
-
-```
-查询
-  │
-  ▼
-MultiQuery (LLM 生成 3-4 变体)
-  │
-  ▼
-每个变体:
-  │
-  ├─ 论文级检索
-  │   · 计算查询向量与每篇论文 title+abstract 的余弦相似度
-  │   · 取 top-5 论文
-  │
-  ├─ Chunk 级检索 (限定 top-5 论文)
-  │   ├─ Milvus 向量搜索 → top-10
-  │   └─ BM25 关键词搜索 → top-10
-  │       └─ RRF 融合 → 最终排序
-  │
-  └─ 合并到全局结果集
-
-合并去重 → 按 score 排序 → top-15
-  │
-  ▼
-Section 过滤 (按意图: 实验/方法/背景/结论)
-  │
-  ▼
-最终结果 (top-10)
-```
-
-## 7. 性能优化
-
-| 优化项 | 措施 | 效果 |
-|--------|------|------|
-| Embedding 显存 | batch_size=4 + cuda.empty_cache() | 显存峰值 ~6-8GB |
-| 论文处理 | 串行 + 2秒间隔 | 避免资源爆炸 |
-| 内存回收 | gc.collect() 每篇论文处理后 | 防止内存泄漏 |
-| 动态章节 | DirectAnalyzer 按查询提取核心章节 | 70K→15K 字符 |
-| MCP 降级 | MCP 失败/空结果 → 直接 arXiv API | 服务可用性 |
-| 论文缓存 | MongoDB 存全文，Milvus 存向量 | 避免重复下载 |
-
-## 8. API 端点
+## 7. 主要 HTTP 接口
 
 | 方法 | 路径 | 说明 |
-|------|------|------|
-| POST | /api/chat | 对话入口 (SSE 流式响应) |
-| GET | /api/test | 健康检查 |
-| POST | /api/upload | 上传 PDF 论文 |
-| GET | /api/papers | 论文列表 |
-| DELETE | /api/papers/{id} | 删除论文 |
-| POST | /api/compare | 多论文对比 |
-| GET | /api/citations/{id} | 引用关系 |
-| GET | /api/sessions | 会话列表 |
-| GET | /api/sessions/{id} | 会话详情 |
-| DELETE | /api/sessions/{id} | 删除会话 |
-| WS | /ws/{session_id} | WebSocket 实时状态 |
+| --- | --- | --- |
+| `POST` | `/api/chat` | SSE 对话入口 |
+| `POST` | `/api/uploads` / `/api/upload` | 批量上传与单文件兼容入口 |
+| `GET` | `/api/upload-batches` / `/api/upload-batches/{batch_id}` | 上传批次列表与详情 |
+| `GET` / `DELETE` | `/api/papers` / `/api/papers/{id}` | 论文列表与删除 |
+| `POST` | `/api/compare` | 多论文对比 |
+| `GET` | `/api/sessions` / `/api/sessions/{id}` | 会话列表与详情 |
+| `GET` | `/api/research-profile/{user_id}` | 研究者档案 |
+| `GET` | `/api/research-graph` / `/api/research-graph/paper-links` | 证据关系与论文关联 |
+| `GET` | `/api/research-graph/status` / `/api/research-graph/jobs` | 图谱覆盖率、任务和尝试历史 |
+| `POST` | `/api/research-graph/jobs/retry` | 手动重试失败论文 |
+| `PATCH` | `/api/research-graph/edges/{edge_id}` | 确认或拒绝待复核关系 |
+| `WS` | `/ws/{session_id}` | 实时任务状态 |
 
-## 9. 技术栈
+## 8. 故障隔离与恢复
 
-| 组件 | 技术 | 版本 |
-|------|------|------|
-| Web 框架 | FastAPI + Uvicorn | - |
-| Agent 编排 | LangGraph | - |
-| LLM | mimo-v2.5 (API) | - |
-| Embedding | BAAI/bge-m3 (SentenceTransformer) | dim=1024 |
-| 向量库 | Milvus | IVF_FLAT |
-| 文档数据库 | MongoDB | - |
-| PDF 解析 | MinerU 官方精准 API（VLM） | - |
-| 论文搜索 | arXiv MCP / arXiv Direct API | - |
-| GPU | NVIDIA RTX 5070 Ti (16GB) | CUDA 12.8 |
+- Agent 返回结构化业务错误，不让单节点异常直接崩溃整个会话。
+- 上传任务与图谱任务均持久化；服务重启时回收中断任务或过期租约。
+- 图谱抽取子进程有硬超时，主 Worker 持续心跳，不让单篇论文阻塞队列。
+- 图谱核验 LLM 漏回单个候选时按项降级为 `needs_review`；只有整个响应无法解析时才拆批重试。
+- 证据不在原 chunk 中、Schema 非法或核验拒绝的 Claim 不写入可用 Fact。
 
-## 10. 启动命令
+## 9. 配置与不变式
 
-```bash
-# Web 服务
-HF_HUB_DISABLE_TRANSFORMERS_SAFE_LOAD_CHECK=1 \
-PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-python -m uvicorn web.app:app --host 0.0.0.0 --port 8000
+环境变量以 `.env.example` 为准：LLM 使用 `LLM_*`，存储使用 `MONGODB_*` / `MILVUS_*`，解析使用 `MINERU_OFFICIAL_*`，上传队列使用 `UPLOAD_*`，图谱队列使用 `GRAPH_*`，外部搜索使用 `USE_MCP`、`MCP_ARXIV_URL` 和 `SEMANTIC_SCHOLAR_API_KEY`。
 
-# 或使用 start.bat (Windows)
-```
-
-## 11. 环境变量
-
-```env
-# LLM
-LLM_MODEL=mimo-v2.5
-LLM_BASE_URL=https://token-plan-cn.xiaomimimo.com/v1
-LLM_API_KEY=your_key
-
-# Embedding
-EMBEDDING_MODEL=BAAI/bge-m3
-EMBEDDING_DEVICE=  # 留空自动检测
-
-# MongoDB
-MONGODB_URI=mongodb://localhost:27017
-MONGODB_DB=paper_agent
-
-# Milvus
-MILVUS_HOST=localhost
-MILVUS_PORT=19530
-
-# MinerU 官方精准 API（必填）
-MINERU_OFFICIAL_TOKEN=your_token
-MINERU_OFFICIAL_BASE_URL=https://mineru.net
-MINERU_OFFICIAL_POLL_SECONDS=5
-MINERU_OFFICIAL_TIMEOUT_SECONDS=900
-
-# MCP (可选)
-USE_MCP=true
-MCP_ARXIV_URL=http://localhost:8050/sse
-```
+1. 论文身份在意图路由前解析，下游 Agent 不各自猜测。
+2. 非 `search` 意图不允许调用外部论文搜索。
+3. 成功的单篇分析必须返回稳定主论文 ID。
+4. 最终回答的引用必须来自本次检索证据，图谱不直接充当答案来源。
+5. 每个可用 Claim 必须保留可定位的原文证据和版本信息。
+6. 新论文只增量处理自身数据并检索有界 Top-K 候选，不触发全库重建。

@@ -29,24 +29,36 @@ Concept Extraction   ← LLM
 Memory Merge         ← 条件LLM
 Reflection           ← LLM
 Final Answer         ← LLM
+Graph Extraction     ← LLM（已索引论文的后台任务）
+Graph Verification   ← LLM
+Entity/Fact Resolve  ← 仅歧义候选调用 LLM
 ```
 
 ### Agent 架构
 
 ```
-START → Supervisor → Translator → Fetcher → Presenter → Reflector → END
-        Supervisor → Retriever → Analyzer → Critic → Presenter → Reflector → END
+START → PaperContextResolver → Supervisor → TurnContext
+                                  ├→ Fetcher → Presenter → END
+                                  ├→ DirectAnalyzer → Presenter → END
+                                  └→ Retriever → Analyzer → Critic → Presenter → END
 ```
 
 ## Agent 职责
 
+### PaperContextResolver
+- **职责**：在意图路由前解析稳定论文 ID
+- **输入**：当前查询、显式论文目标、会话焦点、近期结构化上下文
+- **输出**：`PaperContext`
+- **规则**：优先显式 ID/标题，其次继承唯一会话焦点；歧义时不从助手文本猜标题
+
 ### Supervisor
-- **职责**：路由调度，判断用户意图
-- **输入**：用户原始查询
-- **输出**：`{next_agent, search_query, reason}`
+- **职责**：只判断动作意图，不解析论文身份
+- **输入**：用户原始查询 + `PaperContext`
+- **输出**：`analyze | rag | compare | search | general`
 - **规则**：
   - 搜索/找论文 → fetcher
-  - 提问/分析 → retriever
+  - 已解析单篇论文分析 → direct_analyzer
+  - 多篇对比/知识库问答 → retriever
   - 闲聊 → presenter
 
 ### Translator
@@ -56,13 +68,19 @@ START → Supervisor → Translator → Fetcher → Presenter → Reflector → 
 
 ### Fetcher
 - **职责**：从 arXiv/Semantic Scholar 搜索论文，解析 PDF，分块入库
-- **输入**：`search_query`
+- **输入**：经 `SearchAdmissionGate` 允许的 `SearchRequest`
 - **输出**：`{target_papers, answer}`
 - **流程**：
-  1. 搜索论文（Semantic Scholar 优先）
-  2. 下载 PDF → 解析（MinerU 优先）
+  1. 仅在明确 `search` 意图下搜索论文
+  2. 下载 PDF → MinerU 官方 VLM 解析
   3. 分块 → Embedding → 存入 Milvus
   4. 初始化 Paper Memory + Section Memory
+
+### DirectAnalyzer
+- **职责**：分析已解析的本地单篇论文
+- **输入**：`TurnContext.primary_paper_id`, `user_query`
+- **输出**：`{analysis, answer, primary_paper_id}`
+- **规则**：不执行 arXiv 搜索或下载降级；目标缺失时返回结构化业务错误
 
 ### Retriever
 - **职责**：语义检索相关论文片段
@@ -138,9 +156,10 @@ START → Supervisor → Translator → Fetcher → Presenter → Reflector → 
 │ Concept Memory (MongoDB + Milvus)               │
 │   - name, definition, source_papers             │
 ├─────────────────────────────────────────────────┤
-│ Knowledge Graph (Neo4j 或内存)                  │
-│   - Paper → proposes → Concept                  │
-│   - Concept → used_by → Paper                   │
+│ Evidence Graph V4 (MongoDB + Milvus)             │
+│   - Canonical Entity / Alias                     │
+│   - Claim / Fact / Provenance / Review           │
+│   - 兼容关系投影供页面与 Retriever             │
 ├─────────────────────────────────────────────────┤
 │ Reflection Memory (MongoDB)                     │
 │   - insights, questions, future_directions       │
@@ -155,13 +174,13 @@ START → Supervisor → Translator → Fetcher → Presenter → Reflector → 
 
 | 组件 | 技术 | 用途 |
 |------|------|------|
-| LLM | MiMo v2.5 | 对话、分析、摘要、概念提取 |
+| LLM | OpenAI 兼容 API（由 `LLM_*` 配置） | 对话、分析、摘要、图谱抽取与核验 |
 | Embedding | BGE-M3 | 文本向量化 |
 | Reranker | BGE-Reranker-v2-M3 | 重排序 |
 | 向量数据库 | Milvus | 语义检索 |
 | 元数据库 | MongoDB | Memory 存储 |
-| 知识图谱 | Neo4j（可选） | 实体关系 |
-| PDF 解析 | MinerU / pdfplumber | PDF → Markdown |
+| 知识图谱 | MongoDB + Milvus | Entity / Claim / Fact / Provenance 与候选召回 |
+| PDF 解析 | MinerU 官方精准 API（VLM） | PDF → Markdown |
 | 框架 | LangGraph | Agent 编排 |
 | Web | FastAPI + SSE | 流式输出 |
 
@@ -181,22 +200,12 @@ Query → MultiQuery (LLM)
     Top-K Results
 ```
 
-## LLM 调用统计
+## LLM 调用边界
 
-### 每篇论文（入库时）
-- Section Summary: 5-10 次
-- Paper Summary: 1 次
-- Concept Extraction: 5-10 次
-- **总计: 12-22 次**
-
-### 每次查询
-- Supervisor: 1 次
-- MultiQuery: 1 次
-- Analyzer: 1-3 次
-- Critic: 1 次
-- Presenter: 1 次
-- Reflector: 1 次
-- **总计: 6-9 次**
+- 确定性论文上下文解析、搜索准入、引用归属和 exact/alias/signature 图谱命中不调用 LLM。
+- 对话中的 Supervisor、MultiQuery、Analyzer、Critic 和 Presenter 按路由条件调用，不保证固定次数。
+- 图谱每批执行抽取和核验；Entity/Fact Resolution 只在规则无法决策时各最多增加一次 batch LLM。
+- 实际调用量与论文分批数、检索路由和 Critic 修订次数相关。
 
 ## 状态定义 (AgentState)
 
@@ -214,6 +223,11 @@ Query → MultiQuery (LLM)
     "iteration": int,            # 当前迭代轮次
     "max_iterations": int,       # 最大重试次数
     "session_id": str,           # 会话ID
+    "paper_focus": dict,         # 会话主论文与活动论文集
+    "paper_context": dict,       # 当前轮次的结构化论文解析结果
+    "turn_context": dict,        # 意图、论文范围和外部搜索权限
+    "primary_paper_id": str,     # 成功论文分析的稳定主论文 ID
+    "resolved_paper_ids": list,  # 当前轮次已解析论文集
     "error": str,                # 错误信息
 }
 ```
@@ -225,3 +239,6 @@ Query → MultiQuery (LLM)
 - Workflow 超时 → 300 秒超时限制
 - Critic 异常 → 默认 pass，继续执行
 - LLM 调用失败 → 重试 2 次
+- 非搜索意图调用 arXiv → `SearchAdmissionGate` 拒绝
+- 图谱任务超时/工作者中断 → 持久化租约回收与有界重试
+- LLM 配额耗尽 → 标记 `llm_quota_exhausted`，不自动重试死循环
