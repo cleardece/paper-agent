@@ -27,8 +27,6 @@ function freshTimeline() {
     agent,
     status: "waiting",
     detail: "",
-    input_summary: "",
-    output_summary: "",
     retry_count: 0,
     duration_ms: null,
   }));
@@ -72,8 +70,6 @@ function renderTimeline(timeline) {
   wrapper.innerHTML = timeline.map((step) => {
     const retry = step.agent === "critic" && step.retry_count ? ` · 重试 ${step.retry_count} 次` : "";
     const duration = Number.isFinite(step.duration_ms) ? ` · ${step.duration_ms} ms` : "";
-    const input = escapeHtml(step.input_summary || "暂无输入摘要");
-    const output = escapeHtml(step.output_summary || "暂无输出摘要");
     return `
       <div class="step ${step.status}">
         <span class="dot"></span>
@@ -83,11 +79,6 @@ function renderTimeline(timeline) {
             <span class="agent-status">${statusText(step.status)}${retry}${duration}</span>
           </div>
           <div class="agent-detail">${escapeHtml(step.detail || "")}</div>
-          <details>
-            <summary>查看输入/输出摘要</summary>
-            <div class="summary-block">输入：${input}</div>
-            <div class="summary-block">输出：${output}</div>
-          </details>
         </div>
       </div>
     `;
