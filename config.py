@@ -81,7 +81,10 @@ logger.info(f"[Hardware] 硬件等级: {HW_TIER}")
 LLM_MODEL = os.getenv("LLM_MODEL", "")
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "")
 LLM_API_KEY = os.getenv("LLM_API_KEY")
-
+# 知识图谱专用 LLM；未单独配置时兼容回退到普通对话模型。
+GRAPH_LLM_MODEL = os.getenv("GRAPH_LLM_MODEL", LLM_MODEL)
+GRAPH_LLM_BASE_URL = os.getenv("GRAPH_LLM_BASE_URL", LLM_BASE_URL)
+GRAPH_LLM_API_KEY = os.getenv("GRAPH_LLM_API_KEY", LLM_API_KEY)
 # ==================== Embedding ====================
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-m3")
 EMBEDDING_DEVICE = os.getenv("EMBEDDING_DEVICE", "")  # 留空自动检测 CUDA/CPU
@@ -183,21 +186,76 @@ GRAPH_JOB_HEARTBEAT_SECONDS = int(os.getenv("GRAPH_JOB_HEARTBEAT_SECONDS", "10")
 GRAPH_RETRY_DELAY_SECONDS = int(os.getenv("GRAPH_RETRY_DELAY_SECONDS", "60"))
 GRAPH_CIRCUIT_FAILURE_THRESHOLD = int(os.getenv("GRAPH_CIRCUIT_FAILURE_THRESHOLD", "3"))
 GRAPH_CIRCUIT_PAUSE_SECONDS = int(os.getenv("GRAPH_CIRCUIT_PAUSE_SECONDS", "300"))
+GRAPH_LLM_TPM_LIMIT = int(os.getenv("GRAPH_LLM_TPM_LIMIT", "8000"))
+GRAPH_LLM_MAX_OUTPUT_TOKENS = int(
+    os.getenv("GRAPH_LLM_MAX_OUTPUT_TOKENS", "2000")
+)
+GRAPH_LLM_PROMPT_OVERHEAD_TOKENS = int(
+    os.getenv("GRAPH_LLM_PROMPT_OVERHEAD_TOKENS", "1000")
+)
+GRAPH_RATE_LIMIT_BASE_DELAY_SECONDS = int(
+    os.getenv("GRAPH_RATE_LIMIT_BASE_DELAY_SECONDS", "300")
+)
+GRAPH_RATE_LIMIT_MAX_DELAY_SECONDS = int(
+    os.getenv("GRAPH_RATE_LIMIT_MAX_DELAY_SECONDS", "3600")
+)
 
 
-def _create_llm(*, timeout: int, max_retries: int):
-    if not LLM_MODEL:
+def _create_llm(
+    *,
+    timeout: int,
+    max_retries: int,
+    model: str | None = None,
+    base_url: str | None = None,
+    api_key: str | None = None,
+    temperature: float = 0.3,
+    reasoning_effort: str | None = None,
+    max_output_tokens: int | None = None,
+    graph_legacy_max_tokens: bool = False,
+    direct_local: bool = False,
+):
+    selected_model = LLM_MODEL if model is None else model
+    selected_base_url = LLM_BASE_URL if base_url is None else base_url
+    selected_api_key = LLM_API_KEY if api_key is None else api_key
+
+    if not selected_model:
         raise ValueError("LLM_MODEL 未配置，请在 .env 中设置 LLM_MODEL")
-    if not LLM_BASE_URL:
+    if not selected_base_url:
         raise ValueError("LLM_BASE_URL 未配置，请在 .env 中设置 LLM_BASE_URL")
-    logger.info(f"[LLM] 正在初始化 {LLM_MODEL} @ {LLM_BASE_URL}")
+
+    logger.info(
+        "[LLM] 正在初始化 %s @ %s",
+        selected_model,
+        selected_base_url,
+    )
+    options = {
+        "model": selected_model,
+        "base_url": selected_base_url,
+        "api_key": selected_api_key,
+        "temperature": temperature,
+        "timeout": timeout,
+        "max_retries": max_retries,
+    }
+    if reasoning_effort is not None:
+        options["reasoning_effort"] = reasoning_effort
+    if graph_legacy_max_tokens:
+        # Ollama and SenseNova require max_tokens on Chat Completions. Pass it
+        # through extra_body so LangChain does not rename it to the unsupported
+        # max_completion_tokens field and silently remove the output limit.
+        options["use_responses_api"] = False
+        options["reasoning_effort"] = "none"
+        options["extra_body"] = {
+            "max_tokens": max(1, int(max_output_tokens)),
+        }
+    elif max_output_tokens is not None:
+        options["max_tokens"] = max(1, int(max_output_tokens))
+    if direct_local:
+        import httpx
+
+        options["http_client"] = httpx.Client(trust_env=False)
+        options["http_async_client"] = httpx.AsyncClient(trust_env=False)
     llm = ChatOpenAI(
-        model=LLM_MODEL,
-        base_url=LLM_BASE_URL,
-        api_key=LLM_API_KEY,
-        temperature=0.3,
-        timeout=timeout,
-        max_retries=max_retries,
+        **options,
     )
     logger.info("[LLM] 初始化完成")
     return llm
@@ -210,7 +268,25 @@ def get_llm():
 
 def get_graph_llm():
     """获取图谱提取 LLM；重试只由持久化任务队列负责。"""
+    from urllib.parse import urlparse
+
+    graph_url = urlparse(GRAPH_LLM_BASE_URL)
+    graph_host = graph_url.hostname
+    is_local = graph_host in {"127.0.0.1", "localhost", "::1"}
+    local_ollama = is_local and graph_url.port == 11434
+    sensenova_deepseek = (
+        graph_host == "token.sensenova.cn"
+        and GRAPH_LLM_MODEL.startswith("deepseek-v4-")
+    )
     return _create_llm(
         timeout=GRAPH_LLM_REQUEST_TIMEOUT_SECONDS,
         max_retries=0,
+        model=GRAPH_LLM_MODEL,
+        base_url=GRAPH_LLM_BASE_URL,
+        api_key=GRAPH_LLM_API_KEY,
+        temperature=0,
+        reasoning_effort="none",
+        max_output_tokens=GRAPH_LLM_MAX_OUTPUT_TOKENS,
+        graph_legacy_max_tokens=local_ollama or sensenova_deepseek,
+        direct_local=is_local,
     )

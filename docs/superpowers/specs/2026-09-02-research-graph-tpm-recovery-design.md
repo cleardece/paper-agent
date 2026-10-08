@@ -51,9 +51,9 @@ Repository 新增 `defer_rate_limited()`，只处理正在运行且本次错误�
 
 所有图谱子进程调用在启动前都向 MongoDB scheduler control 预留调用时隙。Repository 使用 compare-and-set 更新 `llm_next_slot_at`，让多个 graph worker 共享同一个串行漏桶；进程重启后已有预留仍然有效。调用间隔按 `estimated_tokens / GRAPH_LLM_TPM_LIMIT * 60` 秒计算，等待期间持续续租任务，避免任务被误回收。
 
-token 估算使用序列化 payload 的 UTF-8 字节数除以 4，再加图谱专用最大输出 token。默认 `GRAPH_LLM_TPM_LIMIT=8000`、`GRAPH_LLM_MAX_OUTPUT_TOKENS=2000`；后者同时传给图谱 LLM 客户端，使准入估算拥有真实的输出上界。抽取 payload 超预算时按正文 segment 拆分，核验 payload 超预算时按 candidate 分组并只携带这些 candidate 引用的 chunk，Entity/Fact Resolution payload 超预算时按 item 分组。系统不能发送一个理论上永远无法进入当前 TPM 窗口的请求。`GRAPH_LLM_TPM_LIMIT=0` 仅关闭主动预留，保留自适应退避，不关闭知识图谱。这个 limiter 不新增 LLM 调用；只有 payload 必须拆分时才增加必要的分组调用。
+token 估算使用序列化 payload 的 UTF-8 字节数除以 4，再加图谱专用最大输出 token 和子进程提示词预算。默认 `GRAPH_LLM_TPM_LIMIT=8000`、`GRAPH_LLM_MAX_OUTPUT_TOKENS=2000`、`GRAPH_LLM_PROMPT_OVERHEAD_TOKENS=1000`；最大输出值同时传给图谱 LLM 客户端，使准入估算拥有真实的输出上界。抽取 payload 超预算时按正文 segment 拆分，核验 payload 超预算时按 candidate 分组并只携带这些 candidate 引用的 chunk，Entity/Fact Resolution payload 超预算时按 item 分组。系统不能发送一个理论上永远无法进入当前 TPM 窗口的请求。`GRAPH_LLM_TPM_LIMIT=0` 仅关闭主动预留，保留自适应退避，不关闭知识图谱。这个 limiter 不新增 LLM 调用；只有 payload 必须拆分时才增加必要的分组调用。
 
-scheduler control 同时保存 `effective_tpm_limit`。它初始等于配置上限；每次服务端 TPM 429 后减半，最低为 3000；连续 20 次图谱 LLM 调用成功后增加 10%，最高回到配置值。这样系统不依赖预先知道服务商的真实共享限额，并能在拥塞消失后恢复吞吐。
+scheduler control 同时保存 `effective_tpm_limit`。它初始等于配置上限；每次服务端 TPM 429 后减半，默认最低为 4000（最大输出、提示词和最小有效 payload 的总预算）；连续 20 次图谱 LLM 调用成功后增加 10%，最高回到配置值。这样系统不依赖预先知道服务商的真实共享限额，并能在拥塞消失后恢复吞吐。
 
 该 limiter 管理所有连接同一 MongoDB 的 graph worker。若同一 API key 还被非图谱功能或其他应用共享，服务端 429 仍由全局持久化退避兜底。
 

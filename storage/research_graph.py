@@ -15,6 +15,7 @@ from knowledge_graph.schema.entity_types import ENTITY_TYPES
 from knowledge_graph.schema.predicates import LEGACY_RELATIONS
 
 GRAPH_VERSION = "evidence-graph-v4"
+RATE_LIMIT_RECOVERY_VERSION = 1
 RELATIONS = {
     *LEGACY_RELATIONS,
 }
@@ -25,6 +26,10 @@ RUNNABLE_STATUSES = {"pending", "retry_wait"}
 NONRETRYABLE_QUOTA_PATTERN = re.compile(
     r"insufficient[_\\]?quota|allocated quota exceeded|increase your quota limit|"
     r"exceeded your current quota",
+    re.IGNORECASE,
+)
+RETRYABLE_RATE_LIMIT_PATTERN = re.compile(
+    r"inference tpm exhausted|429001|rate[_ -]?limit|too many requests",
     re.IGNORECASE,
 )
 
@@ -87,6 +92,8 @@ class ResearchGraphRepository:
             "edge_count": 0, "diagnostics": {}, "updated_at": now, "finished_at": None,
             "batch_total": 0, "completed_batches": [],
             "staged_relations": [], "batch_diagnostics": {},
+            "extraction_checkpoints": {}, "rate_limit_count": 0,
+            "rate_limit_recovery_version": RATE_LIMIT_RECOVERY_VERSION,
         }
         update: dict[str, Any] = {
             "$set": values,
@@ -230,6 +237,76 @@ class ResearchGraphRepository:
             finalized += 1
         return finalized
 
+    def revive_rate_limited_jobs(self) -> int:
+        """Revive jobs whose business attempts were consumed by legacy TPM retries."""
+        now = _now()
+        revived = 0
+        jobs = list(self.jobs.find({
+            "status": {"$in": ["failed", "retry_wait"]},
+            "rate_limit_recovery_version": {"$ne": RATE_LIMIT_RECOVERY_VERSION},
+            "$or": [
+                {"error_kind": "llm_rate_limited"},
+                {"error": {"$regex": RETRYABLE_RATE_LIMIT_PATTERN}},
+            ],
+        }))
+        for job in jobs:
+            run_number = int(job.get("run_number", 1))
+            history = list(job.get("attempt_history", []))
+            refunded = sum(1 for item in history if (
+                int(item.get("run_number", run_number)) == run_number
+                and (
+                    item.get("error_kind") == "llm_rate_limited"
+                    or RETRYABLE_RATE_LIMIT_PATTERN.search(str(item.get("error", "")))
+                )
+                and not item.get("attempt_refunded")
+            ))
+            # A legacy job with a rate-limit terminal state necessarily consumed
+            # at least its final claim even if older history was incomplete.
+            refunded = max(1, refunded)
+            attempt_count = max(0, int(job.get("attempt_count", 0)) - refunded)
+            migration = {
+                "run_number": run_number,
+                "attempt": int(job.get("attempt_count", 0)),
+                "status": "rate_limit_recovered",
+                "error_kind": "llm_rate_limited",
+                "refunded_attempts": refunded,
+                "finished_at": now,
+            }
+            result = self.jobs.update_one(
+                {
+                    "_id": job["_id"],
+                    "rate_limit_recovery_version": {
+                        "$ne": RATE_LIMIT_RECOVERY_VERSION
+                    },
+                },
+                {
+                    "$set": {
+                        "status": "retry_wait",
+                        "attempt_count": attempt_count,
+                        "next_attempt_at": now,
+                        "finished_at": None,
+                        "updated_at": now,
+                        "rate_limit_recovery_version": RATE_LIMIT_RECOVERY_VERSION,
+                    },
+                    "$push": {"attempt_history": migration},
+                    "$unset": {
+                        "worker_id": "", "lease_expires_at": "",
+                        "heartbeat_at": "",
+                    },
+                },
+            )
+            if result.modified_count != 1:
+                continue
+            self.papers.update_one(
+                {"arxiv_id": job["paper_id"]},
+                {"$set": {
+                    "graph_status": "pending",
+                    "graph_error": job.get("error"),
+                }},
+            )
+            revived += 1
+        return revived
+
     def claim_next_job(self, worker_id: str, lease_seconds: int) -> dict[str, Any] | None:
         now = _now()
         return self.jobs.find_one_and_update(
@@ -280,6 +357,68 @@ class ResearchGraphRepository:
         )
         return result.matched_count == 1
 
+    def reset_incomplete_progress(self, paper_id: str, worker_id: str) -> bool:
+        """Discard staged data from an older run that accepted truncated output."""
+        result = self.jobs.update_one(
+            {"paper_id": paper_id, "status": "extracting", "worker_id": worker_id},
+            {"$set": {
+                "completed_batches": [], "staged_relations": [],
+                "batch_diagnostics": {}, "extraction_checkpoints": {},
+                "updated_at": _now(),
+            }},
+        )
+        return result.matched_count == 1
+
+    @staticmethod
+    def _checkpoint_key(batch_index: int) -> str:
+        return f"batch_{max(0, int(batch_index))}"
+
+    def save_extraction_checkpoint(
+        self,
+        paper_id: str,
+        worker_id: str,
+        batch_index: int,
+        candidates: list[dict[str, Any]],
+        diagnostics: dict[str, Any],
+    ) -> bool:
+        job = self.jobs.find_one({
+            "paper_id": paper_id, "status": "extracting", "worker_id": worker_id,
+        })
+        if not job:
+            return False
+        key = self._checkpoint_key(batch_index)
+        checkpoint = {
+            "run_number": int(job.get("run_number", 1)),
+            "candidates": list(candidates),
+            "diagnostics": dict(diagnostics),
+            "saved_at": _now(),
+        }
+        result = self.jobs.update_one(
+            {"_id": job["_id"], "status": "extracting", "worker_id": worker_id},
+            {"$set": {
+                f"extraction_checkpoints.{key}": checkpoint,
+                "updated_at": _now(),
+            }},
+        )
+        return result.matched_count == 1
+
+    def get_extraction_checkpoint(
+        self, paper_id: str, worker_id: str, batch_index: int
+    ) -> dict[str, Any] | None:
+        job = self.jobs.find_one({
+            "paper_id": paper_id, "status": "extracting", "worker_id": worker_id,
+        })
+        if not job:
+            return None
+        checkpoint = dict(job.get("extraction_checkpoints", {})).get(
+            self._checkpoint_key(batch_index)
+        )
+        if not isinstance(checkpoint, dict):
+            return None
+        if int(checkpoint.get("run_number", -1)) != int(job.get("run_number", 1)):
+            return None
+        return checkpoint
+
     def save_batch_result(self, paper_id: str, worker_id: str, batch_index: int,
                           batch_total: int, relations: list[dict[str, Any]],
                           diagnostics: dict[str, Any]) -> bool:
@@ -304,6 +443,9 @@ class ResearchGraphRepository:
                 },
                 "$addToSet": {"completed_batches": batch_index},
                 "$push": {"staged_relations": {"$each": relations}},
+                "$unset": {
+                    f"extraction_checkpoints.{self._checkpoint_key(batch_index)}": "",
+                },
             },
         )
         return result.modified_count == 1
@@ -339,7 +481,7 @@ class ResearchGraphRepository:
                 "$push": {"attempt_history": history},
                 "$unset": {
                     "worker_id": "", "lease_expires_at": "", "heartbeat_at": "",
-                    "staged_relations": "",
+                    "staged_relations": "", "extraction_checkpoints": "",
                 },
             },
         )
@@ -399,6 +541,98 @@ class ResearchGraphRepository:
         )
         return status
 
+    def defer_rate_limited(
+        self,
+        paper_id: str,
+        worker_id: str,
+        error: str,
+        *,
+        retry_delay_seconds: int,
+    ) -> str:
+        """Release a TPM-limited job without consuming a business attempt."""
+        now = _now()
+        job = self.jobs.find_one({
+            "paper_id": paper_id, "status": "extracting", "worker_id": worker_id,
+        })
+        if not job:
+            return "ignored"
+        claimed_attempt = int(job.get("attempt_count", 0))
+        refunded_attempt = max(0, claimed_attempt - 1)
+        delay = max(1, int(retry_delay_seconds))
+        history = {
+            "run_number": int(job.get("run_number", 1)),
+            "attempt": claimed_attempt,
+            "business_attempt_after_refund": refunded_attempt,
+            "status": "rate_limited",
+            "error": error,
+            "error_kind": "llm_rate_limited",
+            "attempt_refunded": True,
+            "retry_delay_seconds": delay,
+            "finished_at": now,
+        }
+        result = self.jobs.update_one(
+            {"_id": job["_id"], "status": "extracting", "worker_id": worker_id},
+            {
+                "$set": {
+                    "status": "retry_wait",
+                    "attempt_count": refunded_attempt,
+                    "error": error,
+                    "error_kind": "llm_rate_limited",
+                    "next_attempt_at": now + timedelta(seconds=delay),
+                    "finished_at": None,
+                    "updated_at": now,
+                    "rate_limit_recovery_version": RATE_LIMIT_RECOVERY_VERSION,
+                    "rate_limit_count": int(job.get("rate_limit_count", 0)) + 1,
+                },
+                "$push": {"attempt_history": history},
+                "$unset": {
+                    "worker_id": "", "lease_expires_at": "", "heartbeat_at": "",
+                },
+            },
+        )
+        if result.modified_count != 1:
+            return "ignored"
+        self.papers.update_one(
+            {"arxiv_id": paper_id},
+            {"$set": {"graph_status": "pending", "graph_error": error}},
+        )
+        return "retry_wait"
+
+    def defer_local_unavailable(
+        self, paper_id: str, worker_id: str, error: str, *,
+        retry_delay_seconds: int,
+    ) -> str:
+        """Wait for a local LLM service without consuming a paper attempt."""
+        now = _now()
+        job = self.jobs.find_one({
+            "paper_id": paper_id, "status": "extracting", "worker_id": worker_id,
+        })
+        if not job:
+            return "ignored"
+        result = self.jobs.update_one(
+            {"_id": job["_id"], "status": "extracting", "worker_id": worker_id},
+            {
+                "$set": {
+                    "status": "retry_wait",
+                    "attempt_count": max(0, int(job.get("attempt_count", 0)) - 1),
+                    "error": error, "error_kind": "llm_connection_error",
+                    "next_attempt_at": now + timedelta(seconds=max(1, retry_delay_seconds)),
+                    "finished_at": None, "updated_at": now,
+                },
+                "$inc": {"connection_wait_count": 1},
+                "$unset": {
+                    "worker_id": "", "lease_expires_at": "", "heartbeat_at": "",
+                },
+            },
+        )
+        if result.modified_count != 1:
+            return "ignored"
+        self.papers.update_one(
+            {"arxiv_id": paper_id},
+            {"$set": {"graph_status": "pending", "graph_error": error}},
+        )
+        return "retry_wait"
+
     def manual_retry(self, paper_id: str) -> dict[str, Any] | None:
         if not self.jobs.find_one({"paper_id": paper_id}):
             if not self.papers.find_one({"arxiv_id": paper_id, "status": "indexed"}):
@@ -412,6 +646,174 @@ class ResearchGraphRepository:
         return list(self.jobs.find().sort([
             ("priority", DESCENDING), ("updated_at", DESCENDING),
         ]).limit(limit))
+
+    def _ensure_scheduler_control(self, configured_tpm_limit: int = 0) -> None:
+        configured = max(0, int(configured_tpm_limit))
+        self.control.update_one(
+            {"_id": "scheduler"},
+            {"$setOnInsert": {
+                "consecutive_failures": 0,
+                "consecutive_rate_limits": 0,
+                "rate_limit_success_streak": 0,
+                "effective_tpm_limit": configured,
+                "llm_schedule_revision": 0,
+                "llm_next_slot_at": None,
+                "paused_until": None,
+            }},
+            upsert=True,
+        )
+        self.control.update_one(
+            {"_id": "scheduler", "llm_schedule_revision": {"$exists": False}},
+            {"$set": {"llm_schedule_revision": 0}},
+        )
+        if configured:
+            self.control.update_one(
+                {"_id": "scheduler", "effective_tpm_limit": {"$in": [None, 0]}},
+                {"$set": {"effective_tpm_limit": configured}},
+            )
+
+    def effective_llm_tpm_limit(self, configured_tpm_limit: int) -> int:
+        configured = max(0, int(configured_tpm_limit))
+        if configured == 0:
+            return 0
+        self._ensure_scheduler_control(configured)
+        state = self.control.find_one({"_id": "scheduler"}) or {}
+        effective = int(state.get("effective_tpm_limit") or configured)
+        return max(1, min(configured, effective))
+
+    def reserve_llm_capacity(
+        self, estimated_tokens: int, *, configured_tpm_limit: int
+    ) -> dict[str, Any]:
+        """Atomically reserve a graph LLM start time across worker processes."""
+        configured = max(0, int(configured_tpm_limit))
+        now = _now()
+        if configured == 0:
+            return {
+                "ready_at": now, "wait_seconds": 0.0,
+                "estimated_tokens": max(1, int(estimated_tokens)),
+                "effective_tpm_limit": 0,
+            }
+        self._ensure_scheduler_control(configured)
+        tokens = max(1, int(estimated_tokens))
+        for _ in range(50):
+            now = _now()
+            state = self.control.find_one({"_id": "scheduler"}) or {}
+            revision = int(state.get("llm_schedule_revision", 0))
+            effective = self.effective_llm_tpm_limit(configured)
+            interval_seconds = max(0.05, tokens / effective * 60.0)
+            current_slot = _as_utc(state.get("llm_next_slot_at"))
+            ready_at = max(now, current_slot) if current_slot else now
+            next_slot = ready_at + timedelta(seconds=interval_seconds)
+            result = self.control.update_one(
+                {"_id": "scheduler", "llm_schedule_revision": revision},
+                {
+                    "$set": {
+                        "llm_next_slot_at": next_slot,
+                        "last_reserved_tokens": tokens,
+                        "updated_at": now,
+                    },
+                    "$inc": {"llm_schedule_revision": 1},
+                },
+            )
+            if result.modified_count == 1:
+                return {
+                    "ready_at": ready_at,
+                    "wait_seconds": max(0.0, (ready_at - now).total_seconds()),
+                    "estimated_tokens": tokens,
+                    "effective_tpm_limit": effective,
+                }
+        raise RuntimeError("无法预留图谱 LLM 调用时隙")
+
+    def record_rate_limit(
+        self,
+        error: str,
+        *,
+        base_delay_seconds: int,
+        max_delay_seconds: int,
+        configured_tpm_limit: int,
+        minimum_tpm_limit: int = 4000,
+    ) -> dict[str, Any]:
+        """Open the graph circuit on the first TPM 429 and reduce admission rate."""
+        now = _now()
+        configured = max(0, int(configured_tpm_limit))
+        self._ensure_scheduler_control(configured)
+        state = self.control.find_one_and_update(
+            {"_id": "scheduler"},
+            {
+                "$inc": {"consecutive_rate_limits": 1},
+                "$set": {
+                    "rate_limit_success_streak": 0,
+                    "last_error": error,
+                    "last_rate_limit_at": now,
+                    "updated_at": now,
+                },
+            },
+            return_document=ReturnDocument.AFTER,
+        ) or {}
+        count = max(1, int(state.get("consecutive_rate_limits", 1)))
+        base = max(1, int(base_delay_seconds))
+        maximum = max(base, int(max_delay_seconds))
+        delay = min(maximum, base * (2 ** min(count - 1, 16)))
+        digest = hashlib.sha256(f"{error}|{count}".encode("utf-8")).digest()
+        delay += int(delay * 0.1 * digest[0] / 255)
+        delay = min(maximum, delay)
+        paused_until = now + timedelta(seconds=delay)
+        current_effective = int(state.get("effective_tpm_limit") or configured or 0)
+        if configured:
+            floor = min(max(1, int(minimum_tpm_limit)), configured)
+            effective = max(floor, min(configured, max(1, current_effective // 2)))
+        else:
+            effective = 0
+        self.control.update_one(
+            {"_id": "scheduler"},
+            {
+                "$max": {"paused_until": paused_until},
+                "$set": {
+                    "effective_tpm_limit": effective,
+                    "pause_kind": "llm_rate_limited",
+                    "updated_at": now,
+                },
+            },
+        )
+        return {
+            "retry_delay_seconds": delay,
+            "paused_until": paused_until,
+            "consecutive_rate_limits": count,
+            "effective_tpm_limit": effective,
+        }
+
+    def record_llm_success(
+        self, *, configured_tpm_limit: int, recovery_success_threshold: int = 20
+    ) -> dict[str, Any]:
+        configured = max(0, int(configured_tpm_limit))
+        self._ensure_scheduler_control(configured)
+        state = self.control.find_one_and_update(
+            {"_id": "scheduler"},
+            {
+                "$inc": {"rate_limit_success_streak": 1},
+                "$set": {
+                    "consecutive_rate_limits": 0,
+                    "consecutive_failures": 0,
+                    "updated_at": _now(),
+                },
+            },
+            return_document=ReturnDocument.AFTER,
+        ) or {}
+        streak = int(state.get("rate_limit_success_streak", 0))
+        effective = int(state.get("effective_tpm_limit") or configured or 0)
+        threshold = max(1, int(recovery_success_threshold))
+        if configured and streak >= threshold and effective < configured:
+            effective = min(configured, max(effective + 1, (effective * 11 + 9) // 10))
+            self.control.update_one(
+                {"_id": "scheduler"},
+                {"$set": {
+                    "effective_tpm_limit": effective,
+                    "rate_limit_success_streak": 0,
+                    "updated_at": _now(),
+                }},
+            )
+            streak = 0
+        return {"effective_tpm_limit": effective, "success_streak": streak}
 
     def record_infrastructure_failure(self, error: str, *, threshold: int,
                                       pause_seconds: int) -> dict[str, Any]:
@@ -430,7 +832,11 @@ class ResearchGraphRepository:
             paused_until = now + timedelta(seconds=pause_seconds)
             self.control.update_one(
                 {"_id": "scheduler"},
-                {"$set": {"paused_until": paused_until, "updated_at": now}},
+                {"$set": {
+                    "paused_until": paused_until,
+                    "pause_kind": "infrastructure",
+                    "updated_at": now,
+                }},
             )
             state["paused_until"] = paused_until
         return state
@@ -440,7 +846,7 @@ class ResearchGraphRepository:
             {"_id": "scheduler"},
             {"$set": {
                 "consecutive_failures": 0, "paused_until": None,
-                "last_error": None, "updated_at": _now(),
+                "pause_kind": None, "last_error": None, "updated_at": _now(),
             }},
             upsert=True,
         )
@@ -448,9 +854,20 @@ class ResearchGraphRepository:
     def circuit_state(self) -> dict[str, Any]:
         state = self.control.find_one({"_id": "scheduler"}) or {}
         paused_until = _as_utc(state.get("paused_until"))
+        now = _now()
+        pause_kind = state.get("pause_kind")
+        if not pause_kind and RETRYABLE_RATE_LIMIT_PATTERN.search(
+            str(state.get("last_error", ""))
+        ):
+            pause_kind = "llm_rate_limited"
         return {
-            "open": bool(paused_until and paused_until > _now()),
+            "open": bool(paused_until and paused_until > now),
             "paused_until": paused_until,
+            "retry_after_seconds": (
+                max(1, int((paused_until - now).total_seconds()))
+                if paused_until and paused_until > now else 0
+            ),
+            "pause_kind": pause_kind,
             "consecutive_failures": int(state.get("consecutive_failures", 0)),
             "last_error": state.get("last_error"),
         }

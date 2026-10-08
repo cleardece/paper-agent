@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
-import hashlib
-import re
 from typing import Any
 
-from knowledge_graph.models import apply_verification, claim_from_candidate
+from knowledge_graph.llm_protocol import (
+    GraphResponseError, index_decisions, invoke_graph_llm,
+    load_json_rows, response_text,
+)
+from knowledge_graph.models import apply_verification
 from knowledge_graph.schema.entity_types import ENTITY_TYPES
 from knowledge_graph.schema.predicates import LEGACY_RELATIONS, PREDICATES
 
@@ -29,6 +31,7 @@ class ResearchGraphExtractor:
         self.max_chunks = max_chunks
         self.batch_chars = batch_chars
         self.segment_chars = segment_chars
+        self._last_llm_diagnostics: dict[str, Any] = {}
 
     @staticmethod
     def _heading(chunk: dict[str, Any]) -> str:
@@ -101,92 +104,15 @@ class ResearchGraphExtractor:
 
     @staticmethod
     def _load_json(content: str) -> tuple[list[dict[str, Any]], str]:
-        """Parse strict JSON while salvaging only independently valid objects."""
-        text = str(content or "").strip()
-        fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", text, flags=re.DOTALL | re.IGNORECASE)
-        if fenced:
-            text = fenced.group(1).strip()
-
-        def normalized(value: Any) -> tuple[list[dict[str, Any]], str] | None:
-            if isinstance(value, list):
-                rows = [item for item in value if isinstance(item, dict)]
-                return rows, "empty_array" if not value else "parsed"
-            if isinstance(value, dict):
-                for key in ("candidates", "claims", "relations", "items", "decisions"):
-                    if isinstance(value.get(key), list):
-                        rows = [item for item in value[key] if isinstance(item, dict)]
-                        return rows, "empty_array" if not value[key] else "parsed"
-                return [value], "parsed_single_object"
-            return None
-
-        try:
-            direct = normalized(json.loads(text))
-        except json.JSONDecodeError:
-            direct = None
-        if direct is not None:
-            return direct
-
-        decoder = json.JSONDecoder()
-        for start, marker in enumerate(text):
-            if marker != "[":
-                continue
-            try:
-                value, _ = decoder.raw_decode(text[start:])
-            except json.JSONDecodeError:
-                continue
-            parsed = normalized(value)
-            if parsed is not None:
-                return parsed
-
-        # A response cut off at the output-token boundary can still contain
-        # complete leading objects. Decode each object independently and never
-        # synthesize the incomplete tail.
-        start = text.find("[")
-        if start >= 0:
-            cursor = start + 1
-            recovered: list[dict[str, Any]] = []
-            while cursor < len(text):
-                while cursor < len(text) and text[cursor] in " \r\n\t,":
-                    cursor += 1
-                if cursor >= len(text) or text[cursor] == "]":
-                    break
-                try:
-                    value, consumed = decoder.raw_decode(text[cursor:])
-                except json.JSONDecodeError:
-                    break
-                if not isinstance(value, dict):
-                    break
-                recovered.append(value)
-                cursor += consumed
-            if recovered:
-                return recovered, "recovered_truncated"
-        return [], "invalid_json"
+        return load_json_rows(content, allow_single_object=True)
 
     @staticmethod
     def _response_text(response: Any) -> str:
-        content = getattr(response, "content", response)
-
-        def text_parts(value: Any) -> list[str]:
-            if isinstance(value, str):
-                return [value]
-            if isinstance(value, dict):
-                if isinstance(value.get("text"), str):
-                    return [value["text"]]
-                if "content" in value:
-                    return text_parts(value["content"])
-                return []
-            if isinstance(value, list):
-                parts: list[str] = []
-                for item in value:
-                    parts.extend(text_parts(item))
-                return parts
-            return [str(value)] if value is not None else []
-
-        return "\n".join(text_parts(content)).strip()
+        return response_text(response)
 
     def _invoke(self, prompt: str) -> str:
-        client = self.llm.bind(temperature=0) if hasattr(self.llm, "bind") else self.llm
-        return self._response_text(client.invoke(prompt))
+        content, self._last_llm_diagnostics = invoke_graph_llm(self.llm, prompt)
+        return content
 
     @staticmethod
     def _candidate_valid(candidate: dict[str, Any], chunk_ids: set[int]) -> bool:
@@ -219,6 +145,9 @@ class ResearchGraphExtractor:
         prompt = (
             "你是严谨的学术事实抽取器。只依据给定正文抽取实体之间明确陈述的事实，"
             "不要把相关工作、引用论文或单纯提及误判为当前论文结论。\n"
+            "请逐句检查全部正文，尽可能完整地抽取所有符合条件的事实。"
+            "同一主体存在多个不同的 predicate 或 object 时必须分别输出，"
+            "不要只返回最显著的一条；只有全文没有符合条件的事实时才返回空数组 []。\n"
             f"当前论文：{paper.get('title', '')}\n"
             f"正文片段：{json.dumps(batch, ensure_ascii=False)}\n\n"
             "仅输出单行 JSON 数组，不要 Markdown、解释或代码围栏。不要自行归一化"
@@ -232,12 +161,6 @@ class ResearchGraphExtractor:
         )
         content = self._invoke(prompt)
         candidates, parse_status = self._load_json(content)
-        if parse_status == "invalid_json":
-            digest = hashlib.sha256(content.encode("utf-8")).hexdigest()[:12]
-            raise ValueError(
-                "图谱抽取器返回的不是可恢复 JSON "
-                f"(response_length={len(content)}, response_digest={digest})"
-            )
         chunk_ids = {int(item["chunk_index"]) for item in batch}
         valid = [item for item in candidates if self._candidate_valid(item, chunk_ids)]
         if not candidates:
@@ -252,6 +175,7 @@ class ResearchGraphExtractor:
             "model_candidate_count": len(candidates),
             "extractor_rejected_count": len(candidates) - len(valid),
             "parse_status": parse_status,
+            "llm": dict(self._last_llm_diagnostics),
             "response_excerpt": content[:800],
         }}
 
@@ -285,59 +209,35 @@ class ResearchGraphExtractor:
         )
         content = self._invoke(prompt)
         decisions, parse_status = self._load_json(content)
-        if parse_status == "invalid_json":
-            raise ValueError("图谱核验器返回的不是有效 JSON 数组")
-        decision_map: dict[int, dict[str, Any]] = {}
-        invalid_decision_count = 0
-        duplicate_decision_count = 0
-        for decision in decisions:
-            try:
-                index = int(decision.get("candidate_index"))
-            except (TypeError, ValueError):
-                invalid_decision_count += 1
-                continue
-            verdict = str(decision.get("verdict", ""))
-            if not 0 <= index < len(candidates) or verdict not in self.VERDICTS:
-                invalid_decision_count += 1
-                continue
-            if index in decision_map:
-                duplicate_decision_count += 1
-                # Conflicting duplicates are unsafe. Leave the candidate for the
-                # conservative synthesized uncertain decision below.
-                if decision_map[index] != decision:
-                    decision_map.pop(index, None)
-                continue
-            decision_map[index] = decision
-        relations = []
-        for index, candidate in enumerate(candidates):
-            decision = decision_map.get(index)
-            if decision is None:
-                base = claim_from_candidate(candidate, paper)
-                decision = {
-                    "verdict": "uncertain",
-                    "valid": base.get("predicate") != "UNKNOWN",
-                    "subject_name": base.get("subject_name"),
-                    "subject_type": base.get("subject_type"),
-                    "predicate": base.get("predicate"),
-                    "object_name": base.get("object_name"),
-                    "object_type": base.get("object_type"),
-                    "qualifiers": base.get("qualifiers", {}),
-                    "stance": base.get("stance", "support"),
-                    "confidence": min(float(base.get("confidence", 0.5)), 0.49),
-                    "reason": "missing_or_invalid_decision",
-                }
-            relations.append(apply_verification(candidate, decision, paper))
-        missing_count = len(candidates) - len(decision_map)
+        invalid_verdicts = sum(
+            decision.get("verdict") not in self.VERDICTS for decision in decisions
+        )
+        if invalid_verdicts:
+            raise GraphResponseError(
+                "图谱核验器返回无效 verdict",
+                error_kind="llm_incomplete_response",
+                diagnostics={"invalid_verdict_count": invalid_verdicts,
+                             **self._last_llm_diagnostics},
+            )
+        decision_map = index_decisions(
+            decisions, "candidate_index", set(range(len(candidates))),
+            self._last_llm_diagnostics,
+        )
+        relations = [
+            apply_verification(candidate, decision_map[index], paper)
+            for index, candidate in enumerate(candidates)
+        ]
         return {"relations": relations, "diagnostics": {
             "validated_count": len(relations),
             "supported_count": sum(item["validation_verdict"] == "supported" for item in relations),
             "uncertain_count": sum(item["validation_verdict"] == "uncertain" for item in relations),
             "rejected_count": sum(item["validation_verdict"] == "rejected" for item in relations),
             "returned_decision_count": len(decisions),
-            "missing_or_invalid_decision_count": missing_count,
-            "invalid_decision_count": invalid_decision_count,
-            "duplicate_decision_count": duplicate_decision_count,
+            "missing_or_invalid_decision_count": 0,
+            "invalid_decision_count": 0,
+            "duplicate_decision_count": 0,
             "parse_status": parse_status,
+            "llm": dict(self._last_llm_diagnostics),
             "response_excerpt": content[:800],
         }}
 
