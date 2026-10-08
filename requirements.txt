@@ -16,6 +16,5 @@ numpy
 httpx
 psutil
 requests
-tavily-python
 langsmith
 mcp

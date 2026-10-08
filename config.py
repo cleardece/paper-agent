@@ -143,7 +143,6 @@ MINERU_OFFICIAL_TIMEOUT_SECONDS = float(
 )
 
 # ==================== 搜索 API ====================
-TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 SEMANTIC_SCHOLAR_API_KEY = os.getenv("SEMANTIC_SCHOLAR_API_KEY")
 
 # ==================== MCP ====================
