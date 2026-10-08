@@ -12,7 +12,7 @@ Paper Agent 是一个基于 FastAPI 和 LangGraph 的学术论文助手。系统
 FastAPI (web/app.py)
         |
         +-- LangGraph 问答工作流
-        |     PaperContextResolver -> Supervisor -> TurnContext
+        |     PaperContextResolver -> Supervisor -> TurnContext -> ContextualQueryRewriter
         |       +-- Fetcher
         |       +-- DirectAnalyzer
         |       +-- Retriever -> Analyzer -> Critic -> Presenter
@@ -30,6 +30,7 @@ FastAPI (web/app.py)
 | `PaperContextResolver` | 在路由前用显式目标、arXiv ID/DOI、本地标题、会话焦点和结构化历史解析论文 ID |
 | `Supervisor` | 只判断 `analyze` / `rag` / `compare` / `search` / `general` 动作，不再猜论文标题 |
 | `TurnContext` | 将查询、意图、主论文、参与论文和外部搜索权限投影给下游 Agent |
+| `ContextualQueryRewriter` | 用有界历史补全检索问题，不改变论文 ID 或证据来源 |
 | `Fetcher` | 唯一允许执行外部论文发现的 Agent；只接收经验证的 `SearchRequest` |
 | `DirectAnalyzer` | 分析已解析的本地单篇论文；失败时不把原问题转发给 arXiv |
 | `Retriever` | 在已入库论文中执行论文级筛选、BM25 + 向量检索、RRF 融合和重排 |

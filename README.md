@@ -1,5 +1,7 @@
 # Paper Agent
 
+[English](README.en.md) · [技术架构](docs/architecture.md) · [运行与维护](docs/operations.md) · [变更记录](CHANGELOG.md)
+
 面向研究生论文阅读与小论文写作的研究助手。它将论文搜索、PDF 解析、混合检索、多 Agent 分析、多轮论文上下文和可审核研究图谱串成一条可追溯的研究工作流：当答案缺少本次检索到的论文证据时，系统会要求重检索或明确提示证据不足。
 
 ## 项目目标
@@ -8,6 +10,7 @@
 - 结合 MongoDB、Milvus 和 Hybrid Search 检索已入库论文；
 - 用 LangGraph 编排路由、检索、分析、质量审核、呈现和反思；
 - 用稳定论文 ID 维护会话焦点，支持“这篇论文的实验呢”等无标题追问；
+- 将当前问题与活动章节、任务、有界近期对话和滚动摘要改写为独立检索问题；
 - 将论文主张规范化为 Entity、Claim、Fact 和 Provenance，并保留人工复核入口；
 - 为回答提供可核验的引用来源、质量状态和 Agent 执行时间；
 - 作为长期个人研究工具，而非一次性的演示项目。
@@ -19,6 +22,7 @@
   -> PaperContextResolver（解析当前论文）
   -> Supervisor（只判断动作意图）
   -> TurnContext / SearchAdmissionGate
+  -> ContextualQueryRewriter（补全追问语义，不参与证据）
   -> Fetcher（搜索/入库）
      或 Retriever -> Analyzer -> Critic -> Presenter -> Reflector
 
@@ -29,6 +33,8 @@ PDF -> 解析 -> Chunk -> Embedding -> Milvus
 
 `Critic` 在 LLM 语义审核前先执行确定性规则：回答中的论文引用必须来自当前 `retrieved_chunks`。这项规则验证来源归属；它不替代对具体事实是否被原文蕴含的人工或 LLM 审核。
 
+多轮对话中的历史消息只用于生成 `retrieval_query`；其中近期助手回答仅用于理解“刚才三个答案”“第二点”等追问对象，不能充当论文事实。论文范围仍由 `PaperContextResolver` 和 `TurnContext.paper_ids` 决定，最终回答的事实与引用仍只能来自本轮检索到的论文 Chunk。
+
 ## 快速开始
 
 ### 前提
@@ -36,17 +42,24 @@ PDF -> 解析 -> Chunk -> Embedding -> Milvus
 - Python 3.10 或更高版本；
 - Docker Desktop；
 - 一个兼容 OpenAI API 的 LLM endpoint；
+- MinerU 官方 API Token；示例配置中的图谱另需本机 Ollama 和 `qwen3-graph:8b` 模型；
 - 若使用本地 Embedding，安装与本机 CUDA/CPU 兼容的 PyTorch。
 
 ### 配置与启动
 
 ```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
 Copy-Item .env.example .env
-# 编辑 .env，填入 LLM_API_KEY，并按需修改模型和服务地址
+# 编辑 .env，填入 LLM_API_KEY、MINERU_OFFICIAL_TOKEN，并核对服务地址
+python -m pip install -r requirements.txt
+ollama pull qwen3:8b
+ollama create qwen3-graph:8b -f Modelfile
 docker compose --env-file .env up -d
-python -m pip install -r requirements-dev.txt
-python -m uvicorn web.app:app --host 0.0.0.0 --port 8000 --reload
+python -m uvicorn web.app:app --host 127.0.0.1 --port 8000
 ```
+
+以上命令在仓库根目录执行，Ollama 服务需保持运行。开发时可安装 `requirements-dev.txt` 并按需使用 `--reload`。默认配置面向本机使用。
 
 打开 `http://localhost:8000`。也可以在 PowerShell 中运行：
 
@@ -68,6 +81,7 @@ python -m uvicorn web.app:app --host 0.0.0.0 --port 8000 --reload
 | `USE_MCP`、`MCP_ARXIV_URL` | arXiv MCP 搜索优先级 |
 | `SEMANTIC_SCHOLAR_API_KEY` | 可选的 Semantic Scholar 搜索 |
 | `GRAPH_*` | 研究图谱 LLM 请求、子进程超时、任务租约、重试与熔断参数 |
+| `GRAPH_LLM_MODEL`、`GRAPH_LLM_BASE_URL`、`GRAPH_LLM_API_KEY` | 图谱独立模型；示例使用本地 Ollama，不影响普通对话 |
 | `PA_DATA_ROOT` | Docker Compose 数据卷根目录 |
 
 ## 日常研究工作流
@@ -105,6 +119,8 @@ python scripts/evaluate.py --cases evaluation/cases.local.json
 `evaluation/cases.local.json` 和 `evaluation/results/` 被忽略，避免把个人研究主题和结果推送到公开仓库。
 
 ## 测试
+
+测试源码随仓库保存。部分测试需要运行中的 MongoDB、Milvus 或模型依赖，具体范围见 [测试计划](docs/test_plan.md)。先安装 `requirements-dev.txt`，再根据本机环境选择执行。
 
 ```powershell
 python -m pytest -q
@@ -186,7 +202,23 @@ MinerU 的镜像依赖和启动参数可能随版本变化，实际部署时以 
 
 - 实体别名、缩写和相近表述优先走确定性规则；只有歧义候选才调用 Resolution LLM。
 - 同一 Fact 可聚合多篇论文的支持或反对 Claim，每条 Claim 保留 paper、chunk、section/page、原文 evidence 和版本信息。
-- 后台任务带租约、心跳、硬超时、一次可恢复重试和熔断；配额耗尽会被标记为不可重试失败，不会无限循环。
+- 后台任务带租约、心跳、硬超时和阶段检查点；临时限流使用持久化退避，明确的永久配额错误单独处理。
+- 图谱可以通过 `GRAPH_LLM_*` 使用独立的本地模型。模型空响应、输出截断和 JSON 协议异常有单独诊断；不能把不完整结果当作成功。
 - 页面与 Retriever 继续读取兼容关系投影；图谱用于关联与导航，最终回答的证据仍来自本次检索到的论文 chunks。
 
 图谱页面为 `GET /graph`；主要接口包括 `GET /api/research-graph`、`GET /api/research-graph/status`、`GET /api/research-graph/jobs`、`POST /api/research-graph/jobs/retry` 和 `PATCH /api/research-graph/edges/{edge_id}`。应用启动时会对已索引论文与当前图谱版本做增量对账。
+
+## 仓库导航
+
+| 路径 | 内容 |
+| --- | --- |
+| `agents/`、`graph/`、`state/` | Agent、工作流与状态 |
+| `core/` | 依赖装配、会话上下文、搜索准入与证据规则 |
+| `knowledge_graph/` | 图谱协议、Schema、实体与事实归一 |
+| `storage/`、`tools/` | 数据存储、检索、解析与后台任务 |
+| `web/` | FastAPI 服务与前端页面 |
+| `tests/`、`evaluation/` | 测试源码与评测工具 |
+| `docs/` | 技术架构、运行说明和历史设计文档 |
+| `arxiv-mcp/` | 独立 MCP 服务源码与其许可证 |
+
+当前阶段按个人研究工具收尾维护；没有以此声明生产 SLA 或所有模型兼容性。历史设计记录保留在 `docs/superpowers/`，当前运行配置以 `.env.example` 和代码为准。
