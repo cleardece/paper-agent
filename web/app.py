@@ -48,10 +48,10 @@ from core.paper_context import PaperContext, PaperFocusState
 from core.session_state import SessionStateReducer, normalize_agent_result
 
 
-AGENTS = ("paper_context_resolver", "supervisor", "turn_context", "fetcher", "retriever", "direct_analyzer", "analyzer", "critic", "presenter")
-QUESTION_FLOW = ("paper_context_resolver", "supervisor", "turn_context", "retriever", "analyzer", "critic", "presenter")
-FETCH_FLOW = ("paper_context_resolver", "supervisor", "turn_context", "fetcher")
-DIRECT_FLOW = ("paper_context_resolver", "supervisor", "turn_context", "direct_analyzer")
+AGENTS = ("paper_context_resolver", "supervisor", "turn_context", "contextual_query_rewriter", "fetcher", "retriever", "direct_analyzer", "analyzer", "critic", "presenter")
+QUESTION_FLOW = ("paper_context_resolver", "supervisor", "turn_context", "contextual_query_rewriter", "retriever", "analyzer", "critic", "presenter")
+FETCH_FLOW = ("paper_context_resolver", "supervisor", "turn_context", "contextual_query_rewriter", "fetcher")
+DIRECT_FLOW = ("paper_context_resolver", "supervisor", "turn_context", "contextual_query_rewriter", "direct_analyzer")
 
 
 class ChatRequest(BaseModel):
@@ -409,6 +409,7 @@ def wrap_agent(name: str, invoke: Callable[[AgentState], Any], session: Session)
 def agent_running_detail(name: str, retry_count: int = 0) -> str:
     details = {
         "supervisor": "正在分析用户意图...",
+        "contextual_query_rewriter": "正在补全当前检索问题的对话语义...",
         "fetcher": "正在检索并入库论文...",
         "retriever": "正在检索相关论文片段...",
         "direct_analyzer": "正在下载并分析论文...",
@@ -426,6 +427,12 @@ def agent_done_detail(name: str, result: dict[str, Any]) -> str:
         return f"论文上下文 {result.get('paper_context', {}).get('status', 'unresolved')}"
     if name == "turn_context":
         return f"路由到 {result.get('next_agent', 'END')}"
+    if name == "contextual_query_rewriter":
+        return (
+            "已生成独立检索问题"
+            if result.get("contextual_query_rewritten")
+            else "沿用当前问题"
+        )
     if name == "critic":
         score = result.get("critic_score", {}).get("score", "N/A")
         return f"质量评分 {score}，下一步 {result.get('next_agent', 'END')}"
@@ -452,6 +459,13 @@ def create_web_initial_state(
 
     return {
         "user_query": query,
+        "retrieval_query": None,
+        "contextual_query_rewritten": False,
+        "recent_user_messages": [
+            " ".join(msg.content.split())[:500]
+            for msg in (session.messages[:-1] if session else [])
+            if msg.role == "user" and msg.content.strip()
+        ][-6:],
         "search_query": None,
         "messages": [],
         "target_papers": [],
@@ -559,7 +573,8 @@ def build_traced_workflow(session: Session):
     graph.add_edge(START, "paper_context_resolver")
     graph.add_edge("paper_context_resolver", "supervisor")
     graph.add_edge("supervisor", "turn_context")
-    graph.add_conditional_edges("turn_context", supervisor_route, {
+    graph.add_edge("turn_context", "contextual_query_rewriter")
+    graph.add_conditional_edges("contextual_query_rewriter", supervisor_route, {
         "direct_analyzer": "direct_analyzer",
         "fetcher": "fetcher",
         "retriever": "retriever",

@@ -23,7 +23,7 @@ let runningTimeline = freshTimeline();
 let currentTimelineEl = null;
 
 function freshTimeline() {
-  return ["supervisor", "fetcher", "retriever", "analyzer", "critic", "presenter"].map((agent) => ({
+  return ["supervisor", "contextual_query_rewriter", "fetcher", "retriever", "analyzer", "critic", "presenter"].map((agent) => ({
     agent,
     status: "waiting",
     detail: "",

@@ -37,10 +37,10 @@ Entity/Fact Resolve  ← 仅歧义候选调用 LLM
 ### Agent 架构
 
 ```
-START → PaperContextResolver → Supervisor → TurnContext
-                                  ├→ Fetcher → Presenter → END
-                                  ├→ DirectAnalyzer → Presenter → END
-                                  └→ Retriever → Analyzer → Critic → Presenter → END
+START → PaperContextResolver → Supervisor → TurnContext → ContextualQueryRewriter
+                                                              ├→ Fetcher → Presenter → END
+                                                              ├→ DirectAnalyzer → Presenter → END
+                                                              └→ Retriever → Analyzer → Critic → Presenter → END
 ```
 
 ## Agent 职责
@@ -78,13 +78,24 @@ START → PaperContextResolver → Supervisor → TurnContext
 
 ### DirectAnalyzer
 - **职责**：分析已解析的本地单篇论文
-- **输入**：`TurnContext.primary_paper_id`, `user_query`
+- **输入**：`TurnContext.primary_paper_id`, `retrieval_query`
 - **输出**：`{analysis, answer, primary_paper_id}`
 - **规则**：不执行 arXiv 搜索或下载降级；目标缺失时返回结构化业务错误
 
+### ContextualQueryRewriter
+- **职责**：将省略式追问改写为可独立检索的问题
+- **输入**：当前问题、已解析论文及标题、活动章节/任务、有界近期对话、滚动摘要
+- **输出**：`retrieval_query`, `contextual_query_rewritten`
+- **规则**：
+  - 不解析或修改论文 ID，不改变外部搜索权限
+  - 历史上下文只用于消解意图，不进入 `retrieved_chunks` 或引用证据
+  - 近期助手回答只用于解析“刚才三个答案”“第二点”等追问对象，不视为论文事实
+  - 无上下文、无 LLM、解析失败或配额异常时沿用原始问题
+  - 每轮最多调用一次 LLM；Critic 重试复用已有改写结果
+
 ### Retriever
 - **职责**：语义检索相关论文片段
-- **输入**：`user_query`
+- **输入**：`retrieval_query`（无上下文或改写失败时为原始 `user_query`）
 - **输出**：`{retrieved_chunks}`
 - **流程**：
   1. MultiQuery（LLM 生成 3-5 个变体）
@@ -203,7 +214,7 @@ Query → MultiQuery (LLM)
 ## LLM 调用边界
 
 - 确定性论文上下文解析、搜索准入、引用归属和 exact/alias/signature 图谱命中不调用 LLM。
-- 对话中的 Supervisor、MultiQuery、Analyzer、Critic 和 Presenter 按路由条件调用，不保证固定次数。
+- 对话中的 ContextualQueryRewriter、Supervisor、MultiQuery、Analyzer、Critic 和 Presenter 按路由条件调用；改写器每轮最多调用一次，其余不保证固定次数。
 - 图谱每批执行抽取和核验；Entity/Fact Resolution 只在规则无法决策时各最多增加一次 batch LLM。
 - 实际调用量与论文分批数、检索路由和 Critic 修订次数相关。
 
@@ -213,6 +224,7 @@ Query → MultiQuery (LLM)
 {
     "user_id": str,              # 用户ID（用于记忆）
     "user_query": str,           # 用户原始查询
+    "retrieval_query": str,      # 融合对话语义后的独立检索问题
     "search_query": str,         # 提取的英文搜索词
     "target_papers": list,       # 搜索到的论文列表
     "retrieved_chunks": list,    # 检索到的相关 chunks
@@ -228,6 +240,7 @@ Query → MultiQuery (LLM)
     "turn_context": dict,        # 意图、论文范围和外部搜索权限
     "primary_paper_id": str,     # 成功论文分析的稳定主论文 ID
     "resolved_paper_ids": list,  # 当前轮次已解析论文集
+    "recent_user_messages": list,# 最近用户消息，仅用于意图消解
     "error": str,                # 错误信息
 }
 ```

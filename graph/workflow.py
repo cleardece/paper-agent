@@ -20,6 +20,7 @@ from agents.reflector import ReflectorAgent
 from agents.direct_analyzer import DirectAnalyzerAgent
 from core.paper_context import PaperContextResolver
 from core.turn_context import TurnContextBuilder
+from core.contextual_query import ContextualQueryRewriter
 
 
 # 路由函数
@@ -46,6 +47,7 @@ def build_workflow(
     paper_context_resolver: PaperContextResolver,
     supervisor: SupervisorAgent,
     turn_context_builder: TurnContextBuilder,
+    contextual_query_rewriter: ContextualQueryRewriter,
     fetcher: FetcherAgent,
     retriever: RetrieverAgent,
     analyzer: AnalyzerAgent,
@@ -60,6 +62,7 @@ def build_workflow(
     graph.add_node("paper_context_resolver", paper_context_resolver.invoke)
     graph.add_node("supervisor", supervisor.invoke)
     graph.add_node("turn_context", turn_context_builder.invoke)
+    graph.add_node("contextual_query_rewriter", contextual_query_rewriter.invoke)
     graph.add_node("fetcher", fetcher.invoke)
     graph.add_node("retriever", retriever.invoke)
     graph.add_node("analyzer", analyzer.invoke)
@@ -78,6 +81,7 @@ def build_workflow(
     graph.add_edge(START, "paper_context_resolver")
     graph.add_edge("paper_context_resolver", "supervisor")
     graph.add_edge("supervisor", "turn_context")
+    graph.add_edge("turn_context", "contextual_query_rewriter")
 
     # 构建 supervisor 路由映射
     supervisor_targets = {"fetcher": "fetcher", "retriever": "retriever", "END": "presenter"}
@@ -85,7 +89,7 @@ def build_workflow(
         supervisor_targets["direct"] = "direct"
 
     graph.add_conditional_edges(
-        "turn_context",
+        "contextual_query_rewriter",
         supervisor_route,
         supervisor_targets,
     )

@@ -130,6 +130,7 @@ class ServiceContainer:
         from agents.reflector import ReflectorAgent
         from core.paper_context import PaperContextResolver
         from core.turn_context import TurnContextBuilder
+        from core.contextual_query import ContextualQueryRewriter
 
         return {
             "paper_context_resolver": PaperContextResolver(
@@ -137,6 +138,7 @@ class ServiceContainer:
             ),
             "supervisor": SupervisorAgent(self.llm, self.mongodb),
             "turn_context": TurnContextBuilder(self.mongodb),
+            "contextual_query_rewriter": ContextualQueryRewriter(self.llm, self.mongodb),
             "fetcher": FetcherAgent(
                 self.paper_search, self.pdf_parser, self.mongodb,
                 self.embedder, self.milvus

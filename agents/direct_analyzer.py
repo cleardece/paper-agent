@@ -67,7 +67,7 @@ class DirectAnalyzerAgent:
         self.parser = pdf_parser
 
     def invoke(self, state: AgentState) -> dict:
-        query = state["user_query"]
+        query = state.get("retrieval_query") or state["user_query"]
         turn_context = state.get("turn_context") or {}
         target_paper_id = (
             turn_context.get("primary_paper_id")

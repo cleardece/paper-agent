@@ -23,6 +23,7 @@ from tools.code_generator import CodeGenerator
 from core.paper_context import PaperContextResolver, PaperFocusState
 from core.session_state import SessionStateReducer
 from core.turn_context import TurnContextBuilder
+from core.contextual_query import ContextualQueryRewriter
 def init_components():
     llm = get_llm()
     arxiv_api = ArxivAPI()
@@ -36,6 +37,7 @@ def init_components():
         "paper_context_resolver": PaperContextResolver(mongodb_client, llm),
         "supervisor": SupervisorAgent(llm, mongodb_client),
         "turn_context_builder": TurnContextBuilder(mongodb_client),
+        "contextual_query_rewriter": ContextualQueryRewriter(llm, mongodb_client),
         "fetcher": FetcherAgent(arxiv_api, pdf_parser, mongodb_client, embedding_service, milvus_client),
         "retriever": RetrieverAgent(embedding_service, milvus_client, mongodb_client),
         "analyzer": AnalyzerAgent(llm, mongodb_client),
@@ -51,6 +53,9 @@ def create_initial_state(query: str) -> AgentState:
     """创建初始状态"""
     return {
         "user_query": query,
+        "retrieval_query": None,
+        "contextual_query_rewritten": False,
+        "recent_user_messages": [],
         "search_query": None,
         "messages": [],
         "target_papers": [],
@@ -104,6 +109,10 @@ def main():
 
         state = create_initial_state(query)
         state["conversation_context"] = context
+        state["recent_user_messages"] = [
+            item.removeprefix("用户: ")
+            for item in chat_history[-20:] if item.startswith("用户: ")
+        ][-6:]
         state["paper_focus"] = paper_focus.to_dict()
         state["active_paper_ids"] = list(paper_focus.active_paper_ids)
         result = asyncio.run(workflow.ainvoke(state))

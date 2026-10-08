@@ -278,12 +278,15 @@ class RetrieverAgent:
         4. 补全元数据
         5. 更新state
         """
-        query = state["user_query"]
+        original_query = state["user_query"]
+        query = state.get("retrieval_query") or original_query
         session_id = state.get("session_id")
         user_id = state.get("user_id", "default")
         turn_context = state.get("turn_context") or {}
         resolved_paper_ids = list(turn_context.get("paper_ids") or [])
         logger.info(f"[Retriever] 开始检索: {query[:50]}...")
+        if query != original_query:
+            logger.info("[Retriever] 使用上下文改写查询")
         graph_paper_ids = self._graph_paper_ids(query)
 
         # 获取用户兴趣
@@ -294,7 +297,7 @@ class RetrieverAgent:
         logger.info(f"[Retriever] MultiQuery: {len(expanded_queries)} 个变体")
 
         # 处理用户交互记忆
-        self.mongo.user_memory.process_interaction(user_id, query)
+        self.mongo.user_memory.process_interaction(user_id, original_query)
 
         # 2. Section 意图检测
         target_sections = self._detect_section_intent(query)
