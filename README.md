@@ -1,6 +1,6 @@
 # Paper Agent
 
-[English](README.en.md) · [技术架构](docs/architecture.md) · [运行与维护](docs/operations.md) · [变更记录](CHANGELOG.md)
+[English](README.en.md) · [技术架构](docs/architecture.md)
 
 面向研究生论文阅读与小论文写作的研究助手。它将论文搜索、PDF 解析、混合检索、多 Agent 分析、多轮论文上下文和可审核研究图谱串成一条可追溯的研究工作流：当答案缺少本次检索到的论文证据时，系统会要求重检索或明确提示证据不足。
 

@@ -1,6 +1,6 @@
 # Paper Agent
 
-[中文](README.md) · [Architecture](docs/architecture.md) · [Operations](docs/operations.md) · [Changelog](CHANGELOG.md)
+[中文](README.md) · [Architecture](docs/architecture.md)
 
 A personal research assistant for paper discovery, PDF ingestion, evidence-backed question answering, multi-turn paper context, and reviewable knowledge graphs.
 
@@ -31,7 +31,7 @@ docker compose --env-file .env up -d
 python -m uvicorn web.app:app --host 127.0.0.1 --port 8000
 ```
 
-Keep Ollama running. Open `http://localhost:8000`; the library is at `/papers` and the graph at `/graph`. Configuration details and operational guidance are in the [Chinese README](README.md) and [operations guide](docs/operations.md).
+Keep Ollama running. Open `http://localhost:8000`; the library is at `/papers` and the graph at `/graph`. Configuration details are in the [Chinese README](README.md).
 
 `LLM_*` configures chat; `GRAPH_LLM_*` configures graph extraction. The sample graph endpoint is local Ollama at `http://127.0.0.1:11434/v1`. `GRAPH_LLM_TPM_LIMIT=0` disables proactive token throttling, not graph extraction.
 
