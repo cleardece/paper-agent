@@ -9,18 +9,24 @@ import time
 
 logger = logging.getLogger("paper-agent")
 
-def search_papers(query: str, max_results: int = 5, retries: int = 3):
+def search_papers(
+    query: str, max_results: int = 5, retries: int = 3, mode: str = "keywords"
+):
     """搜索arXiv论文，带重试机制"""
     client = arxiv.Client(
         page_size=max_results,
         delay_seconds=3.0,  # 增加请求间隔到3秒
         num_retries=3,
     )
-    search = arxiv.Search(
-        query=query,
-        max_results=max_results,
-        sort_by=arxiv.SortCriterion.Relevance
-    )
+    if mode == "arxiv_id":
+        search = arxiv.Search(id_list=[query], max_results=max_results)
+    else:
+        field = "ti" if mode == "title" else "all"
+        search = arxiv.Search(
+            query=f'{field}:"{query}"',
+            max_results=max_results,
+            sort_by=arxiv.SortCriterion.Relevance,
+        )
 
     for attempt in range(retries):
         try:
@@ -75,8 +81,8 @@ def fetch_paper_content(url: str) -> str:
 
 class ArxivAPI:
     """封装为类，供FetcherAgent使用"""
-    def search(self, query, max_results=5):
-        return search_papers(query, max_results)
+    def search(self, query, max_results=5, mode="keywords"):
+        return search_papers(query, max_results, mode=mode)
 
     def fetch(self, url):
         return fetch_paper_content(url)

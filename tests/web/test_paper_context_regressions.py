@@ -38,8 +38,8 @@ class RecordingArxiv:
         self.results = list(results or [])
         self.calls = []
 
-    def search(self, query, max_results):
-        self.calls.append((query, max_results))
+    def search(self, query, max_results, mode="keywords"):
+        self.calls.append((query, max_results, mode))
         return self.results[:max_results]
 
 
@@ -182,7 +182,7 @@ def test_case_6_searching_p003_updates_session_primary():
         search_results=[{"arxiv_id": "2401.00003"}],
     )
 
-    assert result.arxiv_calls == [("2401.00003", 1)]
+    assert result.arxiv_calls == [("2401.00003", 1, "arxiv_id")]
     assert result.final_focus.primary_paper_id == "2401.00003"
     assert result.final_context["source"] == "arxiv_id"
 
@@ -192,5 +192,5 @@ def test_case_7_long_analysis_request_never_becomes_arxiv_query():
 
     result = run_turn(query)
 
-    assert result.arxiv_calls == [("PINN Navier-Stokes", 5)]
+    assert result.arxiv_calls == [("PINN Navier-Stokes", 5, "keywords")]
     assert result.arxiv_calls[0][0] != query

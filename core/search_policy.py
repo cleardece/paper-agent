@@ -125,7 +125,11 @@ class SearchAdmissionGate:
         if isinstance(request, dict):
             request = SearchRequest.from_dict(request)
         request.validate()
-        return arxiv.search(request.value, max_results=max_results)
+        return arxiv.search(
+            request.value,
+            max_results=max_results,
+            mode=request.mode,
+        )
 
 
 _SEARCH_ADMISSION_GATE = SearchAdmissionGate()

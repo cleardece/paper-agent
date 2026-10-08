@@ -88,7 +88,12 @@ class ArxivAPI:
         if not self.use_mcp:
             logger.info("[ArxivAPI] using direct API mode")
 
-    def search(self, query: str, max_results: int = 5) -> list[dict]:
+    def search(
+        self, query: str, max_results: int = 5, mode: str = "keywords"
+    ) -> list[dict]:
+        if mode == "arxiv_id":
+            return self._direct_client.search(query, max_results, mode=mode)
+
         # 优先尝试 MCP
         if self.use_mcp and self._mcp_client:
             try:
@@ -117,6 +122,6 @@ class ArxivAPI:
         # 降级到直接 arXiv API
         if self._direct_client:
             logger.info("[ArxivAPI] 使用直接 arXiv API 搜索")
-            return self._direct_client.search(query, max_results)
+            return self._direct_client.search(query, max_results, mode=mode)
 
         return []
