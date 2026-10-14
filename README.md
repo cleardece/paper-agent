@@ -1,6 +1,6 @@
 # Paper Agent
 
-面向研究生的论文阅读与写作助手，支持论文搜索、多轮问答和跨论文比较。回答附带原文证据，论文中的主张与关联保存在研究图谱中，方便回查和整理。
+Paper Agent 是一个论文阅读与知识整理工具，支持论文搜索、多轮问答和跨论文比较。系统利用检索到的原文片段辅助分析，校验回答中的引用来源，并将抽取的论文主张及其出处保存到研究图谱。
 
 ![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)
 ![LangGraph](https://img.shields.io/badge/Agent-LangGraph-1C3C3C)
