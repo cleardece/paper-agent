@@ -1,57 +1,190 @@
 # Paper Agent
 
+面向研究生的论文阅读与写作助手，支持论文搜索、多轮问答和跨论文比较。回答附带原文证据，论文中的主张与关联保存在研究图谱中，方便回查和整理。
+
+![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)
+![LangGraph](https://img.shields.io/badge/Agent-LangGraph-1C3C3C)
+![Milvus](https://img.shields.io/badge/Vector_DB-Milvus-00A1EA)
+![MongoDB](https://img.shields.io/badge/Memory-MongoDB-47A248?logo=mongodb&logoColor=white)
+![FastAPI](https://img.shields.io/badge/Web-FastAPI-009688?logo=fastapi&logoColor=white)
+
 [English](README.en.md) · [技术架构](docs/architecture.md)
 
-面向研究生论文阅读与小论文写作的研究助手。它将论文搜索、PDF 解析、混合检索、多 Agent 分析、多轮论文上下文和可审核研究图谱串成一条可追溯的研究工作流：当答案缺少本次检索到的论文证据时，系统会要求重检索或明确提示证据不足。
+## 项目背景
 
-## 项目目标
+阅读论文时，经常需要围绕同一篇文章连续追问、比较不同论文的结论，并回到原文核对。项目主要处理这些过程中遇到的几个问题：
 
-- 搜索、导入并解析学术论文；
-- 结合 MongoDB、Milvus 和 Hybrid Search 检索已入库论文；
-- 用 LangGraph 编排路由、检索、分析、质量审核、呈现和反思；
-- 基于稳定论文标识维护会话上下文，支持多轮对话中的论文指代解析与连续追问；
-- 将当前问题与活动章节、任务、有界近期对话和滚动摘要改写为独立检索问题；
-- 将论文主张规范化为 Entity、Claim、Fact 和 Provenance，并保留人工复核入口；
-- 为回答提供可核验的引用来源、质量状态和 Agent 执行时间；
-- 作为长期个人研究工具，而非一次性的演示项目。
+| 工程问题 | Paper Agent 的设计 |
+| --- | --- |
+| “它的实验怎么做？”容易丢失论文焦点，甚至被当成新的搜索词 | 用稳定论文 ID 管理焦点，分离身份解析、意图路由与检索问题改写 |
+| 回答可能引用本轮没有检索到的论文 | 将事实生成约束到当前证据，先校验引用来源，再做 LLM 语义审核 |
+| 零散 Chunk 难以表达跨论文主张及其出处 | 用 Entity / Claim / Fact / Provenance 保留关联、原文定位和审核状态 |
+| 解析或图谱任务中断后难以定位、恢复 | 持久化任务状态，配合租约、检查点、失败诊断与页面执行时间线 |
 
-## 架构
+## 技术架构
 
-```text
-用户问题
-  -> PaperContextResolver（解析当前论文）
-  -> Supervisor（只判断动作意图）
-  -> TurnContext / SearchAdmissionGate
-  -> ContextualQueryRewriter（补全追问语义，不参与证据）
-  -> Fetcher（搜索/入库）
-     或 Retriever -> Analyzer -> Critic -> Presenter -> Reflector
+各层围绕论文问答和知识整理分工：FastAPI 提供交互入口，LangGraph 管理执行状态，检索与图谱共享论文数据。
 
-PDF -> 解析 -> Chunk -> Embedding -> Milvus
-论文与会话元数据 -> MongoDB
-已索引论文 -> 可恢复图谱 Worker -> Entity / Claim / Fact / Provenance
+```mermaid
+flowchart TB
+    subgraph ui["交互层"]
+        pages["论文问答 · 论文库<br/>研究图谱"]
+        api["FastAPI · SSE / WebSocket"]
+        pages --- api
+    end
+    subgraph orchestration["编排层"]
+        workflow["LangGraph<br/>上下文解析 · 意图路由<br/>检索分析 · 质量审核"]
+    end
+    subgraph capabilities["模型与检索"]
+        llm["OpenAI 兼容 API<br/>问答 / 摘要 / 审核<br/>Ollama：示例图谱模型"]
+        retrieval["BGE-M3 + BM25 → RRF<br/>BGE-Reranker-v2-M3 重排"]
+        parser["MinerU 官方 VLM<br/>PDF → Markdown → Chunk"]
+    end
+    subgraph storage["存储层"]
+        mongo[("MongoDB<br/>原文 · 会话 · 记忆<br/>图谱 · 后台任务")]
+        milvus[("Milvus<br/>论文 / Chunk 向量<br/>实体 / 事实候选向量")]
+    end
+    api --> workflow
+    workflow --> llm
+    workflow --> retrieval
+    workflow --> parser
+    workflow --> mongo
+    parser --> mongo
+    retrieval --> mongo
+    retrieval --> milvus
+
+    classDef entry fill:#e0f2fe,stroke:#0284c7,color:#0c4a6e
+    classDef agent fill:#ede9fe,stroke:#7c3aed,color:#4c1d95
+    classDef model fill:#ecfdf5,stroke:#059669,color:#064e3b
+    classDef data fill:#fff7ed,stroke:#ea580c,color:#7c2d12
+    class pages,api entry
+    class workflow agent
+    class llm,retrieval,parser model
+    class mongo,milvus data
 ```
 
-`Critic` 在 LLM 语义审核前先执行确定性规则：回答中的论文引用必须来自当前 `retrieved_chunks`。这项规则验证来源归属；它不替代对具体事实是否被原文蕴含的人工或 LLM 审核。
+运行环境：Python 3.10+；本地向量模型使用 PyTorch，MongoDB、Milvus 及检索配套服务由 Docker Compose 管理。
 
-多轮对话中的历史消息只用于生成 `retrieval_query`；其中近期助手回答仅用于理解“刚才三个答案”“第二点”等追问对象，不能充当论文事实。论文范围仍由 `PaperContextResolver` 和 `TurnContext.paper_ids` 决定，最终回答的事实与引用仍只能来自本轮检索到的论文 Chunk。
+## 问答流程
+
+先确定论文，再判断用户要做什么。历史对话只用于补全问题；引用依据来自本轮检索的原文。
+
+```mermaid
+flowchart TD
+    query["用户问题"]
+    context["PaperContextResolver<br/>解析稳定论文 ID"]
+    supervisor["Supervisor<br/>判断动作意图"]
+    turn["TurnContext<br/>固定论文范围与搜索权限"]
+    rewrite["ContextualQueryRewriter<br/>补全检索问题"]
+    history["当前论文焦点 · 近期对话 · 滚动摘要"]
+    query --> context --> supervisor --> turn --> rewrite
+    history -.-> context
+    history -.-> rewrite
+
+    rewrite -->|搜索论文| gate["SearchAdmissionGate<br/>搜索准入"]
+    gate --> fetch["Fetcher<br/>搜索与入库"]
+    rewrite -->|本地单篇分析| direct["DirectAnalyzer"]
+    rewrite -->|知识库问答 / 多篇比较| retrieve["Retriever<br/>混合检索与重排"]
+    rewrite -->|一般对话| present["Presenter<br/>回答与引用状态"]
+    retrieve --> analyze["Analyzer<br/>基于本轮 Chunk 分析"]
+    analyze --> critic["Critic<br/>引用来源校验 + LLM 语义审核"]
+    critic -->|未通过且仍可重试| retrieve
+    critic -->|通过或达到重试上限| present
+    direct --> present
+    fetch --> present
+    fetch -.->|Web 路由可继续检索| retrieve
+    present --> done["结束 / 可选 Reflector"]
+
+    classDef contextNode fill:#e0f2fe,stroke:#0284c7,color:#0c4a6e
+    classDef rag fill:#ede9fe,stroke:#7c3aed,color:#4c1d95
+    classDef check fill:#fff7ed,stroke:#ea580c,color:#7c2d12
+    classDef output fill:#ecfdf5,stroke:#059669,color:#064e3b
+    class context,supervisor,turn,rewrite,history contextNode
+    class retrieve,analyze,direct rag
+    class gate,critic check
+    class present,done output
+```
+
+各节点分别记录执行状态与耗时。Critic 重试回到检索阶段，复用已解析的论文范围和检索问题；达到重试上限只表示结束修订，不代表回答已通过事实核验。
+
+## 关键设计
+
+### 1. 保持当前论文焦点
+
+仅靠聊天记录判断“它”指向哪篇论文，容易混淆讨论对象，也可能把历史回答误当成论文事实。[PaperContextResolver](core/paper_context.py) 优先解析显式目标与稳定论文 ID，再使用唯一会话焦点；存在歧义时不从助手文本猜标题。
+
+`TurnContext` 将论文范围、当前动作和外部搜索权限传给下游。Supervisor 只判断动作意图，`SearchAdmissionGate` 只对明确的搜索意图放行，避免将“它的实验怎么做？”直接交给 arXiv。
+
+### 2. 补全省略式追问
+
+“第二个贡献呢？”缺少可独立检索的语义。[ContextualQueryRewriter](core/contextual_query.py) 结合已解析论文、活动章节与任务、限定长度的近期对话和滚动摘要，生成 `retrieval_query`；近期助手回答只帮助定位“第二点”“刚才第三点”等追问对象。
+
+改写器不改变论文 ID 或搜索权限，历史上下文不进入 `retrieved_chunks`。每轮最多调用一次 LLM，Critic 重试复用结果；没有可用上下文或改写失败时回退到原始问题。
+
+### 3. 约束回答的证据来源
+
+Retriever 提供本轮 `retrieved_chunks`，Analyzer 被要求仅据此组织论文事实。Critic 在 LLM 语义审核之前执行[确定性引用校验](core/evidence.py)：**回答引用的论文必须来自当前检索结果**，同时检查无证据时是否明确拒答。
+
+规则未通过时会在重试次数限制内重新检索。证据面板显示原文来源和校验状态；LLM 继续检查回答内容是否有依据，用户可以沿引用回看原文。来源校验、语义审核和人工复核各自保留，不能互相替代。
+
+### 4. 图谱构建与中断恢复
+
+Chunk 检索提供局部文本；研究图谱进一步记录“哪篇论文提出什么主张、涉及哪些实体、证据位于哪里、关系是否经过审核”。Entity 统一实体与别名，Claim 保留论文主张，Fact 聚合跨论文主张，Provenance 保存 paper、chunk、section/page、原文证据及版本。
+
+```mermaid
+flowchart TB
+    pdf["PDF"] --> parse["MinerU 解析与分块"]
+    parse --> chunks[("MongoDB：原文 Chunk")]
+    chunks --> embed["BGE-M3 向量化"]
+    embed --> index[("Milvus：论文 / Chunk 索引")]
+    index --> queue["已索引论文 → 持久化图谱任务"]
+    reconcile["启动增量对账"] -.-> queue
+    queue --> worker["Graph Worker<br/>分批抽取 · 核验 · 原文证据定位"]
+    worker --> resolve["实体 / 事实归一<br/>规则优先，歧义候选调用 LLM"]
+    resolve --> graphStore[("Entity / Claim / Fact / Provenance")]
+    graphStore --> review["跨论文关联 · 来源定位 · 人工复核"]
+    recovery["租约 · 心跳 · 检查点<br/>硬超时 · 有界重试"] -.-> worker
+
+    classDef process fill:#e0f2fe,stroke:#0284c7,color:#0c4a6e
+    classDef data fill:#ecfdf5,stroke:#059669,color:#064e3b
+    classDef control fill:#fff7ed,stroke:#ea580c,color:#7c2d12
+    class parse,embed,worker,resolve process
+    class chunks,index,graphStore,review data
+    class queue,reconcile,recovery control
+```
+
+构建由后台 Worker 分批执行，使用持久化任务、租约与心跳、硬超时、检查点和有界重试处理失败及重启恢复。启动时增量对账已索引论文与图谱版本；配额耗尽单独标记，页面提供失败状态、手动重试和关系复核。图谱辅助关联与导航，最终回答仍回到当前检索的原文证据。
+
+## 评测
+
+[离线评测脚本](scripts/evaluate.py) 使用本地已入库论文和人工标注的问题集，统计以下指标。目前仓库尚未提交实测结果。
+
+| 指标 | 当前统计口径 |
+| --- | --- |
+| Recall@5 | 期望论文在前 5 篇去重检索论文中的覆盖率，对用例取均值 |
+| Citation Pass Rate | 证据规则通过的用例占比，包含无证据时正确拒答；不是事实准确率 |
+| Abstention Accuracy | 应拒答用例中，同时无检索论文且证据规则通过的比例 |
+| P50 Latency | 工作流端到端耗时中位数 |
+
+```powershell
+Copy-Item evaluation/cases.example.json evaluation/cases.local.json
+# 按已入库论文填写 expected_papers，并标注 should_abstain
+python scripts/evaluate.py --cases evaluation/cases.local.json
+```
+
+指标边界与测试命令见[评测操作说明](docs/operations.md#评测与测试)，计算实现见 [evaluation/metrics.py](evaluation/metrics.py)。比较结果时需固定论文库、标注集与模型配置。
 
 ## 快速开始
 
-### 前提
+准备 Python 3.10+、Docker Desktop、LLM 服务凭据和 MinerU 官方 Token。以下按示例配置使用本机 Ollama 图谱模型；Ollama 服务需保持运行，本地 Embedding 需兼容 CPU / CUDA 的 PyTorch。
 
-- Python 3.10 或更高版本；
-- Docker Desktop；
-- 一个兼容 OpenAI API 的 LLM endpoint；
-- MinerU 官方 API Token；示例配置中的图谱另需本机 Ollama 和 `qwen3-graph:8b` 模型；
-- 若使用本地 Embedding，安装与本机 CUDA/CPU 兼容的 PyTorch。
-
-### 配置与启动
+在仓库根目录执行：
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 Copy-Item .env.example .env
-# 编辑 .env，填入 LLM_API_KEY、MINERU_OFFICIAL_TOKEN，并核对服务地址
+# 编辑 .env：填写 LLM_API_KEY、MINERU_OFFICIAL_TOKEN，核对模型和服务地址
 python -m pip install -r requirements.txt
 ollama pull qwen3:8b
 ollama create qwen3-graph:8b -f Modelfile
@@ -59,166 +192,10 @@ docker compose --env-file .env up -d
 python -m uvicorn web.app:app --host 127.0.0.1 --port 8000
 ```
 
-以上命令在仓库根目录执行，Ollama 服务需保持运行。开发时可安装 `requirements-dev.txt` 并按需使用 `--reload`。默认配置面向本机使用。
+打开 [对话页面](http://localhost:8000) 或 [研究图谱](http://localhost:8000/graph)。配置与解析细节见[部署说明](docs/operations.md)。
 
-打开 `http://localhost:8000`。也可以在 PowerShell 中运行：
+## 使用边界
 
-```powershell
-.\scripts\start.ps1 -Python python
-```
-
-`PA_DATA_ROOT` 控制 Docker 的本地数据目录，默认是仓库中的 `.local-data/`；它不会被 Git 跟踪。首次使用前请确保 Docker Desktop 有该目录的访问权限。
-
-## 环境变量
-
-| 变量 | 用途 |
-| --- | --- |
-| `LLM_MODEL`、`LLM_BASE_URL`、`LLM_API_KEY` | 对话、路由、分析和审核模型配置 |
-| `MONGODB_URI`、`MONGODB_DB` | 论文、会话和记忆存储 |
-| `MILVUS_HOST`、`MILVUS_PORT` | 向量检索服务 |
-| `MINERU_OFFICIAL_TOKEN` | MinerU 官方精准 API Token；必填，缺失时应用拒绝启动 |
-| `MINERU_OFFICIAL_BASE_URL` | MinerU 官方 API 地址；解析固定使用 `vlm` |
-| `USE_MCP`、`MCP_ARXIV_URL` | arXiv MCP 搜索优先级 |
-| `SEMANTIC_SCHOLAR_API_KEY` | 可选的 Semantic Scholar 搜索 |
-| `GRAPH_*` | 研究图谱 LLM 请求、子进程超时、任务租约、重试与熔断参数 |
-| `GRAPH_LLM_MODEL`、`GRAPH_LLM_BASE_URL`、`GRAPH_LLM_API_KEY` | 图谱独立模型；示例使用本地 Ollama，不影响普通对话 |
-| `PA_DATA_ROOT` | Docker Compose 数据卷根目录 |
-
-## 日常研究工作流
-
-1. 在对话页搜索一个主题，或上传本地 PDF 入库。
-2. 在论文库确认论文状态，点击“提问”回到会话中做单篇分析。
-3. 对多篇已入库论文提问或比较，阅读回答下方的 Agent 时间线与证据面板。
-4. 对用于写作的结论，打开论文原文核对上下文；系统提供的是来源约束和检索证据，不替代学术责任。
-5. 打开 `/graph` 查看图谱覆盖率、后台任务和待复核关系，必要时确认、拒绝或手动重试失败论文。
-6. 将经人工核对的高价值问题加入本地评测集，持续观察检索和引用质量。
-
-## 准确性边界
-
-- 回答引用的论文标题必须属于当前检索结果；未知引用会触发重检索或“需要复核”状态。
-- 没有检索到证据时，系统应明确拒答或说明证据不足，而不是依据模型常识补全。
-- 规则校验只检查“引用来自哪里”，不证明每一条自然语言断言都被论文逐字蕴含。
-- 用于小论文写作前，请自行打开原文核对实验设置、数据、数字和因果结论。
-
-## 评测
-
-复制示例并用你已入库论文的 arXiv ID 标注期望结果：
-
-```powershell
-Copy-Item evaluation/cases.example.json evaluation/cases.local.json
-python scripts/evaluate.py --cases evaluation/cases.local.json
-```
-
-评测输出包括：
-
-- `recall_at_5`：期望论文在前五个检索论文中的覆盖率；
-- `citation_pass_rate`：回答引用通过来源规则校验的比例；
-- `abstention_accuracy`：应拒答问题被正确拒答的比例；
-- `latency_ms_p50`：端到端中位延迟。
-
-`evaluation/cases.local.json` 和 `evaluation/results/` 被忽略，避免把个人研究主题和结果推送到公开仓库。
-
-## 测试
-
-测试源码随仓库保存。部分测试需要运行中的 MongoDB、Milvus 或模型依赖，具体范围见 [测试计划](docs/test_plan.md)。先安装 `requirements-dev.txt`，再根据本机环境选择执行。
-
-```powershell
-python -m pytest -q
-docker compose --env-file .env.example config --quiet
-python -B -c "import main; from web.app import app; print(len(app.routes))"
-```
-
-界面人工验收：切换深浅主题后刷新页面；查看会话和论文库之间主题是否保持；提交一次有证据的问答和一次无证据的问答；确认时间线显示节点耗时、证据面板状态明确、服务失败后发送按钮可再次使用。
-
-## 数据与隐私
-
-本地 PDF、向量库、Mongo 数据、缓存、上传文件和 API 密钥均不应提交。删除论文会影响本地 MongoDB/Milvus 数据，执行前请确认该论文不再需要。
-
-## MinerU 论文解析
-
-Paper Agent 统一使用 MinerU 官方精准 API 解析论文，不再维护本地 MinerU 运行时或 pdfplumber 降级路径。先在 MinerU 平台创建 API Token，再填写本机 `.env`：
-
-```dotenv
-MINERU_OFFICIAL_TOKEN=
-MINERU_OFFICIAL_BASE_URL=https://mineru.net
-MINERU_OFFICIAL_POLL_SECONDS=5
-MINERU_OFFICIAL_TIMEOUT_SECONDS=900
-```
-
-Token 只填写在本机 `.env`，不要写入 `.env.example` 或提交到 Git。没有配置 Token 时应用会在启动阶段给出明确错误，不会以低精度解析器继续运行。官方 API 失败时，上传队列会自动重试该论文一次；仍失败则清理半成品、记录原因并继续下一篇。上传面板和近 7 天历史批次会显示“官方 VLM · 解析 N.N 秒”，日志会记录上传、等待、下载和总耗时，但不会输出 Token、签名上传地址或结果下载地址。
-
-### MinerU 本地部署参考
-
-MinerU 本身也可以独立部署到本地。官方 Docker 方案适用于 Linux，以及启用了 WSL2 的 Windows；建议先确认 NVIDIA 驱动、CUDA 与显存满足 MinerU 当前版本要求。以下流程只用于部署 MinerU 服务，不是 Paper Agent 的解析模式切换入口。
-
-```bash
-# 1. 下载官方 Dockerfile 并构建镜像
-curl -L https://raw.githubusercontent.com/opendatalab/MinerU/master/docker/global/Dockerfile -o Dockerfile
-docker build -t mineru:latest -f Dockerfile .
-
-# 2. 下载官方 Compose 配置
-curl -L https://raw.githubusercontent.com/opendatalab/MinerU/master/docker/compose.yaml -o compose.yaml
-
-# 3. 启动 MinerU Web API
-docker compose -f compose.yaml --profile api up -d
-```
-
-启动后访问 `http://localhost:8000/docs` 查看接口文档，或请求 `http://localhost:8000/health` 检查服务状态。MinerU Web API 与 Paper Agent 默认都占用主机 `8000` 端口，同时运行时需要修改 `compose.yaml` 的主机端口映射。停止服务可运行：
-
-```bash
-docker compose -f compose.yaml --profile api down
-```
-
-MinerU 的镜像依赖和启动参数可能随版本变化，实际部署时以 [MinerU 官方 Docker 部署文档](https://github.com/opendatalab/MinerU/blob/master/docs/zh/quick_start/docker_deployment.md) 为准。
-
-## 批量上传队列
-
-选择 PDF 后，文件会先进入可移除的“待上传清单”；可以多次选择后再点击一次“开始上传”，所有接受的文件会成为同一个 MongoDB 批次并严格串行执行。页面会显示“本批上传”的逐篇状态与成功/处理中/失败/跳过统计，并保留近 7 天批次供刷新后查看。论文库只展示已成功入库的论文，不能作为上传成功率的依据。
-
-- 每篇失败会自动重试一次；第二次失败会清理论文库中的元数据、chunks 和向量，仅保留原始 PDF 与失败任务记录，然后继续下一篇。
-- 服务异常重启后，未完成任务会重新进入队列；已完成任务不重复解析。
-- 默认限制可通过 `.env` 调整：`UPLOAD_BATCH_MAX_FILES=20`、`UPLOAD_MAX_FILE_MB=100`、`UPLOAD_QUEUE_MAX_PENDING=50`、`UPLOAD_JOB_RETENTION_DAYS=30`。队列不提供并发模式。
-
-## 论文入库状态
-
-- `chunked`：PDF 已解析，正文片段已保存到 MongoDB；可以直接进行单篇分析。系统会在需要时对已有 chunks 补索引，不会重新下载 PDF。
-- `indexed`：chunk 向量和论文级向量都已写入 Milvus，可参与语义检索和跨论文问答。
-- `embedding_failed` / `milvus_failed`：原始 chunks 被保留；后续从论文库分析时会尝试补索引。失败不会被伪装成 `indexed`。
-
-论文库的“提问”会携带所选论文的稳定 ID，因此分析和补索引只会针对被点击的那篇论文，不按标题中的单个英文词猜测其他论文。
-
-## 研究型多轮记忆
-
-系统将记忆分为两类：
-
-- **会话焦点**：当前论文、任务、待解决问题、最近对话与滚动摘要。连续提问“它的实验怎么复现”“第二个贡献是什么”会优先使用当前论文的稳定 ID；没有唯一焦点时会检索或请求澄清，不会从对话文本猜一个英文标题后重新搜索。
-- **研究者档案**：学习情况、研究方向、研究项目和长期偏好。回答完成后，系统会从用户本人消息中静默提炼档案更新；每次变更保留来源会话、消息 ID、置信度、时间和前后版本。
-
-可在 `GET /api/research-profile/local-user` 查看本地档案。对话中可直接说“研究方向改为……”“不是这样，……”来覆盖旧记录。研究者档案只用于理解用户意图，绝不会作为论文事实、检索 chunk 或引用来源。
-
-## 研究图谱（Evidence Graph V4）
-
-论文进入 `indexed` 状态后会自动进入持久化图谱队列。工作者从原文 chunks 分批抽取主张，执行 Schema 核验、原文证据定位、Entity Resolution 和 Fact Resolution，最终保存规范实体、主张、事实及其来源。
-
-- 实体别名、缩写和相近表述优先走确定性规则；只有歧义候选才调用 Resolution LLM。
-- 同一 Fact 可聚合多篇论文的支持或反对 Claim，每条 Claim 保留 paper、chunk、section/page、原文 evidence 和版本信息。
-- 后台任务带租约、心跳、硬超时和阶段检查点；临时限流使用持久化退避，明确的永久配额错误单独处理。
-- 图谱可以通过 `GRAPH_LLM_*` 使用独立的本地模型。模型空响应、输出截断和 JSON 协议异常有单独诊断；不能把不完整结果当作成功。
-- 页面与 Retriever 继续读取兼容关系投影；图谱用于关联与导航，最终回答的证据仍来自本次检索到的论文 chunks。
-
-图谱页面为 `GET /graph`；主要接口包括 `GET /api/research-graph`、`GET /api/research-graph/status`、`GET /api/research-graph/jobs`、`POST /api/research-graph/jobs/retry` 和 `PATCH /api/research-graph/edges/{edge_id}`。应用启动时会对已索引论文与当前图谱版本做增量对账。
-
-## 仓库导航
-
-| 路径 | 内容 |
-| --- | --- |
-| `agents/`、`graph/`、`state/` | Agent、工作流与状态 |
-| `core/` | 依赖装配、会话上下文、搜索准入与证据规则 |
-| `knowledge_graph/` | 图谱协议、Schema、实体与事实归一 |
-| `storage/`、`tools/` | 数据存储、检索、解析与后台任务 |
-| `web/` | FastAPI 服务与前端页面 |
-| `tests/`、`evaluation/` | 测试源码与评测工具 |
-| `docs/` | 技术架构、运行说明和历史设计文档 |
-| `arxiv-mcp/` | 独立 MCP 服务源码与其许可证 |
-
-当前阶段按个人研究工具收尾维护；没有以此声明生产 SLA 或所有模型兼容性。历史设计记录保留在 `docs/superpowers/`，当前运行配置以 `.env.example` 和代码为准。
+- **引用来源正确，不代表结论正确**：论文出现在检索结果中，不意味着回答中的每条断言都有原文支持。
+- Critic 的 LLM 审核调用失败时默认放行，达到重试上限也会结束修订。因此，流程完成并不代表回答已经通过事实核验。
+- 写作引用前仍需回看原文，核对实验配置、数字和因果结论。证据面板用于辅助核查，不能替代作者的判断。
